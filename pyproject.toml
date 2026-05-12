@@ -1,0 +1,14 @@
+[project]
+name = "gui-new32"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy==1.26.4",
+    "pyqt6>=6.11.0",
+    "ueidaq-np1",
+]
+
+[tool.uv.sources]
+ueidaq-np1 = { path = "../../../../../Program Files (x86)/UEI/Framework/Python/UeiDaq_np1-5.2.0-cp312-abi3-win_amd64.whl" }
