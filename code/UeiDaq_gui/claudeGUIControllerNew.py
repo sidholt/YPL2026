@@ -34,7 +34,7 @@ except ImportError:
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-CUBE_IP = "172.28.2.4"
+CUBE_IP = "172.28.2.5"
 MOKU_IP = "172.28.5.6"          # set when known, e.g. "192.168.73.1"
 
 NUM_PINS = 8
@@ -57,8 +57,8 @@ STEP_V       = SLEW_RATE_V  * (RAMP_TICK_MS / 1000.0)
 STEP_MA      = SLEW_RATE_MA * (RAMP_TICK_MS / 1000.0)
 
 HOME_WINDOW_W  = 520
-PIN_WINDOW_W   = 560
-PIN_WINDOW_H   = 580
+PIN_WINDOW_W   = 680
+PIN_WINDOW_H   = 950   # tall enough to see all pins + panels without scrolling
 
 SWEEP_DEFAULT_STEPS    = 10
 SWEEP_DEFAULT_DWELL_MS = 500
@@ -287,6 +287,75 @@ class AO333ReadbackWorker(QObject):
         except Exception:
             pass
         self._sock = None
+
+
+PROMICRO_PORT          = "COM11"
+PROMICRO_BAUD          = 9600
+PROMICRO_PLOT_WINDOW_S = 10.0
+
+try:
+    import serial
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+    print("[WARNING] pyserial not found — Pro Micro disabled. Run: uv pip install pyserial")
+
+
+# ── Pro Micro serial worker ────────────────────────────────────────────────────
+
+class ProMicroWorker(QObject):
+    sample_ready = pyqtSignal(float)
+    error        = pyqtSignal(str)
+    connected    = pyqtSignal()
+    disconnected = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._port    = None
+        self._running = False
+
+    def start(self, port: str = PROMICRO_PORT):
+        self.stop()
+        if not HAS_SERIAL:
+            self.error.emit("pyserial not installed")
+            return
+        try:
+            self._port = serial.Serial(port, PROMICRO_BAUD, timeout=1.0)
+            self._port.reset_input_buffer()
+            self._running = True
+            self.connected.emit()
+            print(f"[ProMicro] Connected on {port}")
+        except Exception as e:
+            self.error.emit(f"Cannot open {port}: {e}")
+            self._port = None
+            return
+        import threading
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_loop(self):
+        while self._running and self._port:
+            try:
+                line = self._port.readline().decode("utf-8", errors="ignore").strip()
+                if line.startswith("A0:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            self.sample_ready.emit(float(parts[1]))
+                        except ValueError:
+                            pass
+            except Exception as e:
+                if self._running:
+                    self.error.emit(str(e))
+                break
+        self.disconnected.emit()
+
+    def stop(self):
+        self._running = False
+        try:
+            if self._port: self._port.close()
+        except Exception:
+            pass
+        self._port = None
 
 
 # ── Moku live plot widget ──────────────────────────────────────────────────────
@@ -826,6 +895,114 @@ class RecordingPlotWindow(QWidget):
         self.raise_()
 
 
+# ── Live comparison plot window ────────────────────────────────────────────────
+
+class LiveComparisonPlot(QWidget):
+    """
+    Floating window showing software output vs readback in real time.
+    For Dev0/Dev1: DAQ commanded mA vs Moku measured mA.
+    For Dev2:      DAQ commanded V  vs chosen source (Moku or Guardian).
+
+    Two plots stacked:
+      Top    — time series of both commanded and measured
+      Bottom — scatter: commanded (X) vs measured (Y)
+    """
+
+    def __init__(self, card_label: str, mode: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Output vs Readback — {card_label}")
+        self.resize(620, 600)
+        self._mode = mode   # "current" or "voltage"
+
+        self._cmd_ts  = []
+        self._cmd_vs  = []
+        self._meas_ts = []
+        self._meas_vs = []
+        self._t       = 0.0
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        if HAS_PYQTGRAPH:
+            pg.setConfigOption('background', 'k')
+            pg.setConfigOption('foreground', 'w')
+
+            # time series
+            self._ts_plot = pg.PlotWidget()
+            y_unit = 'mA' if mode == 'current' else 'V'
+            self._ts_plot.setLabel('left',   f'Value ({y_unit})')
+            self._ts_plot.setLabel('bottom', 'Time', units='s')
+            self._ts_plot.setMinimumHeight(220)
+            self._ts_plot.addLegend()
+            self._cmd_curve  = self._ts_plot.plot(
+                [], [], pen=pg.mkPen('#FFD700', width=2), name='Commanded')
+            self._meas_curve = self._ts_plot.plot(
+                [], [], pen=pg.mkPen('#00FF88', width=2), name='Measured')
+            layout.addWidget(self._ts_plot)
+
+            # scatter
+            self._sc_plot = pg.PlotWidget()
+            self._sc_plot.setLabel('bottom', f'Commanded ({y_unit})')
+            self._sc_plot.setLabel('left',   f'Measured ({y_unit})')
+            self._sc_plot.setMinimumHeight(220)
+            self._scatter = self._sc_plot.plot(
+                [], [], pen=None, symbol='o', symbolSize=4,
+                symbolBrush='#00BFFF', symbolPen=None)
+            layout.addWidget(self._sc_plot)
+        else:
+            layout.addWidget(QLabel("pyqtgraph required"))
+            self._ts_plot = self._sc_plot = None
+
+        btn_row = QHBoxLayout()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(70)
+        clear_btn.clicked.connect(self.clear)
+        self._src_lbl = QLabel("")
+        self._src_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        btn_row.addWidget(clear_btn)
+        btn_row.addSpacing(10)
+        btn_row.addWidget(self._src_lbl)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+    def set_source_label(self, txt: str):
+        self._src_lbl.setText(txt)
+
+    def push(self, commanded: float, measured: float, dt: float = 0.1):
+        """Add a new data point. dt = time since last call in seconds."""
+        self._t += dt
+        self._cmd_ts.append(self._t);  self._cmd_vs.append(commanded)
+        self._meas_ts.append(self._t); self._meas_vs.append(measured)
+
+        window = 30.0
+        cutoff = self._t - window
+        for ts, vs in [(self._cmd_ts, self._cmd_vs),
+                       (self._meas_ts, self._meas_vs)]:
+            while ts and ts[0] < cutoff:
+                ts.pop(0); vs.pop(0)
+
+        if not HAS_PYQTGRAPH:
+            return
+
+        self._cmd_curve.setData(self._cmd_ts,  self._cmd_vs)
+        self._meas_curve.setData(self._meas_ts, self._meas_vs)
+        if self._cmd_ts:
+            x_max = self._cmd_ts[-1]
+            self._ts_plot.setXRange(x_max - window, x_max, padding=0)
+
+        # scatter — all points
+        self._scatter.setData(self._cmd_vs, self._meas_vs)
+
+    def clear(self):
+        self._t = 0.0
+        self._cmd_ts=[]; self._cmd_vs=[]
+        self._meas_ts=[]; self._meas_vs=[]
+        if HAS_PYQTGRAPH:
+            self._cmd_curve.setData([], [])
+            self._meas_curve.setData([], [])
+            self._scatter.setData([], [])
+
+
 # ── Pin config view ────────────────────────────────────────────────────────────
 
 class PinConfigView(QWidget):
@@ -1131,6 +1308,39 @@ class PinConfigView(QWidget):
         self._rec_t: float      = 0.0
         self._rec_plot_win: RecordingPlotWindow = None
 
+        # ── live comparison plot ──
+        cmp_row = QHBoxLayout()
+        self._cmp_btn = QPushButton("📈  Live Output vs Readback")
+        self._cmp_btn.setFixedWidth(200)
+        self._cmp_btn.clicked.connect(self._open_comparison_plot)
+
+        # Dev2 source selector (only visible for voltage card)
+        self._cmp_src_combo = QComboBox()
+        self._cmp_src_combo.addItem("Moku",     "moku")
+        self._cmp_src_combo.addItem("Guardian", "guardian")
+        self._cmp_src_combo.addItem("Pro Micro","promicro")
+        self._cmp_src_combo.setFixedWidth(100)
+        self._cmp_src_combo.setVisible(False)
+        self._cmp_src_label = QLabel("Source:")
+        self._cmp_src_label.setVisible(False)
+
+        cmp_row.addWidget(self._cmp_btn)
+        cmp_row.addSpacing(8)
+        cmp_row.addWidget(self._cmp_src_label)
+        cmp_row.addWidget(self._cmp_src_combo)
+        cmp_row.addStretch()
+
+        sep_cmp = QFrame()
+        sep_cmp.setFrameShape(QFrame.Shape.HLine)
+        sep_cmp.setFrameShadow(QFrame.Shadow.Sunken)
+        root.addWidget(sep_cmp)
+        root.addLayout(cmp_row)
+
+        self._cmp_win: LiveComparisonPlot = None
+        self._last_moku_v = 0.0
+        self._last_guardian_v = 0.0
+        self._last_pm_v = 0.0
+
         # AO-333 Guardian readback worker (Dev2 only)
         self._guardian_thread = QThread()
         self._guardian_worker = AO333ReadbackWorker()
@@ -1175,6 +1385,140 @@ class PinConfigView(QWidget):
         self._dev2_t   = 0.0
         self._dev2_ts  = []
         self._dev2_vs  = [[] for _ in range(NUM_PINS)]
+
+        # ── Pro Micro live plot ──
+        self._pm_plot_group = QGroupBox("Pro Micro — Live Voltage")
+        pg2 = QVBoxLayout(self._pm_plot_group)
+        pg2.setContentsMargins(4, 4, 4, 4)
+
+        pm_ctrl = QHBoxLayout()
+        pm_ctrl.addWidget(QLabel("Port:"))
+        self._pm_port_edit = QLineEdit(PROMICRO_PORT)
+        self._pm_port_edit.setFixedWidth(80)
+        pm_ctrl.addWidget(self._pm_port_edit)
+        self._pm_connect_btn    = QPushButton("Connect")
+        self._pm_disconnect_btn = QPushButton("✕")
+        self._pm_connect_btn.setFixedWidth(70)
+        self._pm_disconnect_btn.setFixedSize(24, 24)
+        self._pm_disconnect_btn.setVisible(False)
+        self._pm_status_lbl = QLabel("○")
+        self._pm_status_lbl.setFixedWidth(14)
+        self._pm_val_lbl = QLabel("— V")
+        self._pm_val_lbl.setMinimumWidth(80)
+        self._pm_connect_btn.clicked.connect(self._pm_connect)
+        self._pm_disconnect_btn.clicked.connect(self._pm_disconnect)
+        pm_ctrl.addWidget(self._pm_status_lbl)
+        pm_ctrl.addWidget(self._pm_connect_btn)
+        pm_ctrl.addWidget(self._pm_disconnect_btn)
+        pm_ctrl.addSpacing(10)
+        pm_ctrl.addWidget(self._pm_val_lbl)
+        pm_ctrl.addStretch()
+        pg2.addLayout(pm_ctrl)
+
+        if HAS_PYQTGRAPH:
+            self._pm_plot = pg.PlotWidget()
+            self._pm_plot.setLabel('left',   'Voltage', units='V')
+            self._pm_plot.setLabel('bottom', 'Time',    units='s')
+            self._pm_plot.setMinimumHeight(160)
+            self._pm_curve = self._pm_plot.plot(
+                [], [], pen=pg.mkPen('#00FF88', width=2))
+            pg2.addWidget(self._pm_plot)
+        else:
+            self._pm_plot  = None
+            self._pm_curve = None
+
+        self._pm_plot_group.setVisible(False)
+        root.addWidget(self._pm_plot_group)
+
+        self._pm_t  = 0.0
+        self._pm_ts = []
+        self._pm_vs = []
+
+        # Pro Micro worker + thread
+        self._pm_thread = QThread()
+        self._pm_worker = ProMicroWorker()
+        self._pm_worker.moveToThread(self._pm_thread)
+        self._pm_thread.start()
+        self._pm_worker.sample_ready.connect(self._on_pm_sample)
+        self._pm_worker.connected.connect(self._pm_on_connected)
+        self._pm_worker.disconnected.connect(self._pm_on_disconnected)
+        self._pm_worker.error.connect(
+            lambda msg: print(f"[ProMicro] {msg}"))
+
+    def _open_comparison_plot(self):
+        cs = self.card_session
+        if cs is None:
+            return
+        label = CARDS[cs.card_index]["label"]
+        self._cmp_win = LiveComparisonPlot(label, cs.mode)
+
+        if cs.mode == "current":
+            self._cmp_win.set_source_label("Measured = Moku Ch1 → mA via shunt")
+        else:
+            src = self._cmp_src_combo.currentData()
+            src_names = {"moku": "Moku Ch1", "guardian": "Guardian ADC",
+                         "promicro": "Pro Micro"}
+            self._cmp_win.set_source_label(
+                f"Measured = {src_names.get(src, src)}")
+
+        self._cmp_win.show()
+        self._cmp_win.raise_()
+
+    def _push_comparison(self, measured: float):
+        """Push a commanded/measured pair to the live comparison window."""
+        if self._cmp_win is None or not self._cmp_win.isVisible():
+            return
+        cs = self.card_session
+        if cs is None:
+            return
+        commanded = float(np.mean(cs.values))
+        self._cmp_win.push(commanded, measured, dt=MOKU_POLL_MS / 1000.0)
+
+    def _pm_connect(self):
+        port = self._pm_port_edit.text().strip()
+        self._pm_connect_btn.setEnabled(False)
+        self._pm_connect_btn.setText("…")
+        self._pm_t = 0.0; self._pm_ts = []; self._pm_vs = []
+        if HAS_PYQTGRAPH and self._pm_curve:
+            self._pm_curve.setData([], [])
+        QTimer.singleShot(0, lambda: self._pm_worker.start(port))
+
+    def _pm_disconnect(self):
+        QTimer.singleShot(0, self._pm_worker.stop)
+
+    def _pm_on_connected(self):
+        self._pm_status_lbl.setText("●")
+        self._pm_connect_btn.setVisible(False)
+        self._pm_disconnect_btn.setVisible(True)
+        self._pm_port_edit.setEnabled(False)
+        self._pm_connect_btn.setEnabled(True)
+        self._pm_connect_btn.setText("Connect")
+
+    def _pm_on_disconnected(self):
+        self._pm_status_lbl.setText("○")
+        self._pm_connect_btn.setVisible(True)
+        self._pm_disconnect_btn.setVisible(False)
+        self._pm_port_edit.setEnabled(True)
+        self._pm_val_lbl.setText("— V")
+
+    def _on_pm_sample(self, v: float):
+        self._last_pm_v = v
+        self._pm_val_lbl.setText(f"{v:.4f} V")
+        if (self.card_session and self.card_session.mode == "voltage"
+                and self._cmp_src_combo.currentData() == "promicro"):
+            self._push_comparison(v)
+        if not HAS_PYQTGRAPH or self._pm_curve is None:
+            return
+        self._pm_t += 0.2
+        self._pm_ts.append(self._pm_t)
+        self._pm_vs.append(v)
+        cutoff = self._pm_t - PROMICRO_PLOT_WINDOW_S
+        while self._pm_ts and self._pm_ts[0] < cutoff:
+            self._pm_ts.pop(0); self._pm_vs.pop(0)
+        self._pm_curve.setData(self._pm_ts, self._pm_vs)
+        if self._pm_ts:
+            x_max = self._pm_ts[-1]
+            self._pm_plot.setXRange(x_max - PROMICRO_PLOT_WINDOW_S, x_max, padding=0)
 
     def _on_sweep_mode_toggled(self):
         steps_mode = self._sweep_mode_combo.currentData() == "steps"
@@ -1252,6 +1596,17 @@ class PinConfigView(QWidget):
             lbl.setText("—")
         self._guardian_values = [0.0] * NUM_PINS
         self._dev2_plot_group.setVisible(is_voltage)
+        self._pm_plot_group.setVisible(is_voltage)
+        self._cmp_src_combo.setVisible(is_voltage)
+        self._cmp_src_label.setVisible(is_voltage)
+
+        # close stale comparison window when switching cards
+        if self._cmp_win and self._cmp_win.isVisible():
+            self._cmp_win.close()
+        self._cmp_win = None
+        self._last_moku_v = 0.0
+        self._last_guardian_v = 0.0
+        self._last_pm_v = 0.0
 
         # reset Dev2 rolling plot buffers
         self._dev2_t  = 0.0
@@ -1269,8 +1624,14 @@ class PinConfigView(QWidget):
     def _on_guardian_readback(self, values: list):
         """Called on GUI thread at AO333_GUARDIAN_POLL_MS rate from stream."""
         self._guardian_values = values
+        self._last_guardian_v = float(np.mean(values[:NUM_PINS]))
         for i, v in enumerate(values[:NUM_PINS]):
             self._readback_lbls[i].setText(f"{v:+.{READBACK_DECIMALS}f}V")
+
+        # push to comparison plot for Dev2 if Guardian source selected
+        if (self.card_session and self.card_session.mode == "voltage"
+                and self._cmp_src_combo.currentData() == "guardian"):
+            self._push_comparison(self._last_guardian_v)
 
         # update rolling plot
         if not HAS_PYQTGRAPH or not self._dev2_curves:
@@ -1295,11 +1656,22 @@ class PinConfigView(QWidget):
 
     def push_moku_sample(self, ch1_v: float, ch2_v: float):
         """Receives every Moku poll tick. For Dev2 we use Guardian, not Moku."""
+        self._last_moku_v = ch1_v
+
+        # push to comparison plot for current cards (Dev0/Dev1)
+        if self.card_session and self.card_session.mode == "current":
+            meas_ma = (ch1_v / MOKU_SHUNT_OHMS) * 1000.0
+            self._push_comparison(meas_ma)
+
+        # push to comparison for Dev2 when Moku source selected
+        if (self.card_session and self.card_session.mode == "voltage"
+                and self._cmp_src_combo.currentData() == "moku"):
+            self._push_comparison(ch1_v)
+
         if not self._recording or self.card_session is None:
             return
         # Dev2 (voltage) uses Guardian ADC readback; Dev0/1 use Moku
         if self.card_session.mode == "voltage":
-            # Guardian fires on its own timer — record the latest cached value
             readback_v = float(np.mean(self._guardian_values[:NUM_PINS]))
         else:
             readback_v = ch1_v
@@ -1629,11 +2001,11 @@ class DAQMainWindow(QMainWindow):
     def _open_card(self, idx: int):
         cs = self.card_sessions[idx]
         if cs.connected:
-            # already connected — just open the view
             self.pin_view.load_card(cs)
             self.stacked.setCurrentIndex(1)
             self.daq_box.refresh()
-            self.resize(PIN_WINDOW_W, PIN_WINDOW_H)
+            screen_h = QApplication.primaryScreen().availableGeometry().height()
+            self.resize(PIN_WINDOW_W, min(PIN_WINDOW_H, screen_h - 40))
             return
 
         self.status_bar.showMessage(f"Connecting to {CARDS[idx]['label']}…")
@@ -1664,7 +2036,8 @@ class DAQMainWindow(QMainWindow):
         self.pin_view.load_card(cs)
         self.stacked.setCurrentIndex(1)
         self.daq_box.refresh()
-        self.resize(PIN_WINDOW_W, PIN_WINDOW_H)
+        screen_h = QApplication.primaryScreen().availableGeometry().height()
+        self.resize(PIN_WINDOW_W, min(PIN_WINDOW_H, screen_h - 40))
 
     def _disconnect_card(self, idx: int):
         cs = self.card_sessions[idx]
@@ -1697,6 +2070,9 @@ class DAQMainWindow(QMainWindow):
         self.pin_view._guardian_worker.stop()
         self.pin_view._guardian_thread.quit()
         self.pin_view._guardian_thread.wait(2000)
+        self.pin_view._pm_worker.stop()
+        self.pin_view._pm_thread.quit()
+        self.pin_view._pm_thread.wait(2000)
         if self._bridge_proc and self._bridge_proc.poll() is None:
             self._bridge_proc.terminate()
             print("[Bridge] Terminated")
