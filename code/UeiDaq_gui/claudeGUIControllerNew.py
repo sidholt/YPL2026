@@ -900,28 +900,42 @@ class RecordingPlotWindow(QWidget):
 class LiveComparisonPlot(QWidget):
     """
     Floating window showing software output vs readback in real time.
-    For Dev0/Dev1: DAQ commanded mA vs Moku measured mA.
-    For Dev2:      DAQ commanded V  vs chosen source (Moku or Guardian).
-
-    Two plots stacked:
-      Top    — time series of both commanded and measured
-      Bottom — scatter: commanded (X) vs measured (Y)
+    Pin selector lets you choose which pin's commanded value to compare.
     """
 
     def __init__(self, card_label: str, mode: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Output vs Readback — {card_label}")
-        self.resize(620, 600)
-        self._mode = mode   # "current" or "voltage"
+        self.resize(620, 640)
+        self._mode = mode
 
         self._cmd_ts  = []
         self._cmd_vs  = []
         self._meas_ts = []
         self._meas_vs = []
         self._t       = 0.0
+        self._pin     = 0    # which pin's commanded value to track
 
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
+
+        # ── pin selector row ──
+        pin_row = QHBoxLayout()
+        pin_row.addWidget(QLabel("Pin:"))
+        self._pin_combo = QComboBox()
+        for i in range(NUM_PINS):
+            self._pin_combo.addItem(f"Pin {i:02d}", i)
+        self._pin_combo.setFixedWidth(80)
+        self._pin_combo.currentIndexChanged.connect(self._on_pin_changed)
+        pin_row.addWidget(self._pin_combo)
+        pin_row.addSpacing(16)
+        self._src_lbl = QLabel("")
+        self._src_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        pin_row.addWidget(self._src_lbl)
+        pin_row.addStretch()
+        layout.addLayout(pin_row)
+
+        y_unit = 'mA' if mode == 'current' else 'V'
 
         if HAS_PYQTGRAPH:
             pg.setConfigOption('background', 'k')
@@ -929,10 +943,10 @@ class LiveComparisonPlot(QWidget):
 
             # time series
             self._ts_plot = pg.PlotWidget()
-            y_unit = 'mA' if mode == 'current' else 'V'
             self._ts_plot.setLabel('left',   f'Value ({y_unit})')
             self._ts_plot.setLabel('bottom', 'Time', units='s')
-            self._ts_plot.setMinimumHeight(220)
+            self._ts_plot.getAxis('left').enableAutoSIPrefix(False)
+            self._ts_plot.setMinimumHeight(200)
             self._ts_plot.addLegend()
             self._cmd_curve  = self._ts_plot.plot(
                 [], [], pen=pg.mkPen('#FFD700', width=2), name='Commanded')
@@ -942,9 +956,11 @@ class LiveComparisonPlot(QWidget):
 
             # scatter
             self._sc_plot = pg.PlotWidget()
+            self._sc_plot.getAxis('bottom').enableAutoSIPrefix(False)
+            self._sc_plot.getAxis('left').enableAutoSIPrefix(False)
             self._sc_plot.setLabel('bottom', f'Commanded ({y_unit})')
             self._sc_plot.setLabel('left',   f'Measured ({y_unit})')
-            self._sc_plot.setMinimumHeight(220)
+            self._sc_plot.setMinimumHeight(200)
             self._scatter = self._sc_plot.plot(
                 [], [], pen=None, symbol='o', symbolSize=4,
                 symbolBrush='#00BFFF', symbolPen=None)
@@ -957,19 +973,21 @@ class LiveComparisonPlot(QWidget):
         clear_btn = QPushButton("Clear")
         clear_btn.setFixedWidth(70)
         clear_btn.clicked.connect(self.clear)
-        self._src_lbl = QLabel("")
-        self._src_lbl.setStyleSheet("color: gray; font-size: 10px;")
         btn_row.addWidget(clear_btn)
-        btn_row.addSpacing(10)
-        btn_row.addWidget(self._src_lbl)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
     def set_source_label(self, txt: str):
         self._src_lbl.setText(txt)
 
+    def _on_pin_changed(self):
+        self._pin = self._pin_combo.currentData()
+        self.clear()
+
+    def get_pin(self) -> int:
+        return self._pin
+
     def push(self, commanded: float, measured: float, dt: float = 0.1):
-        """Add a new data point. dt = time since last call in seconds."""
         self._t += dt
         self._cmd_ts.append(self._t);  self._cmd_vs.append(commanded)
         self._meas_ts.append(self._t); self._meas_vs.append(measured)
@@ -989,8 +1007,6 @@ class LiveComparisonPlot(QWidget):
         if self._cmd_ts:
             x_max = self._cmd_ts[-1]
             self._ts_plot.setXRange(x_max - window, x_max, padding=0)
-
-        # scatter — all points
         self._scatter.setData(self._cmd_vs, self._meas_vs)
 
     def clear(self):
@@ -1287,7 +1303,13 @@ class PinConfigView(QWidget):
         self._rec_btn.clicked.connect(self._toggle_recording)
         self._rec_status_lbl = QLabel("Idle")
         self._rec_status_lbl.setStyleSheet("color: gray;")
+        self._save_btn = QPushButton("💾  Save Data")
+        self._save_btn.setFixedWidth(110)
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._save_csv)
         rec_row1.addWidget(self._rec_btn)
+        rec_row1.addSpacing(8)
+        rec_row1.addWidget(self._save_btn)
         rec_row1.addSpacing(10)
         rec_row1.addWidget(self._rec_status_lbl)
         rec_row1.addStretch()
@@ -1298,6 +1320,22 @@ class PinConfigView(QWidget):
         rec_row2.addWidget(self._vi_checkbox)
         rec_row2.addStretch()
         rg.addLayout(rec_row2)
+
+        # source selector for recording readback (Dev2 only, hidden for current cards)
+        rec_row3 = QHBoxLayout()
+        rec_row3.addWidget(QLabel("Readback source:"))
+        self._rec_src_combo = QComboBox()
+        self._rec_src_combo.addItem("Moku",      "moku")
+        self._rec_src_combo.addItem("Guardian",  "guardian")
+        self._rec_src_combo.addItem("Pro Micro", "promicro")
+        self._rec_src_combo.setFixedWidth(110)
+        self._rec_src_lbl = QLabel("Readback source:")
+        rec_row3.addWidget(self._rec_src_combo)
+        rec_row3.addStretch()
+        self._rec_src_row_widget = QWidget()
+        self._rec_src_row_widget.setLayout(rec_row3)
+        self._rec_src_row_widget.setVisible(False)   # shown only for Dev2
+        rg.addWidget(self._rec_src_row_widget)
 
         root.addWidget(rec_group)
 
@@ -1464,15 +1502,31 @@ class PinConfigView(QWidget):
         self._cmp_win.show()
         self._cmp_win.raise_()
 
-    def _push_comparison(self, measured: float):
+    def _append_record(self, readback_v: float, dt: float):
+        """Append one sample to the recording buffer."""
+        self._rec_t += dt
+        self._rec_records.append({
+            't':      self._rec_t,
+            'moku_v': readback_v,
+            'daq':    list(self.card_session.values),
+            'mode':   self.card_session.mode,
+        })
+        self._rec_status_lbl.setText(
+            f"● Recording — {len(self._rec_records)} samples")
+
+    def _push_comparison(self, measured: float, dt: float = None):
         """Push a commanded/measured pair to the live comparison window."""
         if self._cmp_win is None or not self._cmp_win.isVisible():
             return
         cs = self.card_session
         if cs is None:
             return
-        commanded = float(np.mean(cs.values))
-        self._cmp_win.push(commanded, measured, dt=MOKU_POLL_MS / 1000.0)
+        # use the selected pin's commanded value
+        pin = self._cmp_win.get_pin()
+        commanded = cs.values[pin] if pin < len(cs.values) else 0.0
+        if dt is None:
+            dt = MOKU_POLL_MS / 1000.0
+        self._cmp_win.push(commanded, measured, dt=dt)
 
     def _pm_connect(self):
         port = self._pm_port_edit.text().strip()
@@ -1504,9 +1558,18 @@ class PinConfigView(QWidget):
     def _on_pm_sample(self, v: float):
         self._last_pm_v = v
         self._pm_val_lbl.setText(f"{v:.4f} V")
-        if (self.card_session and self.card_session.mode == "voltage"
-                and self._cmp_src_combo.currentData() == "promicro"):
-            self._push_comparison(v)
+
+        # push to comparison only when Pro Micro is the selected source
+        if (self._cmp_src_combo.currentData() == "promicro"
+                and self._cmp_win and self._cmp_win.isVisible()
+                and self.card_session):
+            self._push_comparison(v, dt=0.2)
+
+        # append to recording when Pro Micro is the selected recording source
+        if (self._recording and self.card_session
+                and self._rec_src_combo.currentData() == "promicro"):
+            self._append_record(v, dt=0.2)
+
         if not HAS_PYQTGRAPH or self._pm_curve is None:
             return
         self._pm_t += 0.2
@@ -1599,6 +1662,7 @@ class PinConfigView(QWidget):
         self._pm_plot_group.setVisible(is_voltage)
         self._cmp_src_combo.setVisible(is_voltage)
         self._cmp_src_label.setVisible(is_voltage)
+        self._rec_src_row_widget.setVisible(is_voltage)
 
         # close stale comparison window when switching cards
         if self._cmp_win and self._cmp_win.isVisible():
@@ -1628,10 +1692,19 @@ class PinConfigView(QWidget):
         for i, v in enumerate(values[:NUM_PINS]):
             self._readback_lbls[i].setText(f"{v:+.{READBACK_DECIMALS}f}V")
 
-        # push to comparison plot for Dev2 if Guardian source selected
-        if (self.card_session and self.card_session.mode == "voltage"
-                and self._cmp_src_combo.currentData() == "guardian"):
-            self._push_comparison(self._last_guardian_v)
+        # push to comparison only when Guardian is the selected source
+        if (self._cmp_src_combo.currentData() == "guardian"
+                and self._cmp_win and self._cmp_win.isVisible()
+                and self.card_session):
+            pin = self._cmp_win.get_pin()
+            v   = values[pin] if pin < len(values) else 0.0
+            self._push_comparison(v, dt=AO333_GUARDIAN_POLL_MS / 1000.0)
+
+        # append to recording when Guardian is the selected recording source
+        if (self._recording and self.card_session
+                and self._rec_src_combo.currentData() == "guardian"):
+            self._append_record(self._last_guardian_v,
+                                dt=AO333_GUARDIAN_POLL_MS / 1000.0)
 
         # update rolling plot
         if not HAS_PYQTGRAPH or not self._dev2_curves:
@@ -1655,35 +1728,26 @@ class PinConfigView(QWidget):
                 x_max - AO333_PLOT_WINDOW_S, x_max, padding=0)
 
     def push_moku_sample(self, ch1_v: float, ch2_v: float):
-        """Receives every Moku poll tick. For Dev2 we use Guardian, not Moku."""
+        """Receives every Moku poll tick."""
         self._last_moku_v = ch1_v
+        dt = MOKU_POLL_MS / 1000.0
 
-        # push to comparison plot for current cards (Dev0/Dev1)
-        if self.card_session and self.card_session.mode == "current":
-            meas_ma = (ch1_v / MOKU_SHUNT_OHMS) * 1000.0
-            self._push_comparison(meas_ma)
-
-        # push to comparison for Dev2 when Moku source selected
-        if (self.card_session and self.card_session.mode == "voltage"
-                and self._cmp_src_combo.currentData() == "moku"):
-            self._push_comparison(ch1_v)
-
-        if not self._recording or self.card_session is None:
+        if self.card_session is None:
             return
-        # Dev2 (voltage) uses Guardian ADC readback; Dev0/1 use Moku
-        if self.card_session.mode == "voltage":
-            readback_v = float(np.mean(self._guardian_values[:NUM_PINS]))
-        else:
-            readback_v = ch1_v
-        self._rec_t += MOKU_POLL_MS / 1000.0
-        self._rec_records.append({
-            't':      self._rec_t,
-            'moku_v': readback_v,
-            'daq':    list(self.card_session.values),
-            'mode':   self.card_session.mode,
-        })
-        n = len(self._rec_records)
-        self._rec_status_lbl.setText(f"● Recording — {n} samples")
+
+        if self.card_session.mode == "current":
+            meas_ma = (ch1_v / MOKU_SHUNT_OHMS) * 1000.0
+            self._push_comparison(meas_ma, dt=dt)
+            # current cards always record from Moku
+            if self._recording:
+                self._append_record(ch1_v, dt)
+
+        elif self.card_session.mode == "voltage":
+            if self._cmp_src_combo.currentData() == "moku":
+                self._push_comparison(ch1_v, dt=dt)
+            # record from Moku only if Moku is the selected recording source
+            if self._recording and self._rec_src_combo.currentData() == "moku":
+                self._append_record(ch1_v, dt)
 
     def _toggle_recording(self):
         if not self._recording:
@@ -1699,6 +1763,7 @@ class PinConfigView(QWidget):
         self._rec_btn.setStyleSheet("color: red;")
         self._rec_status_lbl.setText("● Recording — 0 samples")
         self._rec_status_lbl.setStyleSheet("color: red;")
+        self._save_btn.setEnabled(False)
 
     def _stop_recording(self):
         self._recording = False
@@ -1708,9 +1773,10 @@ class PinConfigView(QWidget):
         self._rec_status_lbl.setStyleSheet("color: gray;")
         if n == 0:
             self._rec_status_lbl.setText("Idle — no data recorded")
+            self._save_btn.setEnabled(False)
             return
         self._rec_status_lbl.setText(f"Idle — {n} samples recorded")
-        self._save_csv()
+        self._save_btn.setEnabled(True)
         self._show_plots()
 
     def _save_csv(self):
@@ -1723,15 +1789,23 @@ class PinConfigView(QWidget):
         dev   = self.card_session.dev
         unit  = self.card_session.unit
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = os.path.join(data_dir, f"{dev}_{mode}_{stamp}.csv")
-        # label readback column by source
+
+        # label readback column by actual source used
         if mode == "current":
+            src          = "moku"
             readback_col = "moku_mA"
         else:
-            readback_col = "guardian_V"   # AO-333 onboard ADC
+            src = self._rec_src_combo.currentData()
+            readback_col = {
+                "moku":      "moku_V",
+                "guardian":  "guardian_V",
+                "promicro":  "promicro_V",
+            }.get(src, "readback_V")
+
+        fname    = os.path.join(data_dir, f"{dev}_{mode}_{src}_{stamp}.csv")
         pin_hdrs = [f"pin{i:02d}_{unit}" for i in range(NUM_PINS)]
-        header   = ["time_s", "readback_raw_V", readback_col] + pin_hdrs
-        import csv
+        header   = ["time_s", "readback_raw", readback_col] + pin_hdrs
+
         with open(fname, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(header)
@@ -1739,7 +1813,7 @@ class PinConfigView(QWidget):
                 if mode == "current":
                     scaled = (r['moku_v'] / MOKU_SHUNT_OHMS) * 1000.0
                 else:
-                    scaled = r['moku_v']   # Guardian already in volts
+                    scaled = r['moku_v']   # already in volts for all Dev2 sources
                 w.writerow([f"{r['t']:.4f}", f"{r['moku_v']:.6f}",
                              f"{scaled:.4f}"] +
                             [f"{v:.4f}" for v in r['daq']])
