@@ -63,19 +63,21 @@ PIN_WINDOW_H   = 950   # tall enough to see all pins + panels without scrolling
 SWEEP_DEFAULT_STEPS    = 10
 SWEEP_DEFAULT_DWELL_MS = 500
 
-MOKU_PLOT_WINDOW_S = 5.0    # seconds of rolling history shown
-MOKU_POLL_MS       = 100    # poll interval ms
-MOKU_SHUNT_OHMS    = 505.85    # load resistor (Ohms) — I = V / R
+MOKU_PLOT_WINDOW_S     = 10.0   # seconds of rolling history on Moku home plot
+MOKU_POLL_MS           = 100    # poll interval ms
+MOKU_SHUNT_OHMS        = 100.0  # load resistor (Ohms) — I = V / R
 
 AO333_GUARDIAN_POLL_MS = 50     # GUI update rate from stream (ms) — 20Hz display
-AO333_PLOT_WINDOW_S    = 10.0   # seconds of rolling history on Dev2 plot
 
 # Bridge process config
 BRIDGE_PORT       = 57333
 BRIDGE_PYTHON     = r".venv32\Scripts\python.exe"
 BRIDGE_SCRIPT     = r"code\UeiDaq_gui\ao333_bridge.py"
 
-READBACK_DECIMALS = 6
+READBACK_DECIMALS      = 6
+PLOT_CHUNK_MS          = 100    # repaint all plots at most every 100ms
+CMP_PLOT_WINDOW_S      = 10.0   # seconds on comparison plot time series
+PROMICRO_PLOT_WINDOW_S = 10.0   # seconds on Pro Micro rolling plot
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -291,7 +293,6 @@ class AO333ReadbackWorker(QObject):
 
 PROMICRO_PORT          = "COM11"
 PROMICRO_BAUD          = 9600
-PROMICRO_PLOT_WINDOW_S = 10.0
 
 try:
     import serial
@@ -304,10 +305,11 @@ except ImportError:
 # ── Pro Micro serial worker ────────────────────────────────────────────────────
 
 class ProMicroWorker(QObject):
-    sample_ready = pyqtSignal(float)
-    error        = pyqtSignal(str)
-    connected    = pyqtSignal()
-    disconnected = pyqtSignal()
+    sample_ready    = pyqtSignal(float)         # A0 voltage (V)
+    current_ready   = pyqtSignal(float)         # A1 current (mA)
+    error           = pyqtSignal(str)
+    connected       = pyqtSignal()
+    disconnected    = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -333,16 +335,24 @@ class ProMicroWorker(QObject):
         threading.Thread(target=self._read_loop, daemon=True).start()
 
     def _read_loop(self):
+        """Parse lines like: 'A0: 1.2345 V  A1: 8.7654 mA'"""
         while self._running and self._port:
             try:
                 line = self._port.readline().decode("utf-8", errors="ignore").strip()
-                if line.startswith("A0:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        try:
-                            self.sample_ready.emit(float(parts[1]))
-                        except ValueError:
-                            pass
+                if not line.startswith("A0:"):
+                    continue
+                parts = line.split()
+                # A0: <v> V  A1: <ma> mA
+                try:
+                    self.sample_ready.emit(float(parts[1]))   # voltage
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    # find A1: index
+                    a1_idx = parts.index("A1:")
+                    self.current_ready.emit(float(parts[a1_idx + 1]))
+                except (ValueError, IndexError):
+                    pass
             except Exception as e:
                 if self._running:
                     self.error.emit(str(e))
@@ -605,12 +615,6 @@ class CardSession:
             raise RuntimeError("Session not connected")
         scaled = [v / 1000.0 for v in values] if self.mode == "current" else values
         self.writer.WriteSingleScan(scaled)
-        changed = [i for i, (old, new) in enumerate(zip(self.values, values))
-                   if abs(old - new) > 1e-6]
-        if changed:
-            print(f"[{self.dev}]  " +
-                  "   ".join(f"Pin {i:02d}: {values[i]:8.3f} {self.unit}"
-                             for i in changed))
         self.values = list(values)
 
     def start_wave(self, pin: int, waveform: str, freq: float,
@@ -992,22 +996,12 @@ class LiveComparisonPlot(QWidget):
         self._cmd_ts.append(self._t);  self._cmd_vs.append(commanded)
         self._meas_ts.append(self._t); self._meas_vs.append(measured)
 
-        window = 30.0
-        cutoff = self._t - window
+        cutoff = self._t - CMP_PLOT_WINDOW_S
         for ts, vs in [(self._cmd_ts, self._cmd_vs),
                        (self._meas_ts, self._meas_vs)]:
             while ts and ts[0] < cutoff:
                 ts.pop(0); vs.pop(0)
-
-        if not HAS_PYQTGRAPH:
-            return
-
-        self._cmd_curve.setData(self._cmd_ts,  self._cmd_vs)
-        self._meas_curve.setData(self._meas_ts, self._meas_vs)
-        if self._cmd_ts:
-            x_max = self._cmd_ts[-1]
-            self._ts_plot.setXRange(x_max - window, x_max, padding=0)
-        self._scatter.setData(self._cmd_vs, self._meas_vs)
+        # setData handled by PinConfigView._repaint_plots
 
     def clear(self):
         self._t = 0.0
@@ -1354,13 +1348,9 @@ class PinConfigView(QWidget):
 
         # Dev2 source selector (only visible for voltage card)
         self._cmp_src_combo = QComboBox()
-        self._cmp_src_combo.addItem("Moku",     "moku")
-        self._cmp_src_combo.addItem("Guardian", "guardian")
-        self._cmp_src_combo.addItem("Pro Micro","promicro")
-        self._cmp_src_combo.setFixedWidth(100)
-        self._cmp_src_combo.setVisible(False)
+        self._cmp_src_combo.setFixedWidth(110)
         self._cmp_src_label = QLabel("Source:")
-        self._cmp_src_label.setVisible(False)
+        self._cmp_src_label.setVisible(True)
 
         cmp_row.addWidget(self._cmp_btn)
         cmp_row.addSpacing(8)
@@ -1389,43 +1379,8 @@ class PinConfigView(QWidget):
             lambda msg: print(f"[AO333] {msg}"))
         self._guardian_values: list = [0.0] * NUM_PINS
 
-        # ── Dev2 live rolling plot ──
-        self._dev2_plot_group = QGroupBox("Dev2 Live Voltage Readback")
-        dg = QVBoxLayout(self._dev2_plot_group)
-        dg.setContentsMargins(4, 4, 4, 4)
-
-        if HAS_PYQTGRAPH:
-            pg.setConfigOption('background', 'k')
-            pg.setConfigOption('foreground', 'w')
-            self._dev2_plot = pg.PlotWidget()
-            self._dev2_plot.setLabel('left',   'Voltage', units='V')
-            self._dev2_plot.setLabel('bottom', 'Time',    units='s')
-            self._dev2_plot.setMinimumHeight(200)
-            self._dev2_plot.addLegend()
-            colors = ['#FFD700','#00BFFF','#FF6347','#00FF88',
-                      '#FF69B4','#FFA500','#7B68EE','#00CED1']
-            self._dev2_curves = []
-            for i in range(NUM_PINS):
-                c = self._dev2_plot.plot(
-                    [], [], pen=pg.mkPen(colors[i], width=1),
-                    name=f'Pin {i}')
-                self._dev2_curves.append(c)
-            dg.addWidget(self._dev2_plot)
-        else:
-            dg.addWidget(QLabel("(pyqtgraph required)"))
-            self._dev2_plot   = None
-            self._dev2_curves = []
-
-        self._dev2_plot_group.setVisible(False)
-        root.addWidget(self._dev2_plot_group)
-
-        # rolling buffers for Dev2 plot
-        self._dev2_t   = 0.0
-        self._dev2_ts  = []
-        self._dev2_vs  = [[] for _ in range(NUM_PINS)]
-
         # ── Pro Micro live plot ──
-        self._pm_plot_group = QGroupBox("Pro Micro — Live Voltage")
+        self._pm_plot_group = QGroupBox("Pro Micro — Live Readback")
         pg2 = QVBoxLayout(self._pm_plot_group)
         pg2.setContentsMargins(4, 4, 4, 4)
 
@@ -1443,6 +1398,8 @@ class PinConfigView(QWidget):
         self._pm_status_lbl.setFixedWidth(14)
         self._pm_val_lbl = QLabel("— V")
         self._pm_val_lbl.setMinimumWidth(80)
+        self._pm_ma_lbl = QLabel("— mA")
+        self._pm_ma_lbl.setMinimumWidth(80)
         self._pm_connect_btn.clicked.connect(self._pm_connect)
         self._pm_disconnect_btn.clicked.connect(self._pm_disconnect)
         pm_ctrl.addWidget(self._pm_status_lbl)
@@ -1450,27 +1407,44 @@ class PinConfigView(QWidget):
         pm_ctrl.addWidget(self._pm_disconnect_btn)
         pm_ctrl.addSpacing(10)
         pm_ctrl.addWidget(self._pm_val_lbl)
+        pm_ctrl.addWidget(self._pm_ma_lbl)
         pm_ctrl.addStretch()
         pg2.addLayout(pm_ctrl)
 
         if HAS_PYQTGRAPH:
+            # voltage plot (Dev2)
             self._pm_plot = pg.PlotWidget()
             self._pm_plot.setLabel('left',   'Voltage', units='V')
             self._pm_plot.setLabel('bottom', 'Time',    units='s')
-            self._pm_plot.setMinimumHeight(160)
+            self._pm_plot.getAxis('left').enableAutoSIPrefix(False)
+            self._pm_plot.setMinimumHeight(140)
             self._pm_curve = self._pm_plot.plot(
                 [], [], pen=pg.mkPen('#00FF88', width=2))
             pg2.addWidget(self._pm_plot)
+
+            # current plot (Dev0/Dev1)
+            self._pm_ma_plot = pg.PlotWidget()
+            self._pm_ma_plot.setLabel('left',   'Current', units='mA')
+            self._pm_ma_plot.setLabel('bottom', 'Time',    units='s')
+            self._pm_ma_plot.getAxis('left').enableAutoSIPrefix(False)
+            self._pm_ma_plot.setMinimumHeight(140)
+            self._pm_ma_curve = self._pm_ma_plot.plot(
+                [], [], pen=pg.mkPen('#FF6347', width=2))
+            pg2.addWidget(self._pm_ma_plot)
         else:
-            self._pm_plot  = None
-            self._pm_curve = None
+            self._pm_plot     = None
+            self._pm_curve    = None
+            self._pm_ma_plot  = None
+            self._pm_ma_curve = None
 
         self._pm_plot_group.setVisible(False)
         root.addWidget(self._pm_plot_group)
 
-        self._pm_t  = 0.0
-        self._pm_ts = []
-        self._pm_vs = []
+        self._pm_t   = 0.0
+        self._pm_ts  = []
+        self._pm_vs  = []
+        self._pm_ma_ts = []
+        self._pm_ma_vs = []
 
         # Pro Micro worker + thread
         self._pm_thread = QThread()
@@ -1478,10 +1452,53 @@ class PinConfigView(QWidget):
         self._pm_worker.moveToThread(self._pm_thread)
         self._pm_thread.start()
         self._pm_worker.sample_ready.connect(self._on_pm_sample)
+        self._pm_worker.current_ready.connect(self._on_pm_current)
         self._pm_worker.connected.connect(self._pm_on_connected)
         self._pm_worker.disconnected.connect(self._pm_on_disconnected)
         self._pm_worker.error.connect(
             lambda msg: print(f"[ProMicro] {msg}"))
+
+        # ── batch plot repaint timer ──
+        # All setData calls happen here, decoupled from data arrival rate
+        self._plot_dirty = False   # flag: new data arrived since last repaint
+        self._plot_timer = QTimer()
+        self._plot_timer.setInterval(PLOT_CHUNK_MS)
+        self._plot_timer.timeout.connect(self._repaint_plots)
+        self._plot_timer.start()
+
+    def _repaint_plots(self):
+        """Called every PLOT_CHUNK_MS — repaints all plots in one batch."""
+        if not self._plot_dirty or not HAS_PYQTGRAPH:
+            return
+        self._plot_dirty = False
+
+        # Pro Micro voltage rolling plot
+        if self._pm_curve and self._pm_ts:
+            self._pm_curve.setData(self._pm_ts, self._pm_vs)
+            x_max = self._pm_ts[-1]
+            self._pm_plot.setXRange(
+                x_max - PROMICRO_PLOT_WINDOW_S, x_max, padding=0)
+
+        # Pro Micro current rolling plot
+        if self._pm_ma_curve and self._pm_ma_ts:
+            self._pm_ma_curve.setData(self._pm_ma_ts, self._pm_ma_vs)
+            x_max = self._pm_ma_ts[-1]
+            self._pm_ma_plot.setXRange(
+                x_max - PROMICRO_PLOT_WINDOW_S, x_max, padding=0)
+
+        # Live comparison plot
+        if self._cmp_win and self._cmp_win.isVisible() and HAS_PYQTGRAPH:
+            if self._cmp_win._cmd_ts:
+                self._cmp_win._cmd_curve.setData(
+                    self._cmp_win._cmd_ts, self._cmp_win._cmd_vs)
+                self._cmp_win._meas_curve.setData(
+                    self._cmp_win._meas_ts, self._cmp_win._meas_vs)
+                x_max = self._cmp_win._cmd_ts[-1]
+                self._cmp_win._ts_plot.setXRange(
+                    x_max - CMP_PLOT_WINDOW_S, x_max, padding=0)
+            if self._cmp_win._cmd_vs:
+                self._cmp_win._scatter.setData(
+                    self._cmp_win._cmd_vs, self._cmp_win._meas_vs)
 
     def _open_comparison_plot(self):
         cs = self.card_session
@@ -1490,14 +1507,15 @@ class PinConfigView(QWidget):
         label = CARDS[cs.card_index]["label"]
         self._cmp_win = LiveComparisonPlot(label, cs.mode)
 
+        src = self._cmp_src_combo.currentData()
+        src_names = {"moku": "Moku Ch1", "guardian": "Guardian ADC",
+                     "promicro": "Pro Micro"}
+        src_name = src_names.get(src, src)
         if cs.mode == "current":
-            self._cmp_win.set_source_label("Measured = Moku Ch1 → mA via shunt")
+            unit_note = "→ mA via shunt" if src == "moku" else "→ mA via A1"
+            self._cmp_win.set_source_label(f"Measured = {src_name} {unit_note}")
         else:
-            src = self._cmp_src_combo.currentData()
-            src_names = {"moku": "Moku Ch1", "guardian": "Guardian ADC",
-                         "promicro": "Pro Micro"}
-            self._cmp_win.set_source_label(
-                f"Measured = {src_names.get(src, src)}")
+            self._cmp_win.set_source_label(f"Measured = {src_name}")
 
         self._cmp_win.show()
         self._cmp_win.raise_()
@@ -1521,20 +1539,23 @@ class PinConfigView(QWidget):
         cs = self.card_session
         if cs is None:
             return
-        # use the selected pin's commanded value
         pin = self._cmp_win.get_pin()
         commanded = cs.values[pin] if pin < len(cs.values) else 0.0
         if dt is None:
             dt = MOKU_POLL_MS / 1000.0
         self._cmp_win.push(commanded, measured, dt=dt)
+        self._plot_dirty = True
 
     def _pm_connect(self):
         port = self._pm_port_edit.text().strip()
         self._pm_connect_btn.setEnabled(False)
         self._pm_connect_btn.setText("…")
-        self._pm_t = 0.0; self._pm_ts = []; self._pm_vs = []
-        if HAS_PYQTGRAPH and self._pm_curve:
-            self._pm_curve.setData([], [])
+        self._pm_t = 0.0
+        self._pm_ts = []; self._pm_vs = []
+        self._pm_ma_ts = []; self._pm_ma_vs = []
+        if HAS_PYQTGRAPH:
+            if self._pm_curve:    self._pm_curve.setData([], [])
+            if self._pm_ma_curve: self._pm_ma_curve.setData([], [])
         QTimer.singleShot(0, lambda: self._pm_worker.start(port))
 
     def _pm_disconnect(self):
@@ -1559,10 +1580,11 @@ class PinConfigView(QWidget):
         self._last_pm_v = v
         self._pm_val_lbl.setText(f"{v:.4f} V")
 
-        # push to comparison only when Pro Micro is the selected source
+        # push voltage to comparison for Dev2 when Pro Micro selected
         if (self._cmp_src_combo.currentData() == "promicro"
                 and self._cmp_win and self._cmp_win.isVisible()
-                and self.card_session):
+                and self.card_session
+                and self.card_session.mode == "voltage"):
             self._push_comparison(v, dt=0.2)
 
         # append to recording when Pro Micro is the selected recording source
@@ -1578,12 +1600,33 @@ class PinConfigView(QWidget):
         cutoff = self._pm_t - PROMICRO_PLOT_WINDOW_S
         while self._pm_ts and self._pm_ts[0] < cutoff:
             self._pm_ts.pop(0); self._pm_vs.pop(0)
-        self._pm_curve.setData(self._pm_ts, self._pm_vs)
-        if self._pm_ts:
-            x_max = self._pm_ts[-1]
-            self._pm_plot.setXRange(x_max - PROMICRO_PLOT_WINDOW_S, x_max, padding=0)
+        self._plot_dirty = True   # setData handled by _repaint_plots
+
+    def _on_pm_current(self, ma: float):
+        self._pm_ma_lbl.setText(f"{ma:.3f} mA")
+
+        # push current to comparison for Dev0/Dev1 when Pro Micro selected
+        if (self._cmp_src_combo.currentData() == "promicro"
+                and self._cmp_win and self._cmp_win.isVisible()
+                and self.card_session
+                and self.card_session.mode == "current"):
+            self._push_comparison(ma, dt=0.2)
+
+        if not HAS_PYQTGRAPH or self._pm_ma_curve is None:
+            return
+        self._pm_ma_ts.append(self._pm_t)
+        self._pm_ma_vs.append(ma)
+        cutoff = self._pm_t - PROMICRO_PLOT_WINDOW_S
+        while self._pm_ma_ts and self._pm_ma_ts[0] < cutoff:
+            self._pm_ma_ts.pop(0); self._pm_ma_vs.pop(0)
+        self._plot_dirty = True
 
     def _on_sweep_mode_toggled(self):
+        steps_mode = self._sweep_mode_combo.currentData() == "steps"
+        self.sweep_steps_sb.setVisible(steps_mode)
+        self.sweep_stepsize_sb.setVisible(not steps_mode)
+        self._update_sweep_derived()
+
         steps_mode = self._sweep_mode_combo.currentData() == "steps"
         self.sweep_steps_sb.setVisible(steps_mode)
         self.sweep_stepsize_sb.setVisible(not steps_mode)
@@ -1658,11 +1701,21 @@ class PinConfigView(QWidget):
             lbl.setVisible(is_voltage)
             lbl.setText("—")
         self._guardian_values = [0.0] * NUM_PINS
-        self._dev2_plot_group.setVisible(is_voltage)
-        self._pm_plot_group.setVisible(is_voltage)
-        self._cmp_src_combo.setVisible(is_voltage)
-        self._cmp_src_label.setVisible(is_voltage)
+        self._pm_plot_group.setVisible(True)
+        # show voltage plot for Dev2, current plot for Dev0/Dev1
+        if HAS_PYQTGRAPH:
+            if self._pm_plot:    self._pm_plot.setVisible(is_voltage)
+            if self._pm_ma_plot: self._pm_ma_plot.setVisible(not is_voltage)
         self._rec_src_row_widget.setVisible(is_voltage)
+
+        # populate comparison source options based on card mode
+        self._cmp_src_combo.blockSignals(True)
+        self._cmp_src_combo.clear()
+        self._cmp_src_combo.addItem("Moku",      "moku")
+        if is_voltage:
+            self._cmp_src_combo.addItem("Guardian",  "guardian")
+        self._cmp_src_combo.addItem("Pro Micro", "promicro")
+        self._cmp_src_combo.blockSignals(False)
 
         # close stale comparison window when switching cards
         if self._cmp_win and self._cmp_win.isVisible():
@@ -1673,13 +1726,6 @@ class PinConfigView(QWidget):
         self._last_pm_v = 0.0
 
         # reset Dev2 rolling plot buffers
-        self._dev2_t  = 0.0
-        self._dev2_ts = []
-        self._dev2_vs = [[] for _ in range(NUM_PINS)]
-        if HAS_PYQTGRAPH and self._dev2_curves:
-            for c in self._dev2_curves:
-                c.setData([], [])
-
         if is_voltage:
             QTimer.singleShot(0, self._guardian_worker.start)
         else:
@@ -1706,27 +1752,6 @@ class PinConfigView(QWidget):
             self._append_record(self._last_guardian_v,
                                 dt=AO333_GUARDIAN_POLL_MS / 1000.0)
 
-        # update rolling plot
-        if not HAS_PYQTGRAPH or not self._dev2_curves:
-            return
-        self._dev2_t += AO333_GUARDIAN_POLL_MS / 1000.0
-        self._dev2_ts.append(self._dev2_t)
-        for i, v in enumerate(values[:NUM_PINS]):
-            self._dev2_vs[i].append(v)
-
-        cutoff = self._dev2_t - AO333_PLOT_WINDOW_S
-        while self._dev2_ts and self._dev2_ts[0] < cutoff:
-            self._dev2_ts.pop(0)
-            for buf in self._dev2_vs:
-                if buf: buf.pop(0)
-
-        for i, curve in enumerate(self._dev2_curves):
-            curve.setData(self._dev2_ts, self._dev2_vs[i])
-        if self._dev2_ts:
-            x_max = self._dev2_ts[-1]
-            self._dev2_plot.setXRange(
-                x_max - AO333_PLOT_WINDOW_S, x_max, padding=0)
-
     def push_moku_sample(self, ch1_v: float, ch2_v: float):
         """Receives every Moku poll tick."""
         self._last_moku_v = ch1_v
@@ -1737,7 +1762,8 @@ class PinConfigView(QWidget):
 
         if self.card_session.mode == "current":
             meas_ma = (ch1_v / MOKU_SHUNT_OHMS) * 1000.0
-            self._push_comparison(meas_ma, dt=dt)
+            if self._cmp_src_combo.currentData() == "moku":
+                self._push_comparison(meas_ma, dt=dt)
             # current cards always record from Moku
             if self._recording:
                 self._append_record(ch1_v, dt)
