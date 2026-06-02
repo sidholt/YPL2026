@@ -18,7 +18,7 @@ import ctypes
 import time
 
 # ── config ────────────────────────────────────────────────────────────────────
-CUBE_IP     = "172.28.2.5"
+CUBE_IP = "172.28.2.4"
 DEV_NUM     = 2
 NUM_CH      = 8
 BRIDGE_PORT = 57333
