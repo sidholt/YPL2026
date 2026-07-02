@@ -1,11 +1,13 @@
 """
 unified_lab_gui.py — YPL Lab Control
-One window, two tabs:
-  • DAQ Control  — UEI PowerDNA cards + Moku:Go + Guardian + Pro Micro
-  • ITLA Laser   — Emcore TTX ITLA controller
+One window, multiple tabs:
+  • DAQ Control    — UEI PowerDNA cards + Moku:Go + Guardian + Pro Micro
+  • ITLA Laser     — Emcore TTX ITLA controller
+  • CONEX Motor    — Newport CONEX-CC / TRA12CC controller
+  • HP-8168F Laser — HP/Agilent 8168F tunable laser source (GPIB)
 
 All-PyQt6 (the old itla_gui.py was PySide6 and has been ported).
-Requires: PyQt6, pyqtgraph, numpy; optional: UeiDaq, moku, pyserial, hardware.itla
+Requires: PyQt6, pyqtgraph, numpy; optional: UeiDaq, moku, pyserial, hardware.itla, pyvisa
 Run:      python unified_lab_gui.py
 """
 
@@ -15,6 +17,7 @@ os.environ["MOKU_CLI_PATH"] = r"C:\Program Files\Liquid Instruments\Moku CLI\mok
 import sys
 import math
 import time
+import threading
 import subprocess
 import socket
 import json
@@ -73,6 +76,27 @@ try:
 except ImportError:
     HAS_PYVISA = False
     print("[WARNING] pyvisa not found — CONEX-CC Motor tab disabled. Run: uv pip install pyvisa pyvisa-py")
+
+try:
+    from hardware.laser_hp_8168F import HP8168F
+    HAS_HP8168F = True
+except ImportError:
+    HAS_HP8168F = False
+    print("[WARNING] hardware.laser_hp_8168F not found — HP-8168F Laser tab disabled.")
+
+try:
+    from hardware.coredaq import CoreDAQ
+    HAS_COREDAQ = True
+except ImportError:
+    HAS_COREDAQ = False
+    print("[WARNING] hardware.coredaq not found — CoreDAQ Power Meter tab disabled.")
+
+try:
+    from hardware.laser_tsl_550 import TSL550
+    HAS_SANTEC = True
+except ImportError:
+    HAS_SANTEC = False
+    print("[WARNING] hardware.laser_tsl_550 not found or nidaqmx missing — Santec Laser tab disabled.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # THEME
@@ -184,13 +208,43 @@ class NoScrollDoubleSpinBox(QDoubleSpinBox):
 CUBE_IP = "172.28.2.4"
 MOKU_IP = "172.28.5.6"
 
-NUM_PINS = 8
+NUM_PINS = 8    # Guardian ADC readback bridge channel count (ao333_bridge.py) — unrelated to AO channel count
+MAX_PINS = 32   # widest channel count any single card exposes (Dev2 / AO-333)
 
 CARDS = {
-    0: {"label": "DEV0  —  CURRENT", "mode": "current", "dev": "Dev0", "available": True},
-    1: {"label": "DEV1  —  CURRENT", "mode": "current", "dev": "Dev1", "available": True},
-    2: {"label": "DEV2  —  VOLTAGE", "mode": "voltage", "dev": "Dev2", "available": True},
+    0: {"label": "DEV0  —  CURRENT", "mode": "current", "dev": "Dev0", "available": True,
+        "channels": 16},
+    1: {"label": "DEV1  —  CURRENT", "mode": "current", "dev": "Dev1", "available": True,
+        "channels": 16},
+    2: {"label": "DEV2  —  VOLTAGE", "mode": "voltage", "dev": "Dev2", "available": True,
+        "channels": MAX_PINS},
 }
+
+AO_CHANNEL_NAMES_FILE = os.path.join(os.path.dirname(__file__), "ao_channel_names.json")
+
+CONNECTION_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "connection_settings.json")
+
+
+def load_connection_settings() -> dict:
+    """Last-used IP/port/address per device, keyed by a short device tag."""
+    try:
+        with open(CONNECTION_SETTINGS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_connection_setting(key: str, value) -> None:
+    settings = load_connection_settings()
+    settings[key] = value
+    try:
+        tmp = CONNECTION_SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(settings, f, indent=2)
+        os.replace(tmp, CONNECTION_SETTINGS_FILE)
+    except Exception as e:
+        print(f"[Settings] Failed to save {CONNECTION_SETTINGS_FILE}: {e}")
+
 
 MODE_RANGES = {
     "voltage": (-10.0, 10.0, "V",   -1000, 1000),
@@ -206,6 +260,8 @@ STEP_MA      = SLEW_RATE_MA * (RAMP_TICK_MS / 1000.0)
 # Window sizing — computed once at startup, never auto-resized afterwards
 MAIN_WINDOW_W     = 800
 MAIN_WINDOW_MAX_H = 1000
+
+GLOBAL_REC_TICK_MS = 250   # 4 Hz — global cross-device recorder sample rate
 
 SWEEP_DEFAULT_STEPS    = 10
 SWEEP_DEFAULT_DWELL_MS = 500
@@ -224,6 +280,7 @@ READBACK_DECIMALS      = 6
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 PROMICRO_PLOT_WINDOW_S = 10.0
+COREDAQ_PLOT_WINDOW_S  = 10.0
 
 PROMICRO_PORT = "COM11"
 PROMICRO_BAUD = 9600
@@ -521,7 +578,7 @@ class MokuWidget(QGroupBox):
         self._status_lbl.setFixedWidth(14)
         conn_row.addWidget(self._status_lbl)
         conn_row.addWidget(QLabel("IP:"))
-        self._ip_edit = QLineEdit(MOKU_IP)
+        self._ip_edit = QLineEdit(load_connection_settings().get("moku_ip", MOKU_IP))
         self._ip_edit.setPlaceholderText("e.g. 192.168.73.1")
         self._ip_edit.setFixedWidth(140)
         conn_row.addWidget(self._ip_edit)
@@ -580,6 +637,7 @@ class MokuWidget(QGroupBox):
         if not ip:
             print("[Moku] Enter an IP address first")
             return
+        save_connection_setting("moku_ip", ip)
         self._connect_btn.setEnabled(False)
         self._connect_btn.setText("Connecting…")
         QTimer.singleShot(0, lambda: self._worker.do_connect(ip))
@@ -665,8 +723,9 @@ class CardSession:
         self.writer     = None
         self.mode       = CARDS[card_index]["mode"]
         self.dev        = CARDS[card_index]["dev"]
-        self.values     = [0.0] * NUM_PINS
-        self._targets   = [0.0] * NUM_PINS
+        self.num_pins   = CARDS[card_index].get("channels", NUM_PINS)
+        self.values     = [0.0] * self.num_pins
+        self._targets   = [0.0] * self.num_pins
         min_val, max_val, unit, _, _ = MODE_RANGES[self.mode]
         self.min_val, self.max_val, self.unit = min_val, max_val, unit
         self._step = STEP_V if self.mode == "voltage" else STEP_MA
@@ -690,15 +749,15 @@ class CardSession:
         if not HAS_UEIDAQ:
             raise RuntimeError("UeiDaq library not installed")
         self.session = UeiDaq.CUeiSession()
-        print(f"Connecting: pdna://{CUBE_IP}/{self.dev}/Ao0:{NUM_PINS-1}, "
+        print(f"Connecting: pdna://{CUBE_IP}/{self.dev}/Ao0:{self.num_pins-1}, "
               f"mode: {self.mode}, range: {self.min_val} to {self.max_val}")
         if self.mode == "voltage":
             self.session.CreateAOChannel(
-                f"pdna://{CUBE_IP}/{self.dev}/Ao0:{NUM_PINS-1}",
+                f"pdna://{CUBE_IP}/{self.dev}/Ao0:{self.num_pins-1}",
                 self.min_val, self.max_val)
         else:
             self.session.CreateAOCurrentChannel(
-                f"pdna://{CUBE_IP}/{self.dev}/Ao0:{NUM_PINS-1}",
+                f"pdna://{CUBE_IP}/{self.dev}/Ao0:{self.num_pins-1}",
                 self.min_val, self.max_val)
         self.session.ConfigureTimingForSimpleIO()
         self.writer = UeiDaq.CUeiAnalogScaledWriter(self.session.GetDataStream())
@@ -819,15 +878,15 @@ class CardSession:
 
     def zero(self):
         self.stop_sweep()
-        self.ramp_to([0.0] * NUM_PINS)
+        self.ramp_to([0.0] * self.num_pins)
 
     def zero_immediate(self):
         self.stop_sweep()
         self.stop_wave()
         self._timer.stop()
-        self._targets = [0.0] * NUM_PINS
+        self._targets = [0.0] * self.num_pins
         try:
-            self.write([0.0] * NUM_PINS)
+            self.write([0.0] * self.num_pins)
         except Exception:
             pass
 
@@ -1012,7 +1071,7 @@ class LiveComparisonPlot(QWidget):
     Pin selector lets you choose which pin's commanded value to compare.
     """
 
-    def __init__(self, card_label: str, mode: str, parent=None):
+    def __init__(self, card_label: str, mode: str, num_pins: int = NUM_PINS, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Output vs Readback — {card_label}")
         self.resize(620, 640)
@@ -1031,7 +1090,7 @@ class LiveComparisonPlot(QWidget):
         pin_row = QHBoxLayout()
         pin_row.addWidget(QLabel("Pin:"))
         self._pin_combo = QComboBox()
-        for i in range(NUM_PINS):
+        for i in range(num_pins):
             self._pin_combo.addItem(f"Pin {i:02d}", i)
         self._pin_combo.setFixedWidth(80)
         self._pin_combo.currentIndexChanged.connect(self._on_pin_changed)
@@ -1160,7 +1219,7 @@ class PinConfigView(QWidget):
         self.pin_layout.setContentsMargins(4, 4, 4, 4)
 
         col_row = QHBoxLayout()
-        for text, width in [("Pin", 50), ("Value", 120), ("Slider", -1), ("", 60), ("Readback", 90)]:
+        for text, width in [("Pin", 50), ("Name", 90), ("Value", 120), ("Slider", -1), ("", 60), ("Readback", 90)]:
             lbl = QLabel(text)
             if width > 0: lbl.setFixedWidth(width)
             col_row.addWidget(lbl)
@@ -1173,12 +1232,34 @@ class PinConfigView(QWidget):
 
         self.spinboxes, self.sliders = [], []
         self._readback_lbls = []
+        self._name_edits  = []
+        self._pin_rows    = []
+        self._active_n    = NUM_PINS
+        self._channel_names = self._load_channel_names()
 
-        for i in range(NUM_PINS):
-            rl  = QHBoxLayout()
+        self._group_seps = []   # [(first_pin_idx_in_group, separator_widget), ...]
+
+        for i in range(MAX_PINS):
+            if i > 0 and i % 4 == 0:
+                group_sep = QFrame()
+                group_sep.setFrameShape(QFrame.Shape.HLine)
+                group_sep.setStyleSheet(f"color: {C_GRAY};")
+                group_sep.setFixedHeight(1)
+                self._group_seps.append((i, group_sep))
+                self.pin_layout.addWidget(group_sep)
+
+            row_widget = QWidget()
+            row_widget.setStyleSheet(
+                f"background-color: {'#1D2127' if (i // 4) % 2 else 'transparent'};")
+            rl  = QHBoxLayout(row_widget)
+            rl.setContentsMargins(4, 3, 4, 3)
             rl.setSpacing(6)
             lbl = QLabel(f"Pin {i:02d}")
             lbl.setFixedWidth(50)
+            name_edit = QLineEdit(self._channel_names.get(str(i), ""))
+            name_edit.setPlaceholderText("(nickname)")
+            name_edit.setFixedWidth(90)
+            name_edit.editingFinished.connect(lambda idx=i: self._on_name_edited(idx))
             sb  = NoScrollDoubleSpinBox()
             sb.setDecimals(3)
             sb.setSingleStep(0.1)
@@ -1196,18 +1277,21 @@ class PinConfigView(QWidget):
             rb_lbl = QLabel("—")
             rb_lbl.setFixedWidth(90)
             rb_lbl.setStyleSheet(f"color: {C_BLUE}; font-size: 10px;")
-            rb_lbl.setToolTip("Guardian ADC readback (Dev2 only)")
+            rb_lbl.setToolTip("Guardian ADC readback (Dev2 only, first 8 channels)")
             rb_lbl.setVisible(False)
 
-            rl.addWidget(lbl); rl.addWidget(sb)
+            rl.addWidget(lbl); rl.addWidget(name_edit); rl.addWidget(sb)
             rl.addWidget(sl, stretch=1); rl.addWidget(set_btn)
             rl.addWidget(rb_lbl)
             self.spinboxes.append(sb)
             self.sliders.append(sl)
             self._readback_lbls.append(rb_lbl)
-            self.pin_layout.addLayout(rl)
+            self._name_edits.append(name_edit)
+            self._pin_rows.append(row_widget)
+            self.pin_layout.addWidget(row_widget)
 
         self.pin_layout.addStretch()
+        self._set_active_channels(NUM_PINS)
         scroll.setWidget(pin_container)
         root.addWidget(scroll, stretch=1)
 
@@ -1307,7 +1391,33 @@ class PinConfigView(QWidget):
         row3.addStretch()
         sg.addLayout(row3)
 
+        row4 = QHBoxLayout()
+        self._sweep_log_chk = QCheckBox("Log CoreDAQ power")
+        self._sweep_log_chk.setToolTip(
+            "Records the CoreDAQ optical power meter reading at each sweep step")
+        row4.addWidget(self._sweep_log_chk)
+        row4.addSpacing(8)
+        row4.addWidget(QLabel("Head:"))
+        self._sweep_coredaq_head_combo = QComboBox()
+        for h in range(1, 5):
+            self._sweep_coredaq_head_combo.addItem(f"Head {h}", h)
+        self._sweep_coredaq_head_combo.setFixedWidth(80)
+        row4.addWidget(self._sweep_coredaq_head_combo)
+        row4.addSpacing(10)
+        self._sweep_power_lbl = QLabel("")
+        self._sweep_power_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        row4.addWidget(self._sweep_power_lbl)
+        row4.addStretch()
+        self._sweep_export_btn = QPushButton("Export CSV…")
+        self._sweep_export_btn.setEnabled(False)
+        self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
+        row4.addWidget(self._sweep_export_btn)
+        sg.addLayout(row4)
+
         root.addWidget(sweep_group)
+
+        self._coredaq_panel = None
+        self._sweep_power_log: list = []
 
         self.sweep_start.valueChanged.connect(self._update_sweep_derived)
         self.sweep_stop.valueChanged.connect(self._update_sweep_derived)
@@ -1478,7 +1588,7 @@ class PinConfigView(QWidget):
 
         pm_ctrl = QHBoxLayout()
         pm_ctrl.addWidget(QLabel("Port:"))
-        self._pm_port_edit = QLineEdit(PROMICRO_PORT)
+        self._pm_port_edit = QLineEdit(load_connection_settings().get("promicro_port", PROMICRO_PORT))
         self._pm_port_edit.setFixedWidth(80)
         pm_ctrl.addWidget(self._pm_port_edit)
         self._pm_connect_btn    = QPushButton("Connect")
@@ -1591,7 +1701,7 @@ class PinConfigView(QWidget):
         if cs is None:
             return
         label = CARDS[cs.card_index]["label"]
-        self._cmp_win = LiveComparisonPlot(label, cs.mode)
+        self._cmp_win = LiveComparisonPlot(label, cs.mode, cs.num_pins)
 
         src = self._cmp_src_combo.currentData()
         src_names = {"moku": "Moku Ch1", "guardian": "Guardian ADC",
@@ -1635,6 +1745,7 @@ class PinConfigView(QWidget):
 
     def _pm_connect(self):
         port = self._pm_port_edit.text().strip()
+        save_connection_setting("promicro_port", port)
         self._pm_connect_btn.setEnabled(False)
         self._pm_connect_btn.setText("…")
         self._pm_t = 0.0
@@ -1737,13 +1848,59 @@ class PinConfigView(QWidget):
         span = abs(stop - start)
         return max(2, int(round(span / size)) + 1) if size > 0 else 2
 
+    # ── Channel naming / active-channel-count helpers ──────────────────────────
+
+    def _load_channel_names(self) -> dict:
+        try:
+            with open(AO_CHANNEL_NAMES_FILE, "r") as f:
+                data = json.load(f)
+            return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            return {}
+
+    def _save_channel_names(self):
+        try:
+            tmp = AO_CHANNEL_NAMES_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._channel_names, f, indent=2)
+            os.replace(tmp, AO_CHANNEL_NAMES_FILE)
+        except Exception as e:
+            print(f"[AO names] Failed to save {AO_CHANNEL_NAMES_FILE}: {e}")
+
+    def _on_name_edited(self, idx: int):
+        name = self._name_edits[idx].text().strip()
+        if name:
+            self._channel_names[str(idx)] = name
+        else:
+            self._channel_names.pop(str(idx), None)
+        self._save_channel_names()
+        if self.card_session and idx < self.card_session.num_pins:
+            text = self._pin_display_name(idx)
+            for combo in (self.sweep_pin_combo, self.wave_pin_combo):
+                pos = combo.findData(idx)
+                if pos >= 0:
+                    combo.setItemText(pos, text)
+
+    def _pin_display_name(self, idx: int) -> str:
+        name = self._channel_names.get(str(idx), "")
+        base = f"Pin {idx:02d}"
+        return f"{base} — {name}" if name else base
+
+    def _set_active_channels(self, n: int):
+        self._active_n = n
+        for i, row in enumerate(self._pin_rows):
+            row.setVisible(i < n)
+        for first_idx, sep in self._group_seps:
+            sep.setVisible(first_idx < n)
+
     def load_card(self, cs: CardSession):
         self.card_session = cs
         self.card_title.setText(CARDS[cs.card_index]["label"].split("  —  ")[0])
         self.badge.setText(cs.mode.upper())
+        self._set_active_channels(cs.num_pins)
         _, _, _, s_min, s_max = MODE_RANGES[cs.mode]
         self._syncing = True
-        for i in range(NUM_PINS):
+        for i in range(cs.num_pins):
             self.spinboxes[i].setMinimum(cs.min_val)
             self.spinboxes[i].setMaximum(cs.max_val)
             self.spinboxes[i].setSuffix(f" {cs.unit}")
@@ -1752,6 +1909,14 @@ class PinConfigView(QWidget):
             self.spinboxes[i].setValue(cs.values[i])
             self.sliders[i].setValue(int(cs.values[i] * 100))
         self._syncing = False
+
+        self.sweep_pin_combo.clear()
+        self.wave_pin_combo.clear()
+        for i in range(cs.num_pins):
+            text = self._pin_display_name(i)
+            self.sweep_pin_combo.addItem(text, i)
+            self.wave_pin_combo.addItem(text, i)
+
         self.sweep_start.setMinimum(cs.min_val)
         self.sweep_start.setMaximum(cs.max_val)
         self.sweep_start.setSuffix(f" {cs.unit}")
@@ -1775,10 +1940,13 @@ class PinConfigView(QWidget):
             self._rec_plot_win.close()
             self._rec_plot_win = None
 
-        # Guardian readback — only for voltage card (Dev2 / AO-333)
+        # Guardian readback — only for voltage card (Dev2 / AO-333), and only
+        # for its first NUM_PINS channels: the ao333_bridge.py readback bridge
+        # still only streams 8 monitor channels even though Dev2 now exposes
+        # MAX_PINS=32 outputs. Channels 8-31 have no hardware readback.
         is_voltage = cs.mode == "voltage"
-        for lbl in self._readback_lbls:
-            lbl.setVisible(is_voltage)
+        for i, lbl in enumerate(self._readback_lbls):
+            lbl.setVisible(is_voltage and i < NUM_PINS)
             lbl.setText("—")
         self._guardian_values = [0.0] * NUM_PINS
         self._pm_plot_group.setVisible(True)
@@ -1899,7 +2067,7 @@ class PinConfigView(QWidget):
             }.get(src, "readback_V")
 
         fname    = os.path.join(data_dir, f"{dev}_{mode}_{src}_{stamp}.csv")
-        pin_hdrs = [f"pin{i:02d}_{unit}" for i in range(NUM_PINS)]
+        pin_hdrs = [f"pin{i:02d}_{unit}" for i in range(self.card_session.num_pins)]
         header   = ["time_s", "readback_raw", readback_col] + pin_hdrs
 
         with open(fname, "w", newline="") as f:
@@ -1928,6 +2096,18 @@ class PinConfigView(QWidget):
             self.card_session.mode,
             show_vi=self._vi_checkbox.isChecked())
 
+    def set_coredaq_panel(self, panel):
+        """Wires the CoreDAQ tab in so sweeps can log optical power per step."""
+        self._coredaq_panel = panel
+
+    def latest_ao_snapshot(self):
+        """(card_label, unit, values) for the active card, or None if none connected."""
+        cs = self.card_session
+        if cs is None or not cs.connected:
+            return None
+        label = CARDS[cs.card_index]["label"].split("  —  ")[0]
+        return label, cs.unit, list(cs.values)
+
     def _start_sweep(self):
         cs = self.card_session
         if cs is None: return
@@ -1938,6 +2118,9 @@ class PinConfigView(QWidget):
             stop     = self.sweep_stop.value()
             steps    = self._compute_steps()
             dwell_ms = self.sweep_dwell_sb.value()
+            self._sweep_power_log = []
+            self._sweep_export_btn.setEnabled(False)
+            self._sweep_power_lbl.setText("")
             cs.start_sweep(pin, start, stop, steps, dwell_ms,
                            self._on_sweep_step, self._on_sweep_done)
             self.sweep_run_btn.setEnabled(False)
@@ -1962,10 +2145,57 @@ class PinConfigView(QWidget):
         self._status(f"Sweep — Pin {pin:02d} at {value:.3f} "
                      f"{cs.unit if cs else ''}  (step {step}/{total})")
 
+        if self._sweep_log_chk.isChecked() and self._coredaq_panel is not None:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is not None:
+                self._sweep_power_log.append((value, *powers))
+                head = self._sweep_coredaq_head_combo.currentData()
+                self._sweep_power_lbl.setText(
+                    f"Step {step}/{total} — Head {head}: {_fmt_power_w(powers[head - 1])}")
+            else:
+                self._sweep_power_lbl.setText(
+                    "CoreDAQ not connected — power not logged for this step")
+
     def _on_sweep_done(self):
         self.sweep_run_btn.setEnabled(True)
         self.sweep_stop_btn.setEnabled(False)
         self._status("Sweep complete")
+        if self._sweep_power_log:
+            self._sweep_export_btn.setEnabled(True)
+            self._show_sweep_power_plot()
+
+    def _show_sweep_power_plot(self):
+        cs = self.card_session
+        unit = cs.unit if cs else ""
+        series = {}
+        for ch in range(4):
+            xs = [row[0] for row in self._sweep_power_log]
+            ys = [row[1 + ch] for row in self._sweep_power_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+        win = MultiSeriesPlotWindow("AO Sweep — CoreDAQ Power", "AO value", unit)
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._sweep_plot_win = win
+
+    def _export_sweep_power_csv(self):
+        if not self._sweep_power_log:
+            return
+        import datetime
+        cs = self.card_session
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"ao_sweep_coredaq_{stamp}.csv")
+        unit  = cs.unit if cs else ""
+        comments = [f"ao_sweep_unit: {unit}"]
+        header = [f"ao_value_{unit}",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = [[f"{v:.4f}"] + [f"{w:.9e}" for w in powers]
+                for v, *powers in self._sweep_power_log]
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[Sweep] Saved {len(rows)} rows → {fname}")
+        self._status(f"Saved {len(rows)} sweep/power rows → {fname}")
 
     def _sb_changed(self, idx, val):
         if self._syncing: return
@@ -2008,7 +2238,7 @@ class PinConfigView(QWidget):
         if cs is None: return
         try:
             if not cs.connected: cs.connect()
-            values = [sb.value() for sb in self.spinboxes]
+            values = [sb.value() for sb in self.spinboxes[:cs.num_pins]]
             if self._ramp_chk.isChecked():
                 cs.ramp_to(values)
                 if focused_pin is not None:
@@ -2038,8 +2268,8 @@ class PinConfigView(QWidget):
         try:
             if not cs.connected: cs.connect()
             self._syncing = True
-            for sb in self.spinboxes: sb.setValue(0.0)
-            for sl in self.sliders:   sl.setValue(0)
+            for sb in self.spinboxes[:cs.num_pins]: sb.setValue(0.0)
+            for sl in self.sliders[:cs.num_pins]:   sl.setValue(0)
             self._syncing = False
             if self._ramp_chk.isChecked():
                 cs.zero()
@@ -2047,7 +2277,7 @@ class PinConfigView(QWidget):
             else:
                 def do_zero():
                     try:
-                        cs.write([0.0] * NUM_PINS)
+                        cs.write([0.0] * cs.num_pins)
                     except Exception as e:
                         print(f"[Zero] {e}")
                 t = QThread(self)
@@ -2335,12 +2565,15 @@ class LaserWorker(QThread):
     def run(self):
         op = self._op
         try:
-            if   op == "connect":     self._do_connect(**self._args)
-            elif op == "on":          self._do_on(**self._args)
-            elif op == "off":         self._do_off()
-            elif op == "sweep":       self._do_sweep(**self._args)
-            elif op == "diagnostics": self._do_diagnostics()
-            elif op == "dither":      self._do_dither(**self._args)
+            if   op == "connect":         self._do_connect(**self._args)
+            elif op == "on":              self._do_on(**self._args)
+            elif op == "off":             self._do_off()
+            elif op == "retune":          self._do_retune(**self._args)
+            elif op == "set_power_live":  self._do_set_power_live(**self._args)
+            elif op == "sweep":           self._do_sweep(**self._args)
+            elif op == "power_sweep":     self._do_power_sweep(**self._args)
+            elif op == "diagnostics":     self._do_diagnostics()
+            elif op == "dither":          self._do_dither(**self._args)
         except Exception as e:
             self.status_update.emit(f"Error: {e}", "error")
             self.state_changed.emit("off")
@@ -2429,6 +2662,90 @@ class LaserWorker(QThread):
 
         self._readback()
 
+    # ── retune / live power (laser stays enabled throughout — no off/on cycle) ──
+
+    def _do_retune(self, ch: int, ftf: int, mw: float, use_ftf: bool):
+        dbm100 = mw_to_dbm100(mw)
+        self.status_update.emit(
+            f"Power → {mw:.1f} mW ({dbm100/100:.2f} dBm)", "info")
+        self.itla.power(dbm100)
+        time.sleep(0.1)
+
+        self.itla.write(REG["STATUSF"], 0x00FF)
+        self.itla.write(REG["STATUSW"], 0x00FF)
+        self.itla.write(REG["FTF"],     0x0000, verbose=False)
+        time.sleep(0.1)
+
+        self.status_update.emit(f"Retuning to channel {ch}...", "info")
+        self.state_changed.emit("locking")
+        self.itla.channel(ch)
+
+        t0 = time.time()
+        while time.time() - t0 < 30:
+            nop_status, _ = self.itla.read(REG["NOP"], verbose=False)
+            self.status_update.emit(
+                f"Locking... t={time.time()-t0:.1f}s", "warn")
+            if nop_status == 0:
+                break
+            time.sleep(0.2)
+
+        self.itla.write(REG["STATUSF"], 0x00FF)
+        self.itla.write(REG["STATUSW"], 0x00FF)
+
+        if use_ftf and ftf != 0:
+            self.status_update.emit(
+                f"Applying FTF {ftf * 0.1:+.2f} GHz...", "info")
+            self.itla.write(REG["FTF"], ftf & 0xFFFF, verbose=False)
+            time.sleep(0.5)
+
+        self._readback()
+
+    def _do_set_power_live(self, mw: float):
+        dbm100 = mw_to_dbm100(mw)
+        self.status_update.emit(
+            f"Power → {mw:.1f} mW ({dbm100/100:.2f} dBm)", "info")
+        self.itla.power(dbm100)
+        time.sleep(0.3)
+        self._readback()
+
+    def _do_power_sweep(self, mw_start: float, mw_stop: float, mw_step: float, dwell_s: float):
+        """
+        Steps output power from mw_start to mw_stop (never touching channel/
+        resena — laser must already be locked and ON) so Cal 2-DC can sweep
+        power alone at a fixed wavelength.
+        """
+        if mw_step <= 0:
+            self.status_update.emit("Power step must be positive", "error")
+            return
+
+        step = abs(mw_step) if mw_stop >= mw_start else -abs(mw_step)
+        targets = []
+        v = mw_start
+        if step >= 0:
+            while v <= mw_stop + 1e-9:
+                targets.append(round(v, 4))
+                v += step
+        else:
+            while v >= mw_stop - 1e-9:
+                targets.append(round(v, 4))
+                v += step
+        if not targets:
+            targets = [mw_start]
+
+        total = len(targets)
+        self.status_update.emit(
+            f"Power sweep: {total} points, {mw_start:.2f} → {mw_stop:.2f} mW, "
+            f"{mw_step:.2f} mW step, {dwell_s:.2f} s dwell", "info")
+
+        for idx, mw in enumerate(targets):
+            dbm100 = mw_to_dbm100(mw)
+            self.itla.power(dbm100)
+            time.sleep(dwell_s)
+            self.status_update.emit(f"[{idx+1}/{total}] {mw:.2f} mW", "info")
+            self._readback()
+
+        self.status_update.emit("Power sweep complete", "ok")
+
     def _readback(self):
         _, lf1 = self.itla.read(REG["LF1"], verbose=False)
         _, lf2 = self.itla.read(REG["LF2"], verbose=False)
@@ -2487,14 +2804,24 @@ class LaserWorker(QThread):
         time.sleep(0.2)
         self.itla.write(REG["FTF"], 0x0000, verbose=False)
 
-        f_lo = C_NM_GHZ / max(nm_start, nm_stop)
-        f_hi = C_NM_GHZ / min(nm_start, nm_stop)
+        # Walk frequency from nm_start's frequency toward nm_stop's frequency so the
+        # wavelength sweep order matches the user's Start → Stop direction (frequency
+        # and wavelength are inversely related, so this is NOT simply f_start..f_stop
+        # in ascending order).
+        f_start = C_NM_GHZ / nm_start
+        f_stop  = C_NM_GHZ / nm_stop
+        step    = abs(step_ghz) if f_stop >= f_start else -abs(step_ghz)
 
         targets_ghz = []
-        f = f_lo
-        while f <= f_hi + 1e-6:
-            targets_ghz.append(f)
-            f += step_ghz
+        f = f_start
+        if step >= 0:
+            while f <= f_stop + 1e-6:
+                targets_ghz.append(f)
+                f += step
+        else:
+            while f >= f_stop - 1e-6:
+                targets_ghz.append(f)
+                f += step
 
         if not targets_ghz:
             self.status_update.emit("No sweep points in range", "error")
@@ -2601,6 +2928,13 @@ class ITLAPanel(QWidget):
 
         self._updating = False   # guard against signal loops
 
+        self._last_reading    = None
+        self._coredaq_panel   = None
+        self._sweep_logging   = False
+        self._sweep_power_log = []
+        self._power_sweep_logging = False
+        self._power_sweep_log     = []
+
         self._build_ui()
         self._set_state("disconnected")
 
@@ -2634,7 +2968,7 @@ class ITLAPanel(QWidget):
         cg.addWidget(QLabel("COM port:"))
         self.spin_port = NoScrollSpinBox()
         self.spin_port.setRange(1, 32)
-        self.spin_port.setValue(15)
+        self.spin_port.setValue(load_connection_settings().get("itla_com_port", 15))
         cg.addWidget(self.spin_port)
         self.btn_connect = QPushButton("Connect")
         self.btn_connect.clicked.connect(self.do_connect)
@@ -2701,15 +3035,31 @@ class ITLAPanel(QWidget):
         self.chk_ftf.stateChanged.connect(lambda _: self._update_preview_from_nm())
         cg2.addWidget(self.chk_ftf, 4, 0, 1, 4)
 
+        live_row = QHBoxLayout()
+        self.btn_retune = QPushButton("Apply Wavelength (live)")
+        self.btn_retune.setToolTip(
+            "Re-tune to the wavelength/channel above while the laser stays on—"
+            "no off/on cycle.")
+        self.btn_retune.setEnabled(False)
+        self.btn_retune.clicked.connect(self.do_retune)
+        self.btn_set_power_live = QPushButton("Apply Power (live)")
+        self.btn_set_power_live.setToolTip(
+            "Update output power while the laser stays on—no off/on cycle.")
+        self.btn_set_power_live.setEnabled(False)
+        self.btn_set_power_live.clicked.connect(self.do_set_power_live)
+        live_row.addWidget(self.btn_retune)
+        live_row.addWidget(self.btn_set_power_live)
+        cg2.addLayout(live_row, 5, 0, 1, 4)
+
         self.btn_on = QPushButton("Turn Laser On")
         self.btn_on.setFixedHeight(32)
         self.btn_on.clicked.connect(self.do_on)
-        cg2.addWidget(self.btn_on, 5, 0, 1, 2)
+        cg2.addWidget(self.btn_on, 6, 0, 1, 2)
 
         self.btn_off = QPushButton("Turn Laser Off")
         self.btn_off.setFixedHeight(32)
         self.btn_off.clicked.connect(self.do_off)
-        cg2.addWidget(self.btn_off, 5, 2, 1, 2)
+        cg2.addWidget(self.btn_off, 6, 2, 1, 2)
 
         self.lbl_status = QLabel("LASER IS OFF")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2717,7 +3067,7 @@ class ITLAPanel(QWidget):
         font.setBold(True)
         font.setPointSize(13)
         self.lbl_status.setFont(font)
-        cg2.addWidget(self.lbl_status, 6, 0, 1, 4)
+        cg2.addWidget(self.lbl_status, 7, 0, 1, 4)
 
         top.addWidget(ctrl_box)
 
@@ -2792,7 +3142,67 @@ class ITLAPanel(QWidget):
         self.btn_sweep.clicked.connect(self.do_sweep)
         sg.addWidget(self.btn_sweep, 2, 0, 1, 4)
 
+        self._sweep_log_chk = QCheckBox("Log CoreDAQ power (all 4 channels)")
+        self._sweep_log_chk.setToolTip(
+            "Records the CoreDAQ optical power meter at each sweep step")
+        sg.addWidget(self._sweep_log_chk, 3, 0, 1, 3)
+        self._sweep_export_btn = QPushButton("Export CSV…")
+        self._sweep_export_btn.setEnabled(False)
+        self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
+        sg.addWidget(self._sweep_export_btn, 3, 3)
+
         top.addWidget(sw_box)
+
+        # ── Power Sweep (Cal 2-DC: power only, wavelength stays fixed) ───────
+        pw_box = QGroupBox("Power Sweep  (wavelength stays fixed — laser must already be ON)")
+        pwg = QGridLayout(pw_box)
+
+        pwg.addWidget(QLabel("Start (mW):"), 0, 0)
+        self.spin_pw_start = NoScrollDoubleSpinBox()
+        self.spin_pw_start.setRange(1.0, 22.0)
+        self.spin_pw_start.setValue(1.0)
+        self.spin_pw_start.setDecimals(2)
+        self.spin_pw_start.setSingleStep(0.5)
+        pwg.addWidget(self.spin_pw_start, 0, 1)
+
+        pwg.addWidget(QLabel("Stop (mW):"), 0, 2)
+        self.spin_pw_stop = NoScrollDoubleSpinBox()
+        self.spin_pw_stop.setRange(1.0, 22.0)
+        self.spin_pw_stop.setValue(10.0)
+        self.spin_pw_stop.setDecimals(2)
+        self.spin_pw_stop.setSingleStep(0.5)
+        pwg.addWidget(self.spin_pw_stop, 0, 3)
+
+        pwg.addWidget(QLabel("Step (mW):"), 1, 0)
+        self.spin_pw_step = NoScrollDoubleSpinBox()
+        self.spin_pw_step.setRange(0.01, 10.0)
+        self.spin_pw_step.setValue(1.0)
+        self.spin_pw_step.setSingleStep(0.5)
+        self.spin_pw_step.setDecimals(2)
+        pwg.addWidget(self.spin_pw_step, 1, 1)
+
+        pwg.addWidget(QLabel("Dwell (s):"), 1, 2)
+        self.spin_pw_dwell = NoScrollDoubleSpinBox()
+        self.spin_pw_dwell.setRange(0.1, 60.0)
+        self.spin_pw_dwell.setValue(1.0)
+        self.spin_pw_dwell.setSingleStep(0.5)
+        pwg.addWidget(self.spin_pw_dwell, 1, 3)
+
+        self.btn_power_sweep = QPushButton("Start Power Sweep")
+        self.btn_power_sweep.setEnabled(False)
+        self.btn_power_sweep.clicked.connect(self.do_power_sweep)
+        pwg.addWidget(self.btn_power_sweep, 2, 0, 1, 4)
+
+        self._power_sweep_log_chk = QCheckBox("Log CoreDAQ power (all 4 channels)")
+        self._power_sweep_log_chk.setToolTip(
+            "Records the CoreDAQ optical power meter at each power-sweep step")
+        pwg.addWidget(self._power_sweep_log_chk, 3, 0, 1, 3)
+        self._power_sweep_export_btn = QPushButton("Export CSV…")
+        self._power_sweep_export_btn.setEnabled(False)
+        self._power_sweep_export_btn.clicked.connect(self._export_power_sweep_csv)
+        pwg.addWidget(self._power_sweep_export_btn, 3, 3)
+
+        top.addWidget(pw_box)
 
         # ── Dither ──────────────────────────────────────────────────────────
         dith_box = QGroupBox("Dither  (laser must be locked to channel first)")
@@ -2862,7 +3272,7 @@ class ITLAPanel(QWidget):
     def _set_state(self, state: str):
         self._laser_state = state
         connected = state != "disconnected"
-        busy      = state in ("warming", "locking")
+        busy      = state in ("warming", "locking", "power_sweeping")
         if connected and not busy:
             self._diag_timer.start()
         else:
@@ -2871,7 +3281,10 @@ class ITLAPanel(QWidget):
         self.btn_connect.setEnabled(not connected)
         self.btn_on.setEnabled(connected and not busy and state != "on")
         self.btn_off.setEnabled(connected and not busy and state == "on")
+        self.btn_retune.setEnabled(connected and not busy and state == "on")
+        self.btn_set_power_live.setEnabled(connected and not busy and state == "on")
         self.btn_sweep.setEnabled(connected and not busy)
+        self.btn_power_sweep.setEnabled(connected and not busy and state == "on")
         self.btn_diag.setEnabled(connected and not busy)
         self.btn_dith_sbs.setEnabled(connected and not busy)
         self.btn_dith_txtrace.setEnabled(connected and not busy)
@@ -2879,11 +3292,12 @@ class ITLAPanel(QWidget):
         self.spin_port.setEnabled(not connected)
 
         labels = {
-            "disconnected": ("NOT CONNECTED",    C_TEXT),
-            "warming":      ("WARMING UP...",    C_ORANGE),
-            "locking":      ("LOCKING FREQ...",  C_ORANGE),
-            "off":          ("LASER IS OFF",     C_TEXT),
-            "on":           ("LASER IS ON",      C_RED),
+            "disconnected":    ("NOT CONNECTED",     C_TEXT),
+            "warming":         ("WARMING UP...",     C_ORANGE),
+            "locking":         ("LOCKING FREQ...",   C_ORANGE),
+            "power_sweeping":  ("SWEEPING POWER...", C_ORANGE),
+            "off":             ("LASER IS OFF",      C_TEXT),
+            "on":              ("LASER IS ON",       C_RED),
         }
         text, color = labels.get(state, ("?", C_TEXT))
         self.lbl_status.setText(text)
@@ -2960,6 +3374,24 @@ class ITLAPanel(QWidget):
         self.lbl_freq.setText(f"{freq_ghz:.1f} GHz")
         self.lbl_nm_rb.setText(f"{nm:.4f} nm")
         self.lbl_power.setText(f"{pdbm:.2f} dBm  ({mw:.2f} mW)")
+        self._last_reading = {"freq_ghz": freq_ghz, "nm": nm,
+                               "power_dbm": pdbm, "power_mw": mw}
+
+        if self._sweep_logging and self._coredaq_panel is not None:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is not None:
+                self._sweep_power_log.append((nm, freq_ghz, pdbm, *powers))
+
+        if self._power_sweep_logging and self._coredaq_panel is not None:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is not None:
+                self._power_sweep_log.append((mw, freq_ghz, pdbm, *powers))
+
+    def latest_reading(self):
+        """Last (freq/wavelength/power) reading dict, or None if not connected."""
+        if self._laser_state in ("disconnected",):
+            return None
+        return self._last_reading
 
     def on_grid_params(self, fcf1: int, fcf2: float, grid: float):
         self._fcf1 = fcf1
@@ -3030,11 +3462,93 @@ class ITLAPanel(QWidget):
             self.lbl_statw.setStyleSheet(f"color: {C_GREEN};")
 
     def on_done(self, op: str):
-        pass
+        if op == "sweep" and self._sweep_logging:
+            self._sweep_logging = False
+            if self._sweep_power_log:
+                self._sweep_export_btn.setEnabled(True)
+                self._show_sweep_power_plot()
+        elif op == "power_sweep":
+            self._power_sweep_logging = False
+            if self._power_sweep_log:
+                self._power_sweep_export_btn.setEnabled(True)
+                self._show_power_sweep_plot()
+
+    def set_coredaq_panel(self, panel):
+        """Wires the CoreDAQ tab in so wavelength sweeps can log optical power."""
+        self._coredaq_panel = panel
+
+    def _show_sweep_power_plot(self):
+        series = {}
+        for ch in range(4):
+            xs = [row[0] for row in self._sweep_power_log]
+            ys = [row[3 + ch] for row in self._sweep_power_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+        win = MultiSeriesPlotWindow("ITLA Sweep — CoreDAQ Power", "Wavelength", "nm")
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._sweep_plot_win = win
+
+    def _export_sweep_power_csv(self):
+        if not self._sweep_power_log:
+            return
+        import datetime
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"itla_sweep_coredaq_{stamp}.csv")
+        comments = [
+            f"laser: ITLA",
+            f"sweep: {self.spin_sw_start.value():.4f} -> {self.spin_sw_stop.value():.4f} nm, "
+            f"step {self.spin_sw_step.value():.1f} GHz, dwell {self.spin_dwell.value():.2f} s",
+            f"power_setpoint_mw: {self.spin_mw.value():.2f}",
+        ]
+        header = ["wavelength_nm", "freq_ghz", "power_dbm",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = [[f"{nm:.4f}", f"{f:.2f}", f"{p:.3f}"] + [f"{w:.9e}" for w in powers]
+                for nm, f, p, *powers in self._sweep_power_log]
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[ITLA Sweep] Saved {len(rows)} rows → {fname}")
+        self._status(f"Saved {len(rows)} sweep/power rows → {fname}")
+
+    def _show_power_sweep_plot(self):
+        series = {}
+        for ch in range(4):
+            xs = [row[0] for row in self._power_sweep_log]
+            ys = [row[3 + ch] for row in self._power_sweep_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+        win = MultiSeriesPlotWindow("ITLA Power Sweep — CoreDAQ Power", "Laser power", "mW")
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._power_sweep_plot_win = win
+
+    def _export_power_sweep_csv(self):
+        if not self._power_sweep_log:
+            return
+        import datetime
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"itla_power_sweep_coredaq_{stamp}.csv")
+        comments = [
+            "laser: ITLA",
+            f"power_sweep: {self.spin_pw_start.value():.2f} -> {self.spin_pw_stop.value():.2f} mW, "
+            f"step {self.spin_pw_step.value():.2f} mW, dwell {self.spin_pw_dwell.value():.2f} s",
+            f"wavelength_nm: {self.spin_nm.value():.4f}",
+        ]
+        header = ["power_mw", "freq_ghz", "power_dbm",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = [[f"{mw:.4f}", f"{f:.2f}", f"{p:.3f}"] + [f"{w:.9e}" for w in powers]
+                for mw, f, p, *powers in self._power_sweep_log]
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[ITLA Power Sweep] Saved {len(rows)} rows → {fname}")
+        self._status(f"Saved {len(rows)} power-sweep rows → {fname}")
 
     # ── Button handlers ───────────────────────────────────────────────────────
 
     def do_connect(self):
+        save_connection_setting("itla_com_port", self.spin_port.value())
         self._set_state("warming")
         self.worker.run_op("connect", port=self.spin_port.value(), baud=9600)
 
@@ -3050,6 +3564,23 @@ class ITLAPanel(QWidget):
             + (f"  FTF {ftf*0.1:+.2f} GHz" if use_ftf else "") + "</i>")
         self._set_state("locking")
         self.worker.run_op("on", ch=ch, ftf=ftf, mw=mw, use_ftf=use_ftf)
+
+    def do_retune(self):
+        nm      = self.spin_nm.value()
+        mw      = self.spin_mw.value()
+        use_ftf = self.chk_ftf.isChecked()
+        ch, ftf = nm_to_itla_ch_ftf(nm, self._fcf1, self._fcf2,
+                                     self._grid, self._ui_grid)
+        self.log.append(
+            f"<i>Live retune → {nm:.4f} nm → ch {ch} "
+            f"({itla_ch_to_nm(ch, self._fcf1, self._fcf2, self._grid):.4f} nm)"
+            + (f"  FTF {ftf*0.1:+.2f} GHz" if use_ftf else "") + "</i>")
+        self._set_state("locking")
+        self.worker.run_op("retune", ch=ch, ftf=ftf, mw=mw, use_ftf=use_ftf)
+
+    def do_set_power_live(self):
+        mw = self.spin_mw.value()
+        self.worker.run_op("set_power_live", mw=mw)
 
     def do_off(self):
         self.worker.run_op("off")
@@ -3078,6 +3609,9 @@ class ITLAPanel(QWidget):
         if abs(nm_start - nm_stop) < 0.001:
             QMessageBox.warning(self, "Sweep", "Start and stop must differ.")
             return
+        self._sweep_power_log = []
+        self._sweep_export_btn.setEnabled(False)
+        self._sweep_logging = self._sweep_log_chk.isChecked()
         self._set_state("locking")
         self.worker.run_op("sweep",
             nm_start=nm_start, nm_stop=nm_stop,
@@ -3086,6 +3620,21 @@ class ITLAPanel(QWidget):
             mw=self.spin_mw.value(),
             fcf1=self._fcf1, fcf2=self._fcf2,
             itla_grid=self._grid, ui_grid=self._ui_grid)
+
+    def do_power_sweep(self):
+        mw_start = self.spin_pw_start.value()
+        mw_stop  = self.spin_pw_stop.value()
+        if abs(mw_start - mw_stop) < 0.001:
+            QMessageBox.warning(self, "Power Sweep", "Start and stop must differ.")
+            return
+        self._power_sweep_log = []
+        self._power_sweep_export_btn.setEnabled(False)
+        self._power_sweep_logging = self._power_sweep_log_chk.isChecked()
+        self._set_state("power_sweeping")
+        self.worker.run_op("power_sweep",
+            mw_start=mw_start, mw_stop=mw_stop,
+            mw_step=self.spin_pw_step.value(),
+            dwell_s=self.spin_pw_dwell.value())
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -3402,9 +3951,12 @@ class ConexPanel(QWidget):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        root = QHBoxLayout(self)
+        final = QVBoxLayout(self)
+        final.setContentsMargins(10, 10, 10, 10)
+
+        root = QHBoxLayout()
         root.setSpacing(12)
-        root.setContentsMargins(10, 10, 10, 10)
+        final.addLayout(root)
 
         # ── Left: Connection ──────────────────────────────────────────────────
         conn_box = QGroupBox("Connection")
@@ -3418,7 +3970,7 @@ class ConexPanel(QWidget):
         conn_lay.addWidget(QLabel("COM Port #:"), 1, 0)
         self._port_spin = NoScrollSpinBox()
         self._port_spin.setRange(1, 99)
-        self._port_spin.setValue(4)
+        self._port_spin.setValue(load_connection_settings().get("conex_com_port", 4))
         conn_lay.addWidget(self._port_spin, 1, 1)
 
         self._connect_btn = QPushButton("Connect to Motor")
@@ -3562,22 +4114,13 @@ class ConexPanel(QWidget):
         root.addWidget(move_box, stretch=1)
 
         # ── Bottom: Log ───────────────────────────────────────────────────────
-        outer = QVBoxLayout()
-        outer.addLayout(root)
         log_box = QGroupBox("Log")
         log_lay = QVBoxLayout(log_box)
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setFixedHeight(120)
         log_lay.addWidget(self._log)
-        outer.addWidget(log_box)
-
-        # Replace root layout with vertical wrapper
-        container = QWidget()
-        container.setLayout(outer)
-        final = QVBoxLayout(self)
-        final.setContentsMargins(0, 0, 0, 0)
-        final.addWidget(container)
+        final.addWidget(log_box)
 
     # ── Slot handlers ─────────────────────────────────────────────────────────
 
@@ -3628,6 +4171,7 @@ class ConexPanel(QWidget):
     # ── Button actions ────────────────────────────────────────────────────────
 
     def _do_connect(self):
+        save_connection_setting("conex_com_port", self._port_spin.value())
         self._sig_connect.emit(self._port_spin.value())
 
     def _do_move_abs(self):
@@ -3641,6 +4185,2332 @@ class ConexPanel(QWidget):
 
     def cleanup(self):
         if HAS_PYVISA:
+            self._sig_disconnect.emit()
+            self._thread.quit()
+            self._thread.wait(2000)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HP 8168F TUNABLE LASER PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HP8168FWorker(QObject):
+    """
+    Runs blocking PyVISA/GPIB calls off the GUI thread.
+    All laser I/O goes through here — emit signals back to HP8168FPanel.
+    """
+    status_changed    = pyqtSignal(str)          # DISCONNECTED / CONNECTED / SWEEPING
+    wavelength_update = pyqtSignal(float)
+    power_update      = pyqtSignal(float)
+    output_update     = pyqtSignal(bool)
+    range_update      = pyqtSignal(float, float, float)   # min_nm, max_nm, max_mw
+    sweep_progress    = pyqtSignal(int, int, float)        # idx, total, wavelength_nm
+    power_sweep_progress = pyqtSignal(int, int, float)     # idx, total, power_mw
+    log_message       = pyqtSignal(str)
+    error              = pyqtSignal(str)
+    op_done            = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._laser = None
+        # threading.Event, not a plain bool: Stop must take effect while do_sweep()
+        # is blocking the worker thread's event loop, so it can't wait for a queued
+        # cross-thread signal to be delivered — the GUI thread sets this directly.
+        self._stop_event = threading.Event()
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _sleep_interruptible(self, total_s: float):
+        remaining = total_s
+        while remaining > 0 and not self._stop_event.is_set():
+            chunk = min(0.1, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    # ── Public slots (called via signal connections on worker thread) ───────
+
+    def do_connect(self, gpib_addr: int, prologix_port: int):
+        try:
+            device_name = f"Prologix::{gpib_addr}::ASRL{prologix_port}::INSTR"
+            self._laser = HP8168F(device_name=device_name, force_connect=True)
+            self.status_changed.emit("CONNECTED")
+            self.range_update.emit(self._laser._min_wavelength,
+                                    self._laser._max_wavelength,
+                                    self._laser._max_power)
+            self.wavelength_update.emit(self._laser.wavelength)
+            self.power_update.emit(self._laser.power)
+            self.output_update.emit(self._laser.on_or_off)
+            self.log_message.emit(f"Connected to HP-8168F ({device_name})")
+            self.op_done.emit("connect")
+        except Exception as e:
+            self.error.emit(f"Connect failed: {e}")
+
+    def do_set_wavelength(self, nm: float):
+        try:
+            self._laser.wavelength = nm
+            self.wavelength_update.emit(nm)
+            self.log_message.emit(f"Wavelength set to {nm:.4f} nm")
+            self.op_done.emit("set_wavelength")
+        except Exception as e:
+            self.error.emit(f"Set wavelength error: {e}")
+
+    def do_set_power(self, mw: float):
+        try:
+            self._laser.power = mw
+            self.power_update.emit(mw)
+            self.log_message.emit(f"Power set to {mw:.3f} mW")
+            self.op_done.emit("set_power")
+        except Exception as e:
+            self.error.emit(f"Set power error: {e}")
+
+    def do_set_output(self, on: bool):
+        try:
+            self._laser.on_or_off = on
+            self.output_update.emit(on)
+            self.log_message.emit(f"Output {'ON' if on else 'OFF'}")
+            self.op_done.emit("set_output")
+        except Exception as e:
+            self.error.emit(f"Set output error: {e}")
+
+    def do_sweep(self, nm_start: float, nm_stop: float, nm_step: float, dwell_s: float):
+        """
+        Step the laser wavelength from nm_start to nm_stop in nm_step increments,
+        dwelling dwell_s at each point. Direction follows nm_start → nm_stop
+        (i.e. it sweeps in whichever direction the user set, not always ascending).
+        """
+        try:
+            if nm_step <= 0:
+                self.error.emit("Step size must be positive")
+                return
+
+            self._stop_event.clear()
+            step = abs(nm_step) if nm_stop >= nm_start else -abs(nm_step)
+
+            targets = []
+            v = nm_start
+            if step >= 0:
+                while v <= nm_stop + 1e-9:
+                    targets.append(round(v, 6))
+                    v += step
+            else:
+                while v >= nm_stop - 1e-9:
+                    targets.append(round(v, 6))
+                    v += step
+            if not targets:
+                targets = [nm_start]
+
+            total = len(targets)
+            self.status_changed.emit("SWEEPING")
+            self.log_message.emit(
+                f"Sweep: {total} points, {nm_start:.4f} → {nm_stop:.4f} nm, "
+                f"{nm_step:.4f} nm step, {dwell_s:.2f} s dwell")
+
+            for idx, wl in enumerate(targets):
+                if self._stop_event.is_set():
+                    self.log_message.emit("Sweep stopped by user")
+                    break
+                self._laser.wavelength = wl
+                self.wavelength_update.emit(wl)
+                self.sweep_progress.emit(idx + 1, total, wl)
+                self._sleep_interruptible(dwell_s)
+
+            self.status_changed.emit("CONNECTED")
+            self.log_message.emit("Sweep complete")
+            self.op_done.emit("sweep")
+        except Exception as e:
+            self.error.emit(f"Sweep error: {e}")
+            self.status_changed.emit("CONNECTED")
+
+    def do_power_sweep(self, mw_start: float, mw_stop: float, mw_step: float, dwell_s: float):
+        """
+        Steps output power from mw_start to mw_stop in mw_step increments,
+        wavelength held fixed, dwelling dwell_s at each point (Cal 2-DC).
+        """
+        try:
+            if mw_step <= 0:
+                self.error.emit("Step size must be positive")
+                return
+
+            self._stop_event.clear()
+            step = abs(mw_step) if mw_stop >= mw_start else -abs(mw_step)
+
+            targets = []
+            v = mw_start
+            if step >= 0:
+                while v <= mw_stop + 1e-9:
+                    targets.append(round(v, 4))
+                    v += step
+            else:
+                while v >= mw_stop - 1e-9:
+                    targets.append(round(v, 4))
+                    v += step
+            if not targets:
+                targets = [mw_start]
+
+            total = len(targets)
+            self.status_changed.emit("SWEEPING")
+            self.log_message.emit(
+                f"Power sweep: {total} points, {mw_start:.2f} → {mw_stop:.2f} mW, "
+                f"{mw_step:.2f} mW step, {dwell_s:.2f} s dwell")
+
+            for idx, mw in enumerate(targets):
+                if self._stop_event.is_set():
+                    self.log_message.emit("Power sweep stopped by user")
+                    break
+                self._laser.power = mw
+                self.power_update.emit(mw)
+                self.power_sweep_progress.emit(idx + 1, total, mw)
+                self._sleep_interruptible(dwell_s)
+
+            self.status_changed.emit("CONNECTED")
+            self.log_message.emit("Power sweep complete")
+            self.op_done.emit("power_sweep")
+        except Exception as e:
+            self.error.emit(f"Power sweep error: {e}")
+            self.status_changed.emit("CONNECTED")
+
+    def do_stop_sweep(self):
+        self._stop_event.set()
+
+    def do_disconnect(self):
+        try:
+            if self._laser is not None:
+                self._laser.close()
+                self._laser = None
+            self.status_changed.emit("DISCONNECTED")
+            self.log_message.emit("Disconnected from HP-8168F")
+            self.op_done.emit("disconnect")
+        except Exception as e:
+            self.error.emit(f"Disconnect error: {e}")
+
+
+class HP8168FPanel(QWidget):
+    """
+    HP/Agilent 8168F tunable laser source — GPIB control via pyvisa.
+    All blocking PyVISA calls run in HP8168FWorker on a background QThread.
+    """
+
+    # Signals to invoke worker slots across threads
+    _sig_connect     = pyqtSignal(int, int)   # gpib_addr, prologix_com_port
+    _sig_set_wl      = pyqtSignal(float)
+    _sig_set_power   = pyqtSignal(float)
+    _sig_set_output  = pyqtSignal(bool)
+    _sig_sweep       = pyqtSignal(float, float, float, float)
+    _sig_power_sweep = pyqtSignal(float, float, float, float)
+    _sig_stop_sweep  = pyqtSignal()
+    _sig_disconnect  = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        if not HAS_PYVISA or not HAS_HP8168F:
+            lay = QVBoxLayout(self)
+            msg = []
+            if not HAS_PYVISA:
+                msg.append("pyvisa is not installed. Run: uv pip install pyvisa pyvisa-py")
+            if not HAS_HP8168F:
+                msg.append("hardware.laser_hp_8168F module not found —\n"
+                            "place hardware/laser_hp_8168F.py next to this script to enable the laser tab.")
+            lay.addWidget(QLabel("\n".join(msg) + "\nthen restart the GUI."))
+            return
+
+        # ── Worker thread ─────────────────────────────────────────────────────
+        self._worker = HP8168FWorker()
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.start()
+
+        # Connect panel signals → worker slots
+        self._sig_connect.connect(self._worker.do_connect)
+        self._sig_set_wl.connect(self._worker.do_set_wavelength)
+        self._sig_set_power.connect(self._worker.do_set_power)
+        self._sig_set_output.connect(self._worker.do_set_output)
+        self._sig_sweep.connect(self._worker.do_sweep)
+        self._sig_power_sweep.connect(self._worker.do_power_sweep)
+        self._sig_stop_sweep.connect(self._worker.do_stop_sweep)
+        self._sig_disconnect.connect(self._worker.do_disconnect)
+
+        # Connect worker signals → GUI slots
+        self._worker.status_changed.connect(self._on_status)
+        self._worker.wavelength_update.connect(self._on_wavelength)
+        self._worker.power_update.connect(self._on_power)
+        self._worker.output_update.connect(self._on_output)
+        self._worker.range_update.connect(self._on_range)
+        self._worker.sweep_progress.connect(self._on_sweep_progress)
+        self._worker.power_sweep_progress.connect(self._on_power_sweep_progress)
+        self._worker.log_message.connect(self._on_log)
+        self._worker.error.connect(self._on_error)
+        self._worker.op_done.connect(self._on_op_done)
+
+        self._last_wavelength_nm = None
+        self._last_power_mw     = None
+        self._coredaq_panel     = None
+        self._sweep_logging     = False
+        self._sweep_power_log   = []
+        self._power_sweep_logging = False
+        self._power_sweep_log     = []
+
+        self._build_ui()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        final = QVBoxLayout(self)
+        final.setContentsMargins(10, 10, 10, 10)
+
+        root = QHBoxLayout()
+        root.setSpacing(12)
+        final.addLayout(root)
+
+        # ── Left: Connection ──────────────────────────────────────────────────
+        conn_box = QGroupBox("Connection")
+        conn_lay = QGridLayout(conn_box)
+
+        conn_lay.addWidget(QLabel("Laser Status:"), 0, 0)
+        self._status_lbl = QLabel("DISCONNECTED")
+        self._status_lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+        conn_lay.addWidget(self._status_lbl, 0, 1)
+
+        conn_lay.addWidget(QLabel("GPIB Address:"), 1, 0)
+        self._gpib_spin = NoScrollSpinBox()
+        self._gpib_spin.setRange(0, 30)
+        self._gpib_spin.setValue(load_connection_settings().get("hp8168f_gpib_addr", 9))
+        conn_lay.addWidget(self._gpib_spin, 1, 1)
+
+        conn_lay.addWidget(QLabel("Prologix COM Port:"), 2, 0)
+        self._prologix_port_spin = NoScrollSpinBox()
+        self._prologix_port_spin.setRange(1, 99)
+        self._prologix_port_spin.setValue(load_connection_settings().get("prologix_com_port", 4))
+        self._prologix_port_spin.setToolTip(
+            "COM port of the Prologix GPIB-USB adapter itself (shared by every "
+            "GPIB instrument on the bus) — not the instrument's own GPIB address.")
+        conn_lay.addWidget(self._prologix_port_spin, 2, 1)
+
+        self._connect_btn = QPushButton("Connect to Laser")
+        self._connect_btn.clicked.connect(self._do_connect)
+        conn_lay.addWidget(self._connect_btn, 3, 0, 1, 2)
+
+        self._disconnect_btn = QPushButton("DISCONNECT")
+        self._disconnect_btn.setEnabled(False)
+        self._disconnect_btn.clicked.connect(lambda: self._sig_disconnect.emit())
+        conn_lay.addWidget(self._disconnect_btn, 4, 0, 1, 2)
+
+        conn_lay.addWidget(QLabel("Output:"), 5, 0)
+        self._output_lbl = QLabel("---")
+        self._output_lbl.setStyleSheet(f"color: {C_GRAY}; font-weight: bold;")
+        conn_lay.addWidget(self._output_lbl, 5, 1)
+
+        out_row = QHBoxLayout()
+        self._on_btn  = QPushButton("Output ON")
+        self._off_btn = QPushButton("Output OFF")
+        self._on_btn.setEnabled(False)
+        self._off_btn.setEnabled(False)
+        self._on_btn.clicked.connect(lambda: self._sig_set_output.emit(True))
+        self._off_btn.clicked.connect(lambda: self._sig_set_output.emit(False))
+        out_row.addWidget(self._on_btn)
+        out_row.addWidget(self._off_btn)
+        conn_lay.addLayout(out_row, 6, 0, 1, 2)
+
+        conn_lay.setRowStretch(7, 1)
+        root.addWidget(conn_box)
+
+        # ── Middle: Manual control ───────────────────────────────────────────
+        man_box = QGroupBox("Manual Control")
+        man_lay = QGridLayout(man_box)
+
+        man_lay.addWidget(QLabel("Current Wavelength (nm):"), 0, 0)
+        self._wl_lbl = QLabel("---")
+        self._wl_lbl.setStyleSheet(f"color: {C_BLUE}; font-family: monospace; font-size: 13px;")
+        man_lay.addWidget(self._wl_lbl, 0, 1)
+
+        man_lay.addWidget(QLabel("Current Power (mW):"), 1, 0)
+        self._pow_lbl = QLabel("---")
+        self._pow_lbl.setStyleSheet(f"color: {C_BLUE}; font-family: monospace; font-size: 13px;")
+        man_lay.addWidget(self._pow_lbl, 1, 1)
+
+        man_lay.addWidget(QLabel("Set Wavelength (nm):"), 2, 0)
+        self._wl_spin = NoScrollDoubleSpinBox()
+        self._wl_spin.setDecimals(4)
+        self._wl_spin.setRange(1400.0, 1600.0)   # narrowed to instrument range after connect
+        self._wl_spin.setValue(1550.0)
+        man_lay.addWidget(self._wl_spin, 2, 1)
+        self._wl_btn = QPushButton("SET!")
+        self._wl_btn.setEnabled(False)
+        self._wl_btn.clicked.connect(lambda: self._sig_set_wl.emit(self._wl_spin.value()))
+        man_lay.addWidget(self._wl_btn, 2, 2)
+
+        man_lay.addWidget(QLabel("Set Power (mW):"), 3, 0)
+        self._pow_spin = NoScrollDoubleSpinBox()
+        self._pow_spin.setDecimals(3)
+        self._pow_spin.setRange(0.0, 20.0)       # narrowed to instrument range after connect
+        self._pow_spin.setValue(1.0)
+        man_lay.addWidget(self._pow_spin, 3, 1)
+        self._pow_btn = QPushButton("SET!")
+        self._pow_btn.setEnabled(False)
+        self._pow_btn.clicked.connect(lambda: self._sig_set_power.emit(self._pow_spin.value()))
+        man_lay.addWidget(self._pow_btn, 3, 2)
+
+        man_lay.setRowStretch(4, 1)
+        root.addWidget(man_box)
+
+        # ── Right: Wavelength sweep ───────────────────────────────────────────
+        sweep_box = QGroupBox("Wavelength Sweep")
+        sw_lay = QGridLayout(sweep_box)
+
+        sw_lay.addWidget(QLabel("Start (nm):"), 0, 0)
+        self._sw_start = NoScrollDoubleSpinBox()
+        self._sw_start.setDecimals(4)
+        self._sw_start.setRange(1400.0, 1600.0)
+        self._sw_start.setValue(1545.0)
+        sw_lay.addWidget(self._sw_start, 0, 1)
+
+        sw_lay.addWidget(QLabel("Stop (nm):"), 1, 0)
+        self._sw_stop = NoScrollDoubleSpinBox()
+        self._sw_stop.setDecimals(4)
+        self._sw_stop.setRange(1400.0, 1600.0)
+        self._sw_stop.setValue(1555.0)
+        sw_lay.addWidget(self._sw_stop, 1, 1)
+
+        sw_lay.addWidget(QLabel("Step (nm):"), 2, 0)
+        self._sw_step = NoScrollDoubleSpinBox()
+        self._sw_step.setDecimals(4)
+        self._sw_step.setRange(0.0001, 100.0)
+        self._sw_step.setValue(0.1)
+        sw_lay.addWidget(self._sw_step, 2, 1)
+
+        sw_lay.addWidget(QLabel("Dwell (s):"), 3, 0)
+        self._sw_dwell = NoScrollDoubleSpinBox()
+        self._sw_dwell.setDecimals(2)
+        self._sw_dwell.setRange(0.0, 60.0)
+        self._sw_dwell.setValue(0.5)
+        sw_lay.addWidget(self._sw_dwell, 3, 1)
+
+        self._sw_info_lbl = QLabel("")
+        self._sw_info_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        sw_lay.addWidget(self._sw_info_lbl, 4, 0, 1, 2)
+
+        self._sw_run_btn  = QPushButton("Run Sweep")
+        self._sw_stop_btn = QPushButton("Stop")
+        self._sw_run_btn.setEnabled(False)
+        self._sw_stop_btn.setEnabled(False)
+        self._sw_run_btn.clicked.connect(self._do_sweep)
+        self._sw_stop_btn.clicked.connect(self._do_stop_sweep)
+        sw_lay.addWidget(self._sw_run_btn, 5, 0, 1, 2)
+        sw_lay.addWidget(self._sw_stop_btn, 6, 0, 1, 2)
+
+        self._sw_progress_lbl = QLabel("")
+        self._sw_progress_lbl.setStyleSheet(f"color: {C_GRAY};")
+        sw_lay.addWidget(self._sw_progress_lbl, 7, 0, 1, 2)
+
+        self._sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
+        self._sweep_log_chk.setToolTip(
+            "Records the CoreDAQ optical power meter at each sweep step")
+        sw_lay.addWidget(self._sweep_log_chk, 8, 0, 1, 2)
+        self._sweep_export_btn = QPushButton("Export CSV…")
+        self._sweep_export_btn.setEnabled(False)
+        self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
+        sw_lay.addWidget(self._sweep_export_btn, 9, 0, 1, 2)
+
+        sw_lay.setRowStretch(10, 1)
+        root.addWidget(sweep_box, stretch=1)
+
+        for sb in (self._sw_start, self._sw_stop, self._sw_step, self._sw_dwell):
+            sb.valueChanged.connect(self._update_sweep_info)
+        self._update_sweep_info()
+
+        # ── Power Sweep (Cal 2-DC: power only, wavelength stays fixed) ───────
+        pw_box = QGroupBox("Power Sweep  (wavelength stays fixed — laser must already be ON)")
+        pwg = QGridLayout(pw_box)
+
+        pwg.addWidget(QLabel("Start (mW):"), 0, 0)
+        self._pw_start = NoScrollDoubleSpinBox()
+        self._pw_start.setDecimals(3)
+        self._pw_start.setRange(0.0, 20.0)
+        self._pw_start.setValue(0.5)
+        pwg.addWidget(self._pw_start, 0, 1)
+
+        pwg.addWidget(QLabel("Stop (mW):"), 0, 2)
+        self._pw_stop = NoScrollDoubleSpinBox()
+        self._pw_stop.setDecimals(3)
+        self._pw_stop.setRange(0.0, 20.0)
+        self._pw_stop.setValue(2.0)
+        pwg.addWidget(self._pw_stop, 0, 3)
+
+        pwg.addWidget(QLabel("Step (mW):"), 1, 0)
+        self._pw_step = NoScrollDoubleSpinBox()
+        self._pw_step.setDecimals(3)
+        self._pw_step.setRange(0.001, 10.0)
+        self._pw_step.setValue(0.1)
+        pwg.addWidget(self._pw_step, 1, 1)
+
+        pwg.addWidget(QLabel("Dwell (s):"), 1, 2)
+        self._pw_dwell = NoScrollDoubleSpinBox()
+        self._pw_dwell.setDecimals(2)
+        self._pw_dwell.setRange(0.0, 60.0)
+        self._pw_dwell.setValue(0.5)
+        pwg.addWidget(self._pw_dwell, 1, 3)
+
+        self._pw_run_btn  = QPushButton("Run Power Sweep")
+        self._pw_stop_btn = QPushButton("Stop")
+        self._pw_run_btn.setEnabled(False)
+        self._pw_stop_btn.setEnabled(False)
+        self._pw_run_btn.clicked.connect(self._do_power_sweep)
+        self._pw_stop_btn.clicked.connect(self._do_stop_sweep)
+        pwg.addWidget(self._pw_run_btn, 2, 0, 1, 2)
+        pwg.addWidget(self._pw_stop_btn, 2, 2, 1, 2)
+
+        self._pw_progress_lbl = QLabel("")
+        self._pw_progress_lbl.setStyleSheet(f"color: {C_GRAY};")
+        pwg.addWidget(self._pw_progress_lbl, 3, 0, 1, 4)
+
+        self._power_sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
+        self._power_sweep_log_chk.setToolTip(
+            "Records the CoreDAQ optical power meter at each power-sweep step")
+        pwg.addWidget(self._power_sweep_log_chk, 4, 0, 1, 3)
+        self._power_sweep_export_btn = QPushButton("Export CSV…")
+        self._power_sweep_export_btn.setEnabled(False)
+        self._power_sweep_export_btn.clicked.connect(self._export_power_sweep_csv)
+        pwg.addWidget(self._power_sweep_export_btn, 4, 3)
+
+        final.addWidget(pw_box)
+
+        # ── Bottom: Log ───────────────────────────────────────────────────────
+        log_box = QGroupBox("Log")
+        log_lay = QVBoxLayout(log_box)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFixedHeight(120)
+        log_lay.addWidget(self._log)
+        final.addWidget(log_box)
+
+    # ── Slot handlers ─────────────────────────────────────────────────────────
+
+    def _on_status(self, s: str):
+        self._status_lbl.setText(s)
+        colors = {
+            "DISCONNECTED": C_RED,
+            "CONNECTED":    C_BLUE,
+            "SWEEPING":     C_GOLD,
+        }
+        self._status_lbl.setStyleSheet(
+            f"color: {colors.get(s, C_GRAY)}; font-weight: bold;")
+
+        connected = s != "DISCONNECTED"
+        busy      = s == "SWEEPING"
+        self._sw_run_btn.setEnabled(connected and not busy)
+        self._sw_stop_btn.setEnabled(busy)
+        self._pw_run_btn.setEnabled(connected and not busy)
+        self._pw_stop_btn.setEnabled(busy)
+        self._wl_btn.setEnabled(connected and not busy)
+        self._pow_btn.setEnabled(connected and not busy)
+        self._on_btn.setEnabled(connected and not busy)
+        self._off_btn.setEnabled(connected and not busy)
+
+    def _on_wavelength(self, nm: float):
+        self._wl_lbl.setText(f"{nm:.4f} nm")
+        self._last_wavelength_nm = nm
+
+    def _on_power(self, mw: float):
+        self._pow_lbl.setText(f"{mw:.3f} mW")
+        self._last_power_mw = mw
+
+    def latest_reading(self):
+        """Last (wavelength, power) reading, or None if not connected."""
+        if self._status_lbl.text() == "DISCONNECTED":
+            return None
+        return {"wavelength_nm": self._last_wavelength_nm, "power_mw": self._last_power_mw}
+
+    def set_coredaq_panel(self, panel):
+        """Wires the CoreDAQ tab in so wavelength sweeps can log optical power."""
+        self._coredaq_panel = panel
+
+    def _on_output(self, on: bool):
+        self._output_lbl.setText("ON" if on else "OFF")
+        self._output_lbl.setStyleSheet(f"color: {C_RED if on else C_GRAY}; font-weight: bold;")
+
+    def _on_range(self, min_nm: float, max_nm: float, max_mw: float):
+        for spin in (self._wl_spin, self._sw_start, self._sw_stop):
+            spin.setRange(min_nm, max_nm)
+        self._pow_spin.setRange(0.0, max_mw)
+        self._log.append(f"Wavelength range: {min_nm:.3f}–{max_nm:.3f} nm,  max power {max_mw:.3f} mW")
+
+    def _on_log(self, msg: str):
+        self._log.append(msg)
+
+    def _on_error(self, msg: str):
+        self._log.append(f"<span style='color:{C_RED};'>ERROR: {msg}</span>")
+
+    def _on_op_done(self, op: str):
+        if op == "connect":
+            self._connect_btn.setEnabled(False)
+            self._disconnect_btn.setEnabled(True)
+            self._gpib_spin.setEnabled(False)
+            self._prologix_port_spin.setEnabled(False)
+        elif op == "disconnect":
+            self._connect_btn.setEnabled(True)
+            self._disconnect_btn.setEnabled(False)
+            self._gpib_spin.setEnabled(True)
+            self._prologix_port_spin.setEnabled(True)
+        elif op == "sweep" and self._sweep_logging:
+            self._sweep_logging = False
+            if self._sweep_power_log:
+                self._sweep_export_btn.setEnabled(True)
+                self._show_sweep_power_plot()
+        elif op == "power_sweep":
+            self._power_sweep_logging = False
+            if self._power_sweep_log:
+                self._power_sweep_export_btn.setEnabled(True)
+                self._show_power_sweep_plot()
+
+    def _on_sweep_progress(self, idx: int, total: int, wl: float):
+        self._sw_progress_lbl.setText(f"[{idx}/{total}]  {wl:.4f} nm")
+        if self._sweep_logging and self._coredaq_panel is not None:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is not None:
+                self._sweep_power_log.append((wl, *powers))
+
+    def _on_power_sweep_progress(self, idx: int, total: int, mw: float):
+        self._pw_progress_lbl.setText(f"[{idx}/{total}]  {mw:.3f} mW")
+        if self._power_sweep_logging and self._coredaq_panel is not None:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is not None:
+                self._power_sweep_log.append((mw, *powers))
+
+    def _show_sweep_power_plot(self):
+        series = {}
+        for ch in range(4):
+            xs = [row[0] for row in self._sweep_power_log]
+            ys = [row[1 + ch] for row in self._sweep_power_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+        win = MultiSeriesPlotWindow("HP-8168F Sweep — CoreDAQ Power", "Wavelength", "nm")
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._sweep_plot_win = win
+
+    def _export_sweep_power_csv(self):
+        if not self._sweep_power_log:
+            return
+        import datetime
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"hp8168f_sweep_coredaq_{stamp}.csv")
+        comments = [
+            "laser: HP-8168F",
+            f"sweep: {self._sw_start.value():.4f} -> {self._sw_stop.value():.4f} nm, "
+            f"step {self._sw_step.value():.4f} nm, dwell {self._sw_dwell.value():.2f} s",
+            f"power_setpoint_mw: {self._pow_spin.value():.3f}",
+        ]
+        header = ["wavelength_nm",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = [[f"{wl:.4f}"] + [f"{w:.9e}" for w in powers]
+                for wl, *powers in self._sweep_power_log]
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[HP-8168F Sweep] Saved {len(rows)} rows → {fname}")
+        self._log.append(f"Saved {len(rows)} sweep/power rows → {fname}")
+
+    def _show_power_sweep_plot(self):
+        series = {}
+        for ch in range(4):
+            xs = [row[0] for row in self._power_sweep_log]
+            ys = [row[1 + ch] for row in self._power_sweep_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+        win = MultiSeriesPlotWindow("HP-8168F Power Sweep — CoreDAQ Power", "Laser power", "mW")
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._power_sweep_plot_win = win
+
+    def _export_power_sweep_csv(self):
+        if not self._power_sweep_log:
+            return
+        import datetime
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"hp8168f_power_sweep_coredaq_{stamp}.csv")
+        comments = [
+            "laser: HP-8168F",
+            f"power_sweep: {self._pw_start.value():.3f} -> {self._pw_stop.value():.3f} mW, "
+            f"step {self._pw_step.value():.3f} mW, dwell {self._pw_dwell.value():.2f} s",
+            f"wavelength_nm: {self._wl_spin.value():.4f}",
+        ]
+        header = ["power_mw",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = [[f"{mw:.4f}"] + [f"{w:.9e}" for w in powers]
+                for mw, *powers in self._power_sweep_log]
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[HP-8168F Power Sweep] Saved {len(rows)} rows → {fname}")
+        self._log.append(f"Saved {len(rows)} power-sweep rows → {fname}")
+
+    # ── Button actions ────────────────────────────────────────────────────────
+
+    def _update_sweep_info(self):
+        start = self._sw_start.value()
+        stop  = self._sw_stop.value()
+        step  = self._sw_step.value()
+        dwell = self._sw_dwell.value()
+        if step <= 0:
+            self._sw_info_lbl.setText("")
+            return
+        npts = int(abs(stop - start) / step) + 1
+        self._sw_info_lbl.setText(
+            f"{npts} points · ~{npts * dwell:.1f} s total")
+
+    def _do_connect(self):
+        save_connection_setting("hp8168f_gpib_addr", self._gpib_spin.value())
+        save_connection_setting("prologix_com_port", self._prologix_port_spin.value())
+        self._sig_connect.emit(self._gpib_spin.value(), self._prologix_port_spin.value())
+
+    def _do_sweep(self):
+        start = self._sw_start.value()
+        stop  = self._sw_stop.value()
+        step  = self._sw_step.value()
+        dwell = self._sw_dwell.value()
+        if abs(start - stop) < 1e-9:
+            QMessageBox.warning(self, "Sweep", "Start and stop must differ.")
+            return
+        self._sw_progress_lbl.setText("")
+        self._sweep_power_log = []
+        self._sweep_export_btn.setEnabled(False)
+        self._sweep_logging = self._sweep_log_chk.isChecked()
+        self._sig_sweep.emit(start, stop, step, dwell)
+
+    def _do_power_sweep(self):
+        start = self._pw_start.value()
+        stop  = self._pw_stop.value()
+        step  = self._pw_step.value()
+        dwell = self._pw_dwell.value()
+        if abs(start - stop) < 1e-9:
+            QMessageBox.warning(self, "Power Sweep", "Start and stop must differ.")
+            return
+        self._pw_progress_lbl.setText("")
+        self._power_sweep_log = []
+        self._power_sweep_export_btn.setEnabled(False)
+        self._power_sweep_logging = self._power_sweep_log_chk.isChecked()
+        self._sig_power_sweep.emit(start, stop, step, dwell)
+
+    def _do_stop_sweep(self):
+        # Set the worker's threading.Event directly from this (GUI) thread — a
+        # queued _sig_stop_sweep signal would just sit behind the sweep loop's
+        # own blocking call on the worker thread and never get delivered in time.
+        self._worker._stop_event.set()
+        self._sig_stop_sweep.emit()
+
+    def cleanup(self):
+        if HAS_PYVISA and HAS_HP8168F:
+            self._sig_disconnect.emit()
+            self._thread.quit()
+            self._thread.wait(2000)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SANTEC TSL-550 TUNABLE LASER PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FastSweepWorker(QObject):
+    """
+    Runs one full hardware-triggered wavelength sweep on its own thread — holds
+    direct references to the raw TSL550 laser and CoreDAQ objects for the
+    duration of the sweep. Mirrors the lab's threads/laser_sweep_worker.py: one
+    thread, one blocking method owning both hardware objects, so no cross-thread
+    handshake is needed mid-sweep (unlike SantecWorker/CoreDAQWorker, which each
+    own their device privately behind a queued-signal API for everyday use).
+
+    Trigger scheme: the laser fires a single rising-edge trigger pulse at the
+    start of its native continuous sweep (TRIG:OUTP 2 / TRIG:OUTP:ACT 1).
+    CoreDAQ is armed on that one edge and free-runs its own ADC clock at
+    SWEEP_RATE_HZ for a precomputed sample count — the wavelength axis is
+    reconstructed from elapsed time and the sweep's constant speed, not from
+    per-point synchronization.
+    """
+    progress = pyqtSignal(str)
+    error    = pyqtSignal(str)
+    result   = pyqtSignal(object)   # dict: {"wavelengths": [...], "power_ch": [[4 lists]]}
+    finished = pyqtSignal()
+
+    SWEEP_RATE_HZ = 50_000
+
+    def __init__(self):
+        super().__init__()
+        self._laser  = None
+        self._daq    = None
+        self._params = {}
+
+    def set_hardware(self, laser, daq):
+        self._laser = laser
+        self._daq   = daq
+
+    def set_sweep_params(self, params: dict):
+        self._params = params
+
+    def _configure_laser(self, start_nm, stop_nm, speed_nm_s, power_mw):
+        laser = self._laser
+        laser.write('WAV:UNIT 0')       # nm
+        laser.write('POW:UNIT 1')       # mW
+        laser.write('TRIG:INP 0')       # no external trigger IN to laser
+        laser.write('TRIG:OUTP 2')      # output mode 2 = start trigger pulse
+        laser.write('TRIG:OUTP:ACT 1')  # active-high: rising edge = sweep start
+
+        laser.wavelength = start_nm
+        time.sleep(0.5)
+        laser.power = power_mw
+        laser.on()
+        laser.shutter = False
+        time.sleep(0.3)
+
+        laser.write(f'WAV:SWE:STAR {start_nm}')
+        laser.write(f'WAV:SWE:STOP {stop_nm}')
+        laser.write(f'WAV:SWE:SPE {speed_nm_s}')
+        laser.write('WAV:SWE:MOD 1')    # one-way continuous
+        laser.write('WAV:SWE:CYCL 1')   # single cycle
+        time.sleep(0.3)
+
+    def _build_wavelength_axis(self, start_nm, stop_nm, speed_nm_s, n_samples):
+        span = abs(stop_nm - start_nm)
+        dur  = span / speed_nm_s
+        t    = np.arange(n_samples, dtype=float) / float(self.SWEEP_RATE_HZ)
+        wl   = start_nm + (stop_nm - start_nm) * (t / dur)
+        return np.clip(wl, min(start_nm, stop_nm), max(start_nm, stop_nm))
+
+    def run_sweep(self):
+        start_nm   = self._params.get('start_nm', 1500.0)
+        stop_nm    = self._params.get('stop_nm',  1560.0)
+        speed_nm_s = self._params.get('speed',    50.0)
+        power_mw   = self._params.get('power',    1.0)
+
+        if speed_nm_s <= 0:
+            self.error.emit("Sweep speed must be > 0 nm/s")
+            self.finished.emit()
+            return
+        if self._laser is None or self._daq is None:
+            self.error.emit("Laser or CoreDAQ not connected")
+            self.finished.emit()
+            return
+
+        self.progress.emit(
+            f"Fast sweep: {start_nm:.3f} → {stop_nm:.3f} nm @ {speed_nm_s:.1f} nm/s, "
+            f"P={power_mw:.3f} mW")
+
+        try:
+            span  = abs(stop_nm - start_nm)
+            dur_s = span / speed_nm_s
+            n     = int(round(dur_s * self.SWEEP_RATE_HZ))
+            if n <= 0:
+                raise ValueError("Zero samples — check sweep parameters")
+
+            self.progress.emit(f"CoreDAQ: setting {self.SWEEP_RATE_HZ // 1000} kHz sample rate")
+            self._daq.set_oversampling(0)
+            self._daq.set_freq(self.SWEEP_RATE_HZ)
+
+            self._configure_laser(start_nm, stop_nm, speed_nm_s, power_mw)
+
+            self.progress.emit(f"CoreDAQ: arming {n} samples on rising trigger edge")
+            self._daq.arm_acquisition(n, use_trigger=True, trigger_rising=True)
+
+            self.progress.emit("Starting sweep (trigger fires DAQ)...")
+            t0 = time.time()
+            self._laser.write('WAV:SWE 1')
+
+            timeout_s = dur_s + 30.0
+            while True:
+                if self._daq.state_enum() == 4:   # READY — data available
+                    break
+                if (time.time() - t0) > timeout_s:
+                    raise TimeoutError(f"CoreDAQ timeout after {time.time() - t0:.1f}s")
+                try:
+                    wl = self._laser.query('WAV?').strip()
+                    self.progress.emit(f"  λ={wl} nm  ({time.time() - t0:.1f}s)")
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+            self.progress.emit(f"Data ready in {time.time() - t0:.1f}s — transferring...")
+            time.sleep(0.2)
+            power_ch = self._daq.transfer_frames_W(n)   # list of 4 lists, already watts
+
+            wl_axis = self._build_wavelength_axis(start_nm, stop_nm, speed_nm_s, n)
+
+            self._laser.shutter = True
+            self.progress.emit(f"Fast sweep complete: {len(wl_axis)} points")
+            self.result.emit({"wavelengths": wl_axis.tolist(), "power_ch": power_ch})
+            self.finished.emit()
+
+        except Exception as e:
+            try:
+                self._laser.shutter = True
+            except Exception:
+                pass
+            self.error.emit(str(e))
+            self.finished.emit()
+
+
+class SantecWorker(QObject):
+    """
+    Runs blocking PyVISA/GPIB calls off the GUI thread.
+    All laser I/O goes through here — emit signals back to SantecPanel.
+    """
+    status_changed    = pyqtSignal(str)          # DISCONNECTED / CONNECTED / SWEEPING
+    wavelength_update = pyqtSignal(float)
+    power_update      = pyqtSignal(float)
+    output_update     = pyqtSignal(bool)
+    range_update      = pyqtSignal(float, float, float)   # min_nm, max_nm, max_mw
+    sweep_progress    = pyqtSignal(int, int, float)        # idx, total, wavelength_nm
+    power_sweep_progress = pyqtSignal(int, int, float)     # idx, total, power_mw
+    log_message       = pyqtSignal(str)
+    error              = pyqtSignal(str)
+    op_done            = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._laser = None
+        # threading.Event, not a plain bool: Stop must take effect while do_sweep()
+        # is blocking the worker thread's event loop, so it can't wait for a queued
+        # cross-thread signal to be delivered — the GUI thread sets this directly.
+        self._stop_event = threading.Event()
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _sleep_interruptible(self, total_s: float):
+        remaining = total_s
+        while remaining > 0 and not self._stop_event.is_set():
+            chunk = min(0.1, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    # ── Public slots (called via signal connections on worker thread) ───────
+
+    def do_connect(self, gpib_addr: int, prologix_port: int):
+        try:
+            device_name = f"Prologix::{gpib_addr}::ASRL{prologix_port}::INSTR"
+            self._laser = TSL550(device_name=device_name, force_connect=True)
+            self.status_changed.emit("CONNECTED")
+            self.range_update.emit(self._laser._min_wavelength,
+                                    self._laser._max_wavelength,
+                                    self._laser._max_power)
+            self.wavelength_update.emit(self._laser.wavelength)
+            self.power_update.emit(self._laser.power)
+            self.output_update.emit(not self._laser.shutter)
+            self.log_message.emit(f"Connected to Santec TSL-550 ({device_name})")
+            self.op_done.emit("connect")
+        except Exception as e:
+            self.error.emit(f"Connect failed: {e}")
+
+    def do_set_wavelength(self, nm: float):
+        try:
+            self._laser.wavelength = nm
+            self.wavelength_update.emit(nm)
+            self.log_message.emit(f"Wavelength set to {nm:.4f} nm")
+            self.op_done.emit("set_wavelength")
+        except Exception as e:
+            self.error.emit(f"Set wavelength error: {e}")
+
+    def do_set_power(self, mw: float):
+        try:
+            self._laser.power = mw
+            self.power_update.emit(mw)
+            self.log_message.emit(f"Power set to {mw:.3f} mW")
+            self.op_done.emit("set_power")
+        except Exception as e:
+            self.error.emit(f"Set power error: {e}")
+
+    def do_set_output(self, on: bool):
+        # Leaves the laser diode itself running either way — only the shutter
+        # is toggled, so this never forces a warm-up/re-lock cycle. Turning
+        # the diode fully on/off only ever happens once, right after connect.
+        try:
+            if on:
+                self._laser.on()
+                self._laser.shutter = False
+            else:
+                self._laser.shutter = True
+            self.output_update.emit(on)
+            self.log_message.emit(f"Output {'ON' if on else 'OFF'}")
+            self.op_done.emit("set_output")
+        except Exception as e:
+            self.error.emit(f"Set output error: {e}")
+
+    def do_sweep(self, nm_start: float, nm_stop: float, nm_step: float, dwell_s: float):
+        """
+        Runs the TSL-550's built-in one-way step sweep from nm_start to nm_stop in
+        nm_step increments, dwelling dwell_s at each point on the instrument itself
+        (rather than the host writing a new WAV setpoint and sleeping for each point).
+        Direction follows nm_start → nm_stop. We poll the laser's live wavelength/
+        sweep-status registers to report progress and let the GUI log CoreDAQ power
+        at each step as the instrument reaches it.
+        """
+        try:
+            if nm_step <= 0:
+                self.error.emit("Step size must be positive")
+                return
+
+            self._stop_event.clear()
+            total = int(abs(nm_stop - nm_start) / nm_step + 1e-9) + 1
+
+            self.status_changed.emit("SWEEPING")
+            self.log_message.emit(
+                f"Sweep: {total} points, {nm_start:.4f} → {nm_stop:.4f} nm, "
+                f"{nm_step:.4f} nm step, {dwell_s:.2f} s dwell (Santec built-in step sweep)")
+
+            self._laser.configure_step_sweep(nm_start, nm_stop, nm_step, dwell_s)
+            self._laser.start_sweep()
+            self._sleep_interruptible(0.05)   # let the sweep engine start moving
+
+            idx = 0
+            last_wl = None
+            while not self._stop_event.is_set():
+                wl = self._laser.wavelength
+                if last_wl is None or abs(wl - last_wl) >= abs(nm_step) * 0.5:
+                    last_wl = wl
+                    idx += 1
+                    self.wavelength_update.emit(wl)
+                    self.sweep_progress.emit(min(idx, total), total, wl)
+                if self._laser.sweep_status == 0:
+                    break
+                self._sleep_interruptible(0.08)
+
+            if self._stop_event.is_set():
+                self._laser.stop_sweep()
+                self.log_message.emit("Sweep stopped by user")
+
+            self.status_changed.emit("CONNECTED")
+            self.log_message.emit("Sweep complete")
+            self.op_done.emit("sweep")
+        except Exception as e:
+            self.error.emit(f"Sweep error: {e}")
+            self.status_changed.emit("CONNECTED")
+
+    def do_power_sweep(self, mw_start: float, mw_stop: float, mw_step: float, dwell_s: float):
+        """
+        Steps output power from mw_start to mw_stop in mw_step increments,
+        wavelength held fixed, dwelling dwell_s at each point (Cal 2-DC).
+        """
+        try:
+            if mw_step <= 0:
+                self.error.emit("Step size must be positive")
+                return
+
+            self._stop_event.clear()
+            step = abs(mw_step) if mw_stop >= mw_start else -abs(mw_step)
+
+            targets = []
+            v = mw_start
+            if step >= 0:
+                while v <= mw_stop + 1e-9:
+                    targets.append(round(v, 4))
+                    v += step
+            else:
+                while v >= mw_stop - 1e-9:
+                    targets.append(round(v, 4))
+                    v += step
+            if not targets:
+                targets = [mw_start]
+
+            total = len(targets)
+            self.status_changed.emit("SWEEPING")
+            self.log_message.emit(
+                f"Power sweep: {total} points, {mw_start:.2f} → {mw_stop:.2f} mW, "
+                f"{mw_step:.2f} mW step, {dwell_s:.2f} s dwell")
+
+            for idx, mw in enumerate(targets):
+                if self._stop_event.is_set():
+                    self.log_message.emit("Power sweep stopped by user")
+                    break
+                self._laser.power = mw
+                self.power_update.emit(mw)
+                self.power_sweep_progress.emit(idx + 1, total, mw)
+                self._sleep_interruptible(dwell_s)
+
+            self.status_changed.emit("CONNECTED")
+            self.log_message.emit("Power sweep complete")
+            self.op_done.emit("power_sweep")
+        except Exception as e:
+            self.error.emit(f"Power sweep error: {e}")
+            self.status_changed.emit("CONNECTED")
+
+    def do_stop_sweep(self):
+        self._stop_event.set()
+
+    def do_disconnect(self):
+        try:
+            if self._laser is not None:
+                self._laser.close()
+                self._laser = None
+            self.status_changed.emit("DISCONNECTED")
+            self.log_message.emit("Disconnected from Santec TSL-550")
+            self.op_done.emit("disconnect")
+        except Exception as e:
+            self.error.emit(f"Disconnect error: {e}")
+
+
+class SantecPanel(QWidget):
+    """
+    Santec TSL-550 tunable laser source — GPIB control via pyvisa.
+    All blocking PyVISA calls run in SantecWorker on a background QThread.
+    """
+
+    # Signals to invoke worker slots across threads
+    _sig_connect     = pyqtSignal(int, int)   # gpib_addr, prologix_com_port
+    _sig_set_wl      = pyqtSignal(float)
+    _sig_set_power   = pyqtSignal(float)
+    _sig_set_output  = pyqtSignal(bool)
+    _sig_sweep       = pyqtSignal(float, float, float, float)
+    _sig_power_sweep = pyqtSignal(float, float, float, float)
+    _sig_stop_sweep  = pyqtSignal()
+    _sig_disconnect  = pyqtSignal()
+    _sig_run_fast_sweep = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        if not HAS_PYVISA or not HAS_SANTEC:
+            lay = QVBoxLayout(self)
+            msg = []
+            if not HAS_PYVISA:
+                msg.append("pyvisa is not installed. Run: uv pip install pyvisa pyvisa-py")
+            if not HAS_SANTEC:
+                msg.append("hardware.laser_tsl_550 not found, or its 'nidaqmx' dependency is "
+                            "missing —\nrun: uv pip install nidaqmx")
+            lay.addWidget(QLabel("\n".join(msg) + "\nthen restart the GUI."))
+            return
+
+        # ── Worker thread ─────────────────────────────────────────────────────
+        self._worker = SantecWorker()
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.start()
+
+        # Connect panel signals → worker slots
+        self._sig_connect.connect(self._worker.do_connect)
+        self._sig_set_wl.connect(self._worker.do_set_wavelength)
+        self._sig_set_power.connect(self._worker.do_set_power)
+        self._sig_set_output.connect(self._worker.do_set_output)
+        self._sig_sweep.connect(self._worker.do_sweep)
+        self._sig_power_sweep.connect(self._worker.do_power_sweep)
+        self._sig_stop_sweep.connect(self._worker.do_stop_sweep)
+        self._sig_disconnect.connect(self._worker.do_disconnect)
+
+        # Connect worker signals → GUI slots
+        self._worker.status_changed.connect(self._on_status)
+        self._worker.wavelength_update.connect(self._on_wavelength)
+        self._worker.power_update.connect(self._on_power)
+        self._worker.output_update.connect(self._on_output)
+        self._worker.range_update.connect(self._on_range)
+        self._worker.sweep_progress.connect(self._on_sweep_progress)
+        self._worker.power_sweep_progress.connect(self._on_power_sweep_progress)
+        self._worker.log_message.connect(self._on_log)
+        self._worker.error.connect(self._on_error)
+        self._worker.op_done.connect(self._on_op_done)
+
+        # ── Fast Sweep worker thread — direct laser+DAQ refs, single blocking
+        # method arms the DAQ, fires the laser's one-shot start trigger, and
+        # transfers the result. Mirrors the lab's laser_sweep_worker.py pattern:
+        # one thread owns both hardware objects for the duration of the sweep,
+        # no cross-thread handshake needed mid-sweep. ────────────────────────
+        self._fast_sweep_worker = FastSweepWorker()
+        self._fast_sweep_thread = QThread()
+        self._fast_sweep_worker.moveToThread(self._fast_sweep_thread)
+        self._fast_sweep_thread.start()
+        self._sig_run_fast_sweep.connect(self._fast_sweep_worker.run_sweep)
+        self._fast_sweep_worker.progress.connect(self._on_fast_sweep_progress)
+        self._fast_sweep_worker.error.connect(self._on_fast_sweep_error)
+        self._fast_sweep_worker.result.connect(self._on_fast_sweep_result)
+        self._fast_sweep_worker.finished.connect(self._on_fast_sweep_finished)
+
+        self._last_wavelength_nm = None
+        self._last_power_mw     = None
+        self._coredaq_panel     = None
+        self._sweep_logging     = False
+        self._sweep_power_log   = []
+        self._power_sweep_logging = False
+        self._power_sweep_log     = []
+        self._fast_sweep_running  = False
+        self._fast_sweep_result   = None   # (wavelengths[], [ch1_W..ch4_W])
+
+        self._build_ui()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        final = QVBoxLayout(self)
+        final.setContentsMargins(10, 10, 10, 10)
+
+        root = QHBoxLayout()
+        root.setSpacing(12)
+        final.addLayout(root)
+
+        # ── Left: Connection ──────────────────────────────────────────────────
+        conn_box = QGroupBox("Connection")
+        conn_lay = QGridLayout(conn_box)
+
+        conn_lay.addWidget(QLabel("Laser Status:"), 0, 0)
+        self._status_lbl = QLabel("DISCONNECTED")
+        self._status_lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+        conn_lay.addWidget(self._status_lbl, 0, 1)
+
+        conn_lay.addWidget(QLabel("GPIB Address:"), 1, 0)
+        self._gpib_spin = NoScrollSpinBox()
+        self._gpib_spin.setRange(0, 30)
+        self._gpib_spin.setValue(load_connection_settings().get("santec_gpib_addr", 1))
+        conn_lay.addWidget(self._gpib_spin, 1, 1)
+
+        conn_lay.addWidget(QLabel("Prologix COM Port:"), 2, 0)
+        self._prologix_port_spin = NoScrollSpinBox()
+        self._prologix_port_spin.setRange(1, 99)
+        self._prologix_port_spin.setValue(load_connection_settings().get("prologix_com_port", 4))
+        self._prologix_port_spin.setToolTip(
+            "COM port of the Prologix GPIB-USB adapter itself (shared by every "
+            "GPIB instrument on the bus) — not the instrument's own GPIB address.")
+        conn_lay.addWidget(self._prologix_port_spin, 2, 1)
+
+        self._connect_btn = QPushButton("Connect to Laser")
+        self._connect_btn.clicked.connect(self._do_connect)
+        conn_lay.addWidget(self._connect_btn, 3, 0, 1, 2)
+
+        self._disconnect_btn = QPushButton("DISCONNECT")
+        self._disconnect_btn.setEnabled(False)
+        self._disconnect_btn.clicked.connect(lambda: self._sig_disconnect.emit())
+        conn_lay.addWidget(self._disconnect_btn, 4, 0, 1, 2)
+
+        conn_lay.addWidget(QLabel("Output:"), 5, 0)
+        self._output_lbl = QLabel("---")
+        self._output_lbl.setStyleSheet(f"color: {C_GRAY}; font-weight: bold;")
+        conn_lay.addWidget(self._output_lbl, 5, 1)
+
+        out_row = QHBoxLayout()
+        self._on_btn  = QPushButton("Output ON")
+        self._off_btn = QPushButton("Output OFF")
+        self._on_btn.setEnabled(False)
+        self._off_btn.setEnabled(False)
+        self._on_btn.clicked.connect(lambda: self._sig_set_output.emit(True))
+        self._off_btn.clicked.connect(lambda: self._sig_set_output.emit(False))
+        out_row.addWidget(self._on_btn)
+        out_row.addWidget(self._off_btn)
+        conn_lay.addLayout(out_row, 6, 0, 1, 2)
+
+        conn_lay.setRowStretch(7, 1)
+        root.addWidget(conn_box)
+
+        # ── Middle: Manual control ───────────────────────────────────────────
+        man_box = QGroupBox("Manual Control")
+        man_lay = QGridLayout(man_box)
+
+        man_lay.addWidget(QLabel("Current Wavelength (nm):"), 0, 0)
+        self._wl_lbl = QLabel("---")
+        self._wl_lbl.setStyleSheet(f"color: {C_BLUE}; font-family: monospace; font-size: 13px;")
+        man_lay.addWidget(self._wl_lbl, 0, 1)
+
+        man_lay.addWidget(QLabel("Current Power (mW):"), 1, 0)
+        self._pow_lbl = QLabel("---")
+        self._pow_lbl.setStyleSheet(f"color: {C_BLUE}; font-family: monospace; font-size: 13px;")
+        man_lay.addWidget(self._pow_lbl, 1, 1)
+
+        man_lay.addWidget(QLabel("Set Wavelength (nm):"), 2, 0)
+        self._wl_spin = NoScrollDoubleSpinBox()
+        self._wl_spin.setDecimals(4)
+        self._wl_spin.setRange(1400.0, 1700.0)   # narrowed to instrument range after connect
+        self._wl_spin.setValue(1550.0)
+        man_lay.addWidget(self._wl_spin, 2, 1)
+        self._wl_btn = QPushButton("SET!")
+        self._wl_btn.setEnabled(False)
+        self._wl_btn.clicked.connect(lambda: self._sig_set_wl.emit(self._wl_spin.value()))
+        man_lay.addWidget(self._wl_btn, 2, 2)
+
+        man_lay.addWidget(QLabel("Set Power (mW):"), 3, 0)
+        self._pow_spin = NoScrollDoubleSpinBox()
+        self._pow_spin.setDecimals(3)
+        self._pow_spin.setRange(0.0, 20.0)       # narrowed to instrument range after connect
+        self._pow_spin.setValue(1.0)
+        man_lay.addWidget(self._pow_spin, 3, 1)
+        self._pow_btn = QPushButton("SET!")
+        self._pow_btn.setEnabled(False)
+        self._pow_btn.clicked.connect(lambda: self._sig_set_power.emit(self._pow_spin.value()))
+        man_lay.addWidget(self._pow_btn, 3, 2)
+
+        man_lay.setRowStretch(4, 1)
+        root.addWidget(man_box)
+
+        # ── Right: Wavelength sweep ───────────────────────────────────────────
+        sweep_box = QGroupBox("Wavelength Sweep")
+        sw_lay = QGridLayout(sweep_box)
+
+        sw_lay.addWidget(QLabel("Start (nm):"), 0, 0)
+        self._sw_start = NoScrollDoubleSpinBox()
+        self._sw_start.setDecimals(4)
+        self._sw_start.setRange(1400.0, 1700.0)
+        self._sw_start.setValue(1545.0)
+        sw_lay.addWidget(self._sw_start, 0, 1)
+
+        sw_lay.addWidget(QLabel("Stop (nm):"), 1, 0)
+        self._sw_stop = NoScrollDoubleSpinBox()
+        self._sw_stop.setDecimals(4)
+        self._sw_stop.setRange(1400.0, 1700.0)
+        self._sw_stop.setValue(1555.0)
+        sw_lay.addWidget(self._sw_stop, 1, 1)
+
+        sw_lay.addWidget(QLabel("Step (nm):"), 2, 0)
+        self._sw_step = NoScrollDoubleSpinBox()
+        self._sw_step.setDecimals(4)
+        self._sw_step.setRange(0.0001, 100.0)
+        self._sw_step.setValue(0.1)
+        sw_lay.addWidget(self._sw_step, 2, 1)
+
+        sw_lay.addWidget(QLabel("Dwell (s):"), 3, 0)
+        self._sw_dwell = NoScrollDoubleSpinBox()
+        self._sw_dwell.setDecimals(2)
+        self._sw_dwell.setRange(0.0, 60.0)
+        self._sw_dwell.setValue(0.5)
+        sw_lay.addWidget(self._sw_dwell, 3, 1)
+
+        self._sw_info_lbl = QLabel("")
+        self._sw_info_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        sw_lay.addWidget(self._sw_info_lbl, 4, 0, 1, 2)
+
+        self._sw_run_btn  = QPushButton("Run Sweep")
+        self._sw_stop_btn = QPushButton("Stop")
+        self._sw_run_btn.setEnabled(False)
+        self._sw_stop_btn.setEnabled(False)
+        self._sw_run_btn.clicked.connect(self._do_sweep)
+        self._sw_stop_btn.clicked.connect(self._do_stop_sweep)
+        sw_lay.addWidget(self._sw_run_btn, 5, 0, 1, 2)
+        sw_lay.addWidget(self._sw_stop_btn, 6, 0, 1, 2)
+
+        self._sw_progress_lbl = QLabel("")
+        self._sw_progress_lbl.setStyleSheet(f"color: {C_GRAY};")
+        sw_lay.addWidget(self._sw_progress_lbl, 7, 0, 1, 2)
+
+        self._sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
+        self._sweep_log_chk.setToolTip(
+            "Records the CoreDAQ optical power meter at each sweep step")
+        sw_lay.addWidget(self._sweep_log_chk, 8, 0, 1, 2)
+        self._sweep_export_btn = QPushButton("Export CSV…")
+        self._sweep_export_btn.setEnabled(False)
+        self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
+        sw_lay.addWidget(self._sweep_export_btn, 9, 0, 1, 2)
+
+        sw_lay.setRowStretch(10, 1)
+        root.addWidget(sweep_box, stretch=1)
+
+        for sb in (self._sw_start, self._sw_stop, self._sw_step, self._sw_dwell):
+            sb.valueChanged.connect(self._update_sweep_info)
+        self._update_sweep_info()
+
+        # ── Power Sweep (Cal 2-DC: power only, wavelength stays fixed) ───────
+        pw_box = QGroupBox("Power Sweep  (wavelength stays fixed — laser must already be ON)")
+        pwg = QGridLayout(pw_box)
+
+        pwg.addWidget(QLabel("Start (mW):"), 0, 0)
+        self._pw_start = NoScrollDoubleSpinBox()
+        self._pw_start.setDecimals(3)
+        self._pw_start.setRange(0.0, 20.0)
+        self._pw_start.setValue(0.5)
+        pwg.addWidget(self._pw_start, 0, 1)
+
+        pwg.addWidget(QLabel("Stop (mW):"), 0, 2)
+        self._pw_stop = NoScrollDoubleSpinBox()
+        self._pw_stop.setDecimals(3)
+        self._pw_stop.setRange(0.0, 20.0)
+        self._pw_stop.setValue(2.0)
+        pwg.addWidget(self._pw_stop, 0, 3)
+
+        pwg.addWidget(QLabel("Step (mW):"), 1, 0)
+        self._pw_step = NoScrollDoubleSpinBox()
+        self._pw_step.setDecimals(3)
+        self._pw_step.setRange(0.001, 10.0)
+        self._pw_step.setValue(0.1)
+        pwg.addWidget(self._pw_step, 1, 1)
+
+        pwg.addWidget(QLabel("Dwell (s):"), 1, 2)
+        self._pw_dwell = NoScrollDoubleSpinBox()
+        self._pw_dwell.setDecimals(2)
+        self._pw_dwell.setRange(0.0, 60.0)
+        self._pw_dwell.setValue(0.5)
+        pwg.addWidget(self._pw_dwell, 1, 3)
+
+        self._pw_run_btn  = QPushButton("Run Power Sweep")
+        self._pw_stop_btn = QPushButton("Stop")
+        self._pw_run_btn.setEnabled(False)
+        self._pw_stop_btn.setEnabled(False)
+        self._pw_run_btn.clicked.connect(self._do_power_sweep)
+        self._pw_stop_btn.clicked.connect(self._do_stop_sweep)
+        pwg.addWidget(self._pw_run_btn, 2, 0, 1, 2)
+        pwg.addWidget(self._pw_stop_btn, 2, 2, 1, 2)
+
+        self._pw_progress_lbl = QLabel("")
+        self._pw_progress_lbl.setStyleSheet(f"color: {C_GRAY};")
+        pwg.addWidget(self._pw_progress_lbl, 3, 0, 1, 4)
+
+        self._power_sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
+        self._power_sweep_log_chk.setToolTip(
+            "Records the CoreDAQ optical power meter at each power-sweep step")
+        pwg.addWidget(self._power_sweep_log_chk, 4, 0, 1, 3)
+        self._power_sweep_export_btn = QPushButton("Export CSV…")
+        self._power_sweep_export_btn.setEnabled(False)
+        self._power_sweep_export_btn.clicked.connect(self._export_power_sweep_csv)
+        pwg.addWidget(self._power_sweep_export_btn, 4, 3)
+
+        final.addWidget(pw_box)
+
+        # ── Fast Sweep (hardware-triggered, laser drives CoreDAQ directly) ────
+        fs_box = QGroupBox("Fast Sweep (HW Triggered) \u2014 laser start-trigger \u2192 CoreDAQ free-run capture")
+        fsg = QGridLayout(fs_box)
+
+        fsg.addWidget(QLabel("Start (nm):"), 0, 0)
+        self._fs_start = NoScrollDoubleSpinBox()
+        self._fs_start.setDecimals(4)
+        self._fs_start.setRange(1400.0, 1700.0)
+        self._fs_start.setValue(1545.0)
+        fsg.addWidget(self._fs_start, 0, 1)
+
+        fsg.addWidget(QLabel("Stop (nm):"), 0, 2)
+        self._fs_stop = NoScrollDoubleSpinBox()
+        self._fs_stop.setDecimals(4)
+        self._fs_stop.setRange(1400.0, 1700.0)
+        self._fs_stop.setValue(1555.0)
+        fsg.addWidget(self._fs_stop, 0, 3)
+
+        fsg.addWidget(QLabel("Speed (nm/s):"), 1, 0)
+        self._fs_speed = NoScrollDoubleSpinBox()
+        self._fs_speed.setDecimals(2)
+        self._fs_speed.setRange(1.0, 100.0)
+        self._fs_speed.setValue(50.0)
+        fsg.addWidget(self._fs_speed, 1, 1)
+
+        fsg.addWidget(QLabel("Power (mW):"), 1, 2)
+        self._fs_power = NoScrollDoubleSpinBox()
+        self._fs_power.setDecimals(3)
+        self._fs_power.setRange(0.0, 20.0)
+        self._fs_power.setValue(1.0)
+        fsg.addWidget(self._fs_power, 1, 3)
+
+        self._fs_info_lbl = QLabel("")
+        self._fs_info_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        fsg.addWidget(self._fs_info_lbl, 2, 0, 1, 4)
+
+        self._fs_run_btn = QPushButton("Run Fast Sweep")
+        self._fs_run_btn.setEnabled(False)
+        self._fs_run_btn.clicked.connect(self._do_fast_sweep)
+        fsg.addWidget(self._fs_run_btn, 3, 0, 1, 4)
+
+        self._fs_progress_lbl = QLabel("")
+        self._fs_progress_lbl.setStyleSheet(f"color: {C_GRAY};")
+        fsg.addWidget(self._fs_progress_lbl, 4, 0, 1, 4)
+
+        self._fs_export_btn = QPushButton("Export CSV\u2026")
+        self._fs_export_btn.setEnabled(False)
+        self._fs_export_btn.clicked.connect(self._export_fast_sweep_csv)
+        fsg.addWidget(self._fs_export_btn, 5, 0, 1, 4)
+
+        for sb in (self._fs_start, self._fs_stop, self._fs_speed):
+            sb.valueChanged.connect(self._update_fast_sweep_info)
+        self._update_fast_sweep_info()
+
+        final.addWidget(fs_box)
+
+        # ── Bottom: Log ───────────────────────────────────────────────────────
+        log_box = QGroupBox("Log")
+        log_lay = QVBoxLayout(log_box)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFixedHeight(120)
+        log_lay.addWidget(self._log)
+        final.addWidget(log_box)
+
+    # ── Slot handlers ─────────────────────────────────────────────────────────
+
+    def _on_status(self, s: str):
+        self._status_lbl.setText(s)
+        colors = {
+            "DISCONNECTED": C_RED,
+            "CONNECTED":    C_BLUE,
+            "SWEEPING":     C_GOLD,
+        }
+        self._status_lbl.setStyleSheet(
+            f"color: {colors.get(s, C_GRAY)}; font-weight: bold;")
+
+        connected = s != "DISCONNECTED"
+        # Fast Sweep drives the raw laser object directly from its own thread,
+        # so it counts as "busy" for every control that would otherwise also
+        # touch that object concurrently — same lockout as a regular SWEEPING.
+        busy      = s == "SWEEPING" or self._fast_sweep_running
+        self._sw_run_btn.setEnabled(connected and not busy)
+        self._sw_stop_btn.setEnabled(s == "SWEEPING")
+        self._pw_run_btn.setEnabled(connected and not busy)
+        self._pw_stop_btn.setEnabled(s == "SWEEPING")
+        self._wl_btn.setEnabled(connected and not busy)
+        self._pow_btn.setEnabled(connected and not busy)
+        self._on_btn.setEnabled(connected and not busy)
+        self._off_btn.setEnabled(connected and not busy)
+        self._fs_run_btn.setEnabled(connected and not busy)
+
+    def _on_wavelength(self, nm: float):
+        self._wl_lbl.setText(f"{nm:.4f} nm")
+        self._last_wavelength_nm = nm
+
+    def _on_power(self, mw: float):
+        self._pow_lbl.setText(f"{mw:.3f} mW")
+        self._last_power_mw = mw
+
+    def latest_reading(self):
+        """Last (wavelength, power) reading, or None if not connected."""
+        if self._status_lbl.text() == "DISCONNECTED":
+            return None
+        return {"wavelength_nm": self._last_wavelength_nm, "power_mw": self._last_power_mw}
+
+    def set_coredaq_panel(self, panel):
+        """Wires the CoreDAQ tab in so wavelength sweeps can log optical power."""
+        self._coredaq_panel = panel
+
+    def _on_output(self, on: bool):
+        self._output_lbl.setText("ON" if on else "OFF")
+        self._output_lbl.setStyleSheet(f"color: {C_RED if on else C_GRAY}; font-weight: bold;")
+
+    def _on_range(self, min_nm: float, max_nm: float, max_mw: float):
+        for spin in (self._wl_spin, self._sw_start, self._sw_stop):
+            spin.setRange(min_nm, max_nm)
+        self._pow_spin.setRange(0.0, max_mw)
+        self._log.append(f"Wavelength range: {min_nm:.3f}–{max_nm:.3f} nm,  max power {max_mw:.3f} mW")
+
+    def _on_log(self, msg: str):
+        self._log.append(msg)
+
+    def _on_error(self, msg: str):
+        self._log.append(f"<span style='color:{C_RED};'>ERROR: {msg}</span>")
+
+    def _on_op_done(self, op: str):
+        if op == "connect":
+            self._connect_btn.setEnabled(False)
+            self._disconnect_btn.setEnabled(True)
+            self._gpib_spin.setEnabled(False)
+            self._prologix_port_spin.setEnabled(False)
+        elif op == "disconnect":
+            self._connect_btn.setEnabled(True)
+            self._disconnect_btn.setEnabled(False)
+            self._gpib_spin.setEnabled(True)
+            self._prologix_port_spin.setEnabled(True)
+        elif op == "sweep" and self._sweep_logging:
+            self._sweep_logging = False
+            if self._sweep_power_log:
+                self._sweep_export_btn.setEnabled(True)
+                self._show_sweep_power_plot()
+        elif op == "power_sweep":
+            self._power_sweep_logging = False
+            if self._power_sweep_log:
+                self._power_sweep_export_btn.setEnabled(True)
+                self._show_power_sweep_plot()
+
+    def _on_sweep_progress(self, idx: int, total: int, wl: float):
+        self._sw_progress_lbl.setText(f"[{idx}/{total}]  {wl:.4f} nm")
+        if self._sweep_logging and self._coredaq_panel is not None:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is not None:
+                self._sweep_power_log.append((wl, *powers))
+
+    def _on_power_sweep_progress(self, idx: int, total: int, mw: float):
+        self._pw_progress_lbl.setText(f"[{idx}/{total}]  {mw:.3f} mW")
+        if self._power_sweep_logging and self._coredaq_panel is not None:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is not None:
+                self._power_sweep_log.append((mw, *powers))
+
+    def _show_sweep_power_plot(self):
+        series = {}
+        for ch in range(4):
+            xs = [row[0] for row in self._sweep_power_log]
+            ys = [row[1 + ch] for row in self._sweep_power_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+        win = MultiSeriesPlotWindow("Santec Sweep — CoreDAQ Power", "Wavelength", "nm")
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._sweep_plot_win = win
+
+    def _export_sweep_power_csv(self):
+        if not self._sweep_power_log:
+            return
+        import datetime
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"santec_sweep_coredaq_{stamp}.csv")
+        comments = [
+            "laser: Santec TSL-550",
+            f"sweep: {self._sw_start.value():.4f} -> {self._sw_stop.value():.4f} nm, "
+            f"step {self._sw_step.value():.4f} nm, dwell {self._sw_dwell.value():.2f} s",
+            f"power_setpoint_mw: {self._pow_spin.value():.3f}",
+        ]
+        header = ["wavelength_nm",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = [[f"{wl:.4f}"] + [f"{w:.9e}" for w in powers]
+                for wl, *powers in self._sweep_power_log]
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[Santec Sweep] Saved {len(rows)} rows → {fname}")
+        self._log.append(f"Saved {len(rows)} sweep/power rows → {fname}")
+
+    def _show_power_sweep_plot(self):
+        series = {}
+        for ch in range(4):
+            xs = [row[0] for row in self._power_sweep_log]
+            ys = [row[1 + ch] for row in self._power_sweep_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+        win = MultiSeriesPlotWindow("Santec Power Sweep — CoreDAQ Power", "Laser power", "mW")
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._power_sweep_plot_win = win
+
+    def _export_power_sweep_csv(self):
+        if not self._power_sweep_log:
+            return
+        import datetime
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"santec_power_sweep_coredaq_{stamp}.csv")
+        comments = [
+            "laser: Santec TSL-550",
+            f"power_sweep: {self._pw_start.value():.3f} -> {self._pw_stop.value():.3f} mW, "
+            f"step {self._pw_step.value():.3f} mW, dwell {self._pw_dwell.value():.2f} s",
+            f"wavelength_nm: {self._wl_spin.value():.4f}",
+        ]
+        header = ["power_mw",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = [[f"{mw:.4f}"] + [f"{w:.9e}" for w in powers]
+                for mw, *powers in self._power_sweep_log]
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[Santec Power Sweep] Saved {len(rows)} rows → {fname}")
+        self._log.append(f"Saved {len(rows)} power-sweep rows → {fname}")
+
+    # ── Button actions ────────────────────────────────────────────────────────
+
+    def _update_sweep_info(self):
+        start = self._sw_start.value()
+        stop  = self._sw_stop.value()
+        step  = self._sw_step.value()
+        dwell = self._sw_dwell.value()
+        if step <= 0:
+            self._sw_info_lbl.setText("")
+            return
+        npts = int(abs(stop - start) / step) + 1
+        self._sw_info_lbl.setText(
+            f"{npts} points · ~{npts * dwell:.1f} s total")
+
+    def _do_connect(self):
+        save_connection_setting("santec_gpib_addr", self._gpib_spin.value())
+        save_connection_setting("prologix_com_port", self._prologix_port_spin.value())
+        self._sig_connect.emit(self._gpib_spin.value(), self._prologix_port_spin.value())
+
+    def _do_sweep(self):
+        start = self._sw_start.value()
+        stop  = self._sw_stop.value()
+        step  = self._sw_step.value()
+        dwell = self._sw_dwell.value()
+        if abs(start - stop) < 1e-9:
+            QMessageBox.warning(self, "Sweep", "Start and stop must differ.")
+            return
+        self._sw_progress_lbl.setText("")
+        self._sweep_power_log = []
+        self._sweep_export_btn.setEnabled(False)
+        self._sweep_logging = self._sweep_log_chk.isChecked()
+        self._sig_sweep.emit(start, stop, step, dwell)
+
+    def _do_power_sweep(self):
+        start = self._pw_start.value()
+        stop  = self._pw_stop.value()
+        step  = self._pw_step.value()
+        dwell = self._pw_dwell.value()
+        if abs(start - stop) < 1e-9:
+            QMessageBox.warning(self, "Power Sweep", "Start and stop must differ.")
+            return
+        self._pw_progress_lbl.setText("")
+        self._power_sweep_log = []
+        self._power_sweep_export_btn.setEnabled(False)
+        self._power_sweep_logging = self._power_sweep_log_chk.isChecked()
+        self._sig_power_sweep.emit(start, stop, step, dwell)
+
+    def _do_stop_sweep(self):
+        # Set the worker's threading.Event directly from this (GUI) thread — a
+        # queued _sig_stop_sweep signal would just sit behind the sweep loop's
+        # own blocking call on the worker thread and never get delivered in time.
+        self._worker._stop_event.set()
+        self._sig_stop_sweep.emit()
+
+    def _update_fast_sweep_info(self):
+        start = self._fs_start.value()
+        stop  = self._fs_stop.value()
+        speed = self._fs_speed.value()
+        if speed <= 0:
+            self._fs_info_lbl.setText("")
+            return
+        duration_s = abs(stop - start) / speed
+        npts = int(round(duration_s * FastSweepWorker.SWEEP_RATE_HZ))
+        self._fs_info_lbl.setText(f"~{npts} pts \u00b7 ~{duration_s:.1f} s")
+
+    def _set_fast_sweep_controls_enabled(self, enabled: bool):
+        # The fast sweep drives the raw laser/DAQ objects directly from its own
+        # thread \u2014 anything else that could also touch them concurrently
+        # (manual wavelength/power/output, the regular sweeps) must be locked
+        # out for the duration, same as SWEEPING already locks them out for
+        # do_sweep()/do_power_sweep().
+        for w in (self._fs_run_btn, self._sw_run_btn, self._pw_run_btn,
+                  self._wl_btn, self._pow_btn, self._on_btn, self._off_btn,
+                  self._disconnect_btn):
+            w.setEnabled(enabled)
+
+    def _do_fast_sweep(self):
+        start = self._fs_start.value()
+        stop  = self._fs_stop.value()
+        speed = self._fs_speed.value()
+        power = self._fs_power.value()
+        if abs(start - stop) < 1e-9:
+            QMessageBox.warning(self, "Fast Sweep", "Start and stop must differ.")
+            return
+        if self._coredaq_panel is None or not self._coredaq_panel._connected:
+            QMessageBox.warning(self, "Fast Sweep", "CoreDAQ must be connected first.")
+            return
+
+        # Pause CoreDAQ's own ~5 Hz poll loop \u2014 it shares the same serial
+        # connection the sweep worker is about to drive directly.
+        self._coredaq_panel.pause_polling()
+
+        self._fast_sweep_result  = None
+        self._fast_sweep_running = True
+        self._fs_export_btn.setEnabled(False)
+        self._fs_progress_lbl.setText("Starting...")
+        self._set_fast_sweep_controls_enabled(False)
+
+        self._fast_sweep_worker.set_hardware(self._worker._laser, self._coredaq_panel._worker._daq)
+        self._fast_sweep_worker.set_sweep_params({
+            "start_nm": start, "stop_nm": stop, "speed": speed, "power": power,
+        })
+        self._sig_run_fast_sweep.emit()
+
+    def _on_fast_sweep_progress(self, msg: str):
+        self._fs_progress_lbl.setText(msg)
+
+    def _on_fast_sweep_result(self, result: dict):
+        self._fast_sweep_result = (result["wavelengths"], result["power_ch"])
+        self._log.append(f"Fast sweep captured {len(result['wavelengths'])} points")
+        self._fs_export_btn.setEnabled(True)
+        self._show_fast_sweep_plot()
+
+    def _on_fast_sweep_error(self, msg: str):
+        self._log.append(f"<span style='color:{C_RED};'>Fast sweep ERROR: {msg}</span>")
+        QMessageBox.warning(self, "Fast Sweep Error", f"Fast sweep failed:\n{msg}")
+
+    def _on_fast_sweep_finished(self):
+        self._fast_sweep_running = False
+        connected = self._status_lbl.text() != "DISCONNECTED"
+        self._set_fast_sweep_controls_enabled(connected)
+        if self._coredaq_panel is not None:
+            self._coredaq_panel.resume_polling()
+
+    def _show_fast_sweep_plot(self):
+        if not self._fast_sweep_result:
+            return
+        wavelengths, power_ch = self._fast_sweep_result
+        series = {}
+        for ch in range(min(4, len(power_ch))):
+            series[f"CoreDAQ Head {ch + 1}"] = (wavelengths, power_ch[ch], "W")
+        win = MultiSeriesPlotWindow("Santec Fast Sweep \u2014 CoreDAQ Power", "Wavelength", "nm")
+        win.show_data(series)
+        mw = self.window()
+        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
+        self._fast_sweep_plot_win = win
+
+    def _export_fast_sweep_csv(self):
+        if not self._fast_sweep_result:
+            return
+        import datetime
+        wavelengths, power_ch = self._fast_sweep_result
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"santec_fast_sweep_coredaq_{stamp}.csv")
+        comments = [
+            "laser: Santec TSL-550 (HW-triggered continuous sweep)",
+            f"sweep: {self._fs_start.value():.4f} -> {self._fs_stop.value():.4f} nm, "
+            f"speed {self._fs_speed.value():.2f} nm/s, power {self._fs_power.value():.3f} mW",
+        ]
+        header = ["wavelength_nm",
+                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
+        rows = []
+        for i, wl in enumerate(wavelengths):
+            rows.append([f"{wl:.4f}"] + [f"{power_ch[ch][i]:.9e}" for ch in range(4)])
+        write_csv_with_metadata(fname, comments, header, rows)
+        print(f"[Santec Fast Sweep] Saved {len(rows)} rows \u2192 {fname}")
+        self._log.append(f"Saved {len(rows)} fast-sweep rows \u2192 {fname}")
+
+    def cleanup(self):
+        if HAS_PYVISA and HAS_SANTEC:
+            self._sig_disconnect.emit()
+            self._thread.quit()
+            self._thread.wait(2000)
+            self._fast_sweep_thread.quit()
+            self._fast_sweep_thread.wait(2000)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COREDAQ OPTICAL POWER METER PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_power_w(p_w: float) -> str:
+    """Auto-scale a watts value to a readable string (mW/µW/nW/pW)."""
+    a = abs(p_w)
+    if a >= 1e-3:
+        return f"{p_w * 1e3:.4f} mW"
+    if a >= 1e-6:
+        return f"{p_w * 1e6:.4f} µW"
+    if a >= 1e-9:
+        return f"{p_w * 1e9:.4f} nW"
+    return f"{p_w * 1e12:.4f} pW"
+
+
+def write_csv_with_metadata(path: str, comments: list, header: list, rows: list):
+    """
+    Writes '# comment' lines followed by a normal CSV body — mirrors the
+    metadata-header convention used by the reference CoreConsole sweep tab.
+    """
+    import csv
+    with open(path, "w", newline="") as f:
+        for c in comments:
+            f.write(f"# {c}\n")
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+
+class MultiSeriesPlotWindow(QWidget):
+    """
+    Generic 2-column grid of pyqtgraph plots, one per named series — mirrors
+    the reference CoreConsole app's plotter/sweep tab layout. Sparse-tolerant:
+    each series supplies its own (x, y) arrays, so devices that weren't
+    connected the whole time just produce a shorter curve.
+    """
+
+    _COLORS = (C_BLUE, C_GOLD, C_GREEN, C_RED, "#B388FF", "#00FF88", "#FFA836", "#4FC3F7")
+
+    def __init__(self, title: str, x_label: str, x_unit: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(820, 640)
+        self._x_label = x_label
+        self._x_unit  = x_unit
+        self._grid = QGridLayout(self)
+        self._plots = {}   # name -> (PlotWidget, curve)
+
+    def show_data(self, series_data: dict):
+        """series_data: {name: (xs, ys, y_unit)}"""
+        if not HAS_PYQTGRAPH:
+            self._grid.addWidget(QLabel("pyqtgraph required for plots"), 0, 0)
+            return
+        for i, (name, (xs, ys, y_unit)) in enumerate(series_data.items()):
+            if name not in self._plots:
+                pw = pg.PlotWidget()
+                pw.setLabel('bottom', self._x_label, units=self._x_unit)
+                pw.setLabel('left', name, units=y_unit)
+                pw.getAxis('left').enableAutoSIPrefix(False)
+                pw.setMinimumHeight(220)
+                color = self._COLORS[len(self._plots) % len(self._COLORS)]
+                curve = pw.plot([], [], pen=pg.mkPen(color, width=2), symbol='o', symbolSize=4)
+                row, col = divmod(len(self._plots), 2)
+                self._grid.addWidget(pw, row, col)
+                self._plots[name] = (pw, curve)
+            _, curve = self._plots[name]
+            curve.setData(xs, ys)
+        self.show()
+        self.raise_()
+
+
+class CoreDAQWorker(QObject):
+    """
+    Runs blocking serial calls to the CoreDAQ optical power meter off the GUI
+    thread. All I/O still goes through this one worker thread via queued
+    slots (do_connect/do_poll/do_set_gain/do_set_wavelength/do_disconnect),
+    preserving strict single-owner access to the serial connection.
+
+    The plot data path is restructured to match the lab's
+    threads/daq_reader_coredaq.py DaqReaderWorker for speed: each do_poll()
+    tick is one snapshot_W() round trip (not two), decimated writes into a
+    pre-allocated numpy ring buffer (O(1) circular write, no Python-list
+    .pop(0) reshuffling), and a zero-allocation chronological read via
+    get_display_data() for the GUI's independent ~30 Hz redraw timer. The
+    numeric mV/gain labels and latest_power_w() are refreshed on a much
+    slower wall-clock throttle (LABEL_HZ) since they don't need per-sample
+    freshness.
+    """
+    status_changed = pyqtSignal(str)             # DISCONNECTED / CONNECTED
+    info_update     = pyqtSignal(str, str, str)   # idn, frontend_type, detector_type
+    raw_update      = pyqtSignal(list, list, list)  # power_w(4), mV(4), gains(4) — throttled
+    log_message     = pyqtSignal(str)
+    error           = pyqtSignal(str)
+    op_done         = pyqtSignal(str)
+
+    LABEL_HZ = 10.0   # wall-clock throttle for numeric-label refresh + extra snapshot_mV() call
+
+    def __init__(self):
+        super().__init__()
+        self._daq = None
+        self._last_power_w = None
+
+        # ── Plot ring buffer: pre-allocated, fixed-size, circular ───────────
+        # Sized generously for COREDAQ_PLOT_WINDOW_S at up to ~1 kHz — actual
+        # achieved poll rate (capped by serial round-trip time) just fills a
+        # smaller fraction of the window, which is fine.
+        self.plot_buffer_len  = max(2, int(COREDAQ_PLOT_WINDOW_S * 1000))
+        self.plot_buffer      = np.zeros((4, self.plot_buffer_len), dtype=np.float32)
+        self.plot_write_index = 0
+        self.plot_filled      = 0
+        self._display_buf     = np.zeros((4, self.plot_buffer_len), dtype=np.float32)
+
+        self._last_label_emit_t = 0.0
+        self._err_count = 0
+
+    def do_connect(self, port: str):
+        # Defensive: release any handle we're still holding from a prior
+        # attempt before opening a new one, so we're never the reason a
+        # retry fails with "port already open".
+        if self._daq is not None:
+            try:
+                self._daq.close()
+            except Exception:
+                pass
+            self._daq = None
+        try:
+            port = port.strip()
+            # Accept bare numbers ("16") as shorthand for the Windows device
+            # name pyserial actually needs ("COM16") — same convention the
+            # vendor's own CoreConsole-style tooling expects.
+            if port.isdigit():
+                port = f"COM{port}"
+            if port:
+                daq = CoreDAQ(port)
+            else:
+                ports = CoreDAQ.find()
+                if not ports:
+                    self.error.emit("No CoreDAQ device found — check USB connection")
+                    return
+                self.log_message.emit(f"Auto-detected CoreDAQ on {ports[0]}")
+                daq = CoreDAQ(ports[0])
+            self._daq = daq
+            idn       = self._daq.idn()
+            frontend  = self._daq.frontend_type()
+            detector  = self._daq.detector_type()
+            # Fresh connection: drop any stale samples from a previous device
+            # so the plot window doesn't briefly show old data.
+            self.plot_write_index   = 0
+            self.plot_filled        = 0
+            self._last_label_emit_t = 0.0
+            self._err_count         = 0
+            self.status_changed.emit("CONNECTED")
+            self.info_update.emit(idn, frontend, detector)
+            self.log_message.emit(f"Connected — {idn}")
+            self.op_done.emit("connect")
+        except PermissionError as e:
+            self.error.emit(
+                f"Connect failed: {e} — port is already open elsewhere "
+                "(another program such as CoreConsole, a leftover instance "
+                "of this GUI, or a previous unclosed connection). Close "
+                "whatever else has it open, or leave the Port field blank "
+                "to auto-detect — the right device, even if it's enumerated "
+                "on a different COM port.")
+        except Exception as e:
+            self.error.emit(f"Connect failed: {e}")
+
+    def do_poll(self):
+        if self._daq is None:
+            return
+        try:
+            power_w = self._daq.snapshot_W()
+            data = np.asarray(power_w[:4], dtype=np.float32)
+            self._last_power_w = tuple(float(x) for x in power_w[:4])
+
+            self.plot_buffer[:, self.plot_write_index] = data
+            self.plot_write_index = (self.plot_write_index + 1) % self.plot_buffer_len
+            if self.plot_filled < self.plot_buffer_len:
+                self.plot_filled += 1
+
+            now = time.monotonic()
+            if (now - self._last_label_emit_t) >= (1.0 / self.LABEL_HZ):
+                self._last_label_emit_t = now
+                mv, gains = self._daq.snapshot_mV()
+                self.raw_update.emit(list(power_w[:4]), list(mv[:4]), list(gains[:4]))
+        except Exception as e:
+            self._err_count += 1
+            if self._err_count % 200 == 1:
+                self.error.emit(f"Poll error (×{self._err_count}): {e}")
+
+    def get_display_data(self):
+        """
+        Returns (data, count): the plot ring buffer stitched chronologically
+        (oldest first) into a pre-allocated scratch buffer — no allocation on
+        this hot path, called directly (not via a queued signal) by the GUI's
+        independent display-refresh timer.
+        """
+        count = self.plot_filled
+        if count == 0:
+            return self._display_buf, 0
+
+        N    = self.plot_buffer_len
+        widx = self.plot_write_index
+
+        if count >= N:
+            if widx == 0:
+                np.copyto(self._display_buf, self.plot_buffer)
+            else:
+                self._display_buf[:, :N - widx] = self.plot_buffer[:, widx:]
+                self._display_buf[:, N - widx:] = self.plot_buffer[:, :widx]
+        else:
+            np.copyto(self._display_buf[:, :count], self.plot_buffer[:, :count])
+
+        return self._display_buf, count
+
+    def do_set_gain(self, head: int, value: int):
+        try:
+            self._daq.set_gain(head, value)
+            self.log_message.emit(f"Head {head} gain set to G{value}")
+            self.op_done.emit("set_gain")
+        except Exception as e:
+            self.error.emit(f"Set gain error: {e}")
+
+    def do_set_wavelength(self, nm: float):
+        try:
+            self._daq.set_wavelength_nm(nm)
+            self.log_message.emit(f"Measurement wavelength set to {nm:.2f} nm")
+            self.op_done.emit("set_wavelength")
+        except Exception as e:
+            self.error.emit(f"Set wavelength error: {e}")
+
+    def do_disconnect(self):
+        try:
+            if self._daq is not None:
+                self._daq.close()
+                self._daq = None
+            self.status_changed.emit("DISCONNECTED")
+            self.log_message.emit("Disconnected from CoreDAQ")
+            self.op_done.emit("disconnect")
+        except Exception as e:
+            self.error.emit(f"Disconnect error: {e}")
+
+
+class CoreDAQPanel(QWidget):
+    """
+    CoreDAQ 4-channel USB optical power meter — wraps hardware/coredaq.py.
+    All blocking serial calls run in CoreDAQWorker on a background QThread.
+    """
+
+    _sig_connect       = pyqtSignal(str)
+    _sig_poll          = pyqtSignal()
+    _sig_set_gain      = pyqtSignal(int, int)
+    _sig_set_wl        = pyqtSignal(float)
+    _sig_disconnect    = pyqtSignal()
+
+    POLL_MS    = 2    # request poll ticks as fast as Qt/serial will sustain
+    DISPLAY_MS = 33   # ~30 Hz plot redraw, decoupled from the poll/acquire rate
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._connected     = False
+        self._frontend_type = None
+        self._live_t_axis   = None   # cached, built once per plot-buffer size
+
+        if not HAS_SERIAL or not HAS_COREDAQ:
+            lay = QVBoxLayout(self)
+            msg = []
+            if not HAS_SERIAL:
+                msg.append("pyserial is not installed. Run: uv pip install pyserial")
+            if not HAS_COREDAQ:
+                msg.append("hardware.coredaq module not found —\n"
+                            "place hardware/coredaq.py next to this script to enable this tab.")
+            lay.addWidget(QLabel("\n".join(msg) + "\nthen restart the GUI."))
+            return
+
+        # ── Worker thread ─────────────────────────────────────────────────────
+        self._worker = CoreDAQWorker()
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.start()
+
+        self._sig_connect.connect(self._worker.do_connect)
+        self._sig_poll.connect(self._worker.do_poll)
+        self._sig_set_gain.connect(self._worker.do_set_gain)
+        self._sig_set_wl.connect(self._worker.do_set_wavelength)
+        self._sig_disconnect.connect(self._worker.do_disconnect)
+
+        self._worker.status_changed.connect(self._on_status)
+        self._worker.info_update.connect(self._on_info)
+        self._worker.raw_update.connect(self._on_raw)
+        self._worker.log_message.connect(self._on_log)
+        self._worker.error.connect(self._on_error)
+        self._worker.op_done.connect(self._on_op_done)
+
+        self._poll_timer = QTimer()
+        self._poll_timer.setInterval(self.POLL_MS)
+        self._poll_timer.timeout.connect(lambda: self._sig_poll.emit())
+
+        # Independent redraw timer — reads the worker's ring buffer directly
+        # (get_display_data() is a plain, allocation-free method call, not a
+        # queued signal) so plot refresh rate never depends on how fast the
+        # serial link can actually sustain do_poll() ticks.
+        self._display_timer = QTimer()
+        self._display_timer.setInterval(self.DISPLAY_MS)
+        self._display_timer.timeout.connect(self._update_live_plot)
+        self._display_timer.start()
+
+        self._build_ui()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        final = QVBoxLayout(self)
+        final.setContentsMargins(10, 10, 10, 10)
+
+        root = QHBoxLayout()
+        root.setSpacing(12)
+        final.addLayout(root)
+
+        # ── Left: Connection ──────────────────────────────────────────────────
+        conn_box = QGroupBox("Connection")
+        conn_lay = QGridLayout(conn_box)
+
+        conn_lay.addWidget(QLabel("Status:"), 0, 0)
+        self._status_lbl = QLabel("DISCONNECTED")
+        self._status_lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+        conn_lay.addWidget(self._status_lbl, 0, 1)
+
+        conn_lay.addWidget(QLabel("Port:"), 1, 0)
+        self._port_edit = QLineEdit(load_connection_settings().get("coredaq_port", ""))
+        self._port_edit.setPlaceholderText("blank = auto-detect, or COM16 / 16")
+        conn_lay.addWidget(self._port_edit, 1, 1)
+
+        self._connect_btn = QPushButton("Connect")
+        self._connect_btn.clicked.connect(self._do_connect)
+        conn_lay.addWidget(self._connect_btn, 2, 0, 1, 2)
+
+        self._disconnect_btn = QPushButton("DISCONNECT")
+        self._disconnect_btn.setEnabled(False)
+        self._disconnect_btn.clicked.connect(lambda: self._sig_disconnect.emit())
+        conn_lay.addWidget(self._disconnect_btn, 3, 0, 1, 2)
+
+        conn_lay.addWidget(QLabel("IDN:"), 4, 0)
+        self._idn_lbl = QLabel("—")
+        self._idn_lbl.setWordWrap(True)
+        conn_lay.addWidget(self._idn_lbl, 4, 1)
+
+        conn_lay.addWidget(QLabel("Frontend:"), 5, 0)
+        self._frontend_lbl = QLabel("—")
+        conn_lay.addWidget(self._frontend_lbl, 5, 1)
+
+        conn_lay.addWidget(QLabel("Detector:"), 6, 0)
+        self._detector_lbl = QLabel("—")
+        conn_lay.addWidget(self._detector_lbl, 6, 1)
+
+        conn_lay.setRowStretch(7, 1)
+        root.addWidget(conn_box)
+
+        # ── Middle: Measurement config ───────────────────────────────────────
+        cfg_box = QGroupBox("Measurement Config")
+        cfg_lay = QGridLayout(cfg_box)
+
+        cfg_lay.addWidget(QLabel("Wavelength (nm):"), 0, 0)
+        self._wl_spin = NoScrollDoubleSpinBox()
+        self._wl_spin.setDecimals(1)
+        self._wl_spin.setRange(400.0, 1700.0)
+        self._wl_spin.setValue(1550.0)
+        cfg_lay.addWidget(self._wl_spin, 0, 1)
+        self._wl_btn = QPushButton("SET!")
+        self._wl_btn.setEnabled(False)
+        self._wl_btn.clicked.connect(lambda: self._sig_set_wl.emit(self._wl_spin.value()))
+        cfg_lay.addWidget(self._wl_btn, 0, 2)
+        cfg_lay.addWidget(QLabel(
+            "Keeps the InGaAs/Si responsivity correction in sync\n"
+            "with the wavelength actually being measured."), 1, 0, 1, 3)
+
+        cfg_lay.addWidget(QLabel("Gain (LINEAR heads only):"), 2, 0, 1, 3)
+        self._gain_combos = []
+        self._gain_btns    = []
+        for h in range(1, 5):
+            cfg_lay.addWidget(QLabel(f"Head {h}:"), 2 + h, 0)
+            combo = QComboBox()
+            for g, label in enumerate(CoreDAQ.GAIN_LABELS):
+                combo.addItem(f"G{g} ({label})", g)
+            combo.setEnabled(False)
+            cfg_lay.addWidget(combo, 2 + h, 1)
+            btn = QPushButton("Set")
+            btn.setEnabled(False)
+            btn.clicked.connect(lambda _, hh=h: self._sig_set_gain.emit(
+                hh, self._gain_combos[hh - 1].currentData()))
+            cfg_lay.addWidget(btn, 2 + h, 2)
+            self._gain_combos.append(combo)
+            self._gain_btns.append(btn)
+
+        cfg_lay.setRowStretch(7, 1)
+        root.addWidget(cfg_box)
+
+        # ── Right: Channel readouts ──────────────────────────────────────────
+        ch_box = QGroupBox("Channels")
+        ch_lay = QGridLayout(ch_box)
+        self._power_lbls = []
+        self._raw_lbls   = []
+        for ch in range(4):
+            ch_lay.addWidget(QLabel(f"Head {ch + 1}:"), ch, 0)
+            p_lbl = QLabel("—")
+            p_lbl.setStyleSheet(f"color: {C_BLUE}; font-family: monospace; font-size: 13px;")
+            p_lbl.setMinimumWidth(110)
+            ch_lay.addWidget(p_lbl, ch, 1)
+            raw_lbl = QLabel("—")
+            raw_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+            ch_lay.addWidget(raw_lbl, ch, 2)
+            self._power_lbls.append(p_lbl)
+            self._raw_lbls.append(raw_lbl)
+        ch_lay.setRowStretch(4, 1)
+        root.addWidget(ch_box, stretch=1)
+
+        # ── Live plot — rolling per-channel power vs time ────────────────────
+        plot_box = QGroupBox(f"Live Plot  (last {COREDAQ_PLOT_WINDOW_S:.0f} s)")
+        plot_grid = QGridLayout(plot_box)
+        self._live_plots = []
+        if HAS_PYQTGRAPH:
+            colors = (C_BLUE, C_GOLD, C_GREEN, C_RED)
+            for ch in range(4):
+                pw = pg.PlotWidget()
+                pw.setLabel('left', f'Head {ch + 1}', units='W')
+                pw.setLabel('bottom', 'Time', units='s')
+                pw.getAxis('left').enableAutoSIPrefix(False)
+                pw.setMinimumHeight(160)
+                # Render-side speedups: downsample large point counts to the
+                # visible pixel width, clip off-screen data, and skip the
+                # per-point NaN/Inf check (our ring-buffer data is always
+                # finite) — mirrors the lab's assembled_gui.py live-plot setup.
+                pw.plotItem.setDownsampling(auto=True, mode='peak')
+                pw.plotItem.setClipToView(True)
+                pw.setXRange(-COREDAQ_PLOT_WINDOW_S, 0.0, padding=0)
+                curve = pw.plot([], [], pen=pg.mkPen(colors[ch], width=2), skipFiniteCheck=True)
+                row, col = divmod(ch, 2)
+                plot_grid.addWidget(pw, row, col)
+                self._live_plots.append((pw, curve))
+        else:
+            plot_grid.addWidget(QLabel("pyqtgraph required for live plots"), 0, 0)
+        final.addWidget(plot_box)
+
+        # ── Bottom: Log ───────────────────────────────────────────────────────
+        log_box = QGroupBox("Log")
+        log_lay = QVBoxLayout(log_box)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFixedHeight(100)
+        log_lay.addWidget(self._log)
+        final.addWidget(log_box)
+
+    # ── Slot handlers ─────────────────────────────────────────────────────────
+
+    def _on_status(self, s: str):
+        self._connected = s == "CONNECTED"
+        self._status_lbl.setText(s)
+        self._status_lbl.setStyleSheet(
+            f"color: {C_BLUE if self._connected else C_RED}; font-weight: bold;")
+        self._wl_btn.setEnabled(self._connected)
+        if self._connected:
+            self._live_t_axis = None   # rebuilt on next redraw, in case buffer size changed
+            if HAS_PYQTGRAPH:
+                for _, curve in self._live_plots:
+                    curve.setData([], [])
+            self._poll_timer.start()
+        else:
+            self._poll_timer.stop()
+            for lbl in self._power_lbls: lbl.setText("—")
+            for lbl in self._raw_lbls:   lbl.setText("—")
+            for combo, btn in zip(self._gain_combos, self._gain_btns):
+                combo.setEnabled(False); btn.setEnabled(False)
+
+    def _on_info(self, idn: str, frontend: str, detector: str):
+        self._idn_lbl.setText(idn)
+        self._frontend_lbl.setText(frontend)
+        self._detector_lbl.setText(detector)
+        self._frontend_type = frontend
+        is_linear = frontend == CoreDAQ.FRONTEND_LINEAR
+        for combo, btn in zip(self._gain_combos, self._gain_btns):
+            combo.setEnabled(is_linear); btn.setEnabled(is_linear)
+
+    def _on_raw(self, power_w: list, mv: list, gains: list):
+        """Throttled (~CoreDAQWorker.LABEL_HZ) numeric-label refresh — the fast
+        per-sample data goes straight into the worker's ring buffer instead
+        and is picked up by _update_live_plot() on its own timer."""
+        for i, v in enumerate(power_w[:4]):
+            self._power_lbls[i].setText(_fmt_power_w(v))
+        for i in range(min(4, len(mv))):
+            g = gains[i] if i < len(gains) else 0
+            self._raw_lbls[i].setText(f"{mv[i]:.2f} mV  (G{g})")
+
+    def _update_live_plot(self):
+        """Called by the independent ~30 Hz display timer — pulls whatever the
+        worker's ring buffer currently holds. Decoupled from the acquisition
+        rate: a slow serial link just means fewer new points per redraw, not
+        a slower UI."""
+        if not HAS_PYQTGRAPH or not self._connected:
+            return
+        data, count = self._worker.get_display_data()
+        if count <= 0:
+            return
+        if self._live_t_axis is None or len(self._live_t_axis) != data.shape[1]:
+            N = data.shape[1]
+            self._live_t_axis = np.linspace(-COREDAQ_PLOT_WINDOW_S, 0.0, N)
+        t = self._live_t_axis
+        N = len(t)
+        for ch, (pw, curve) in enumerate(self._live_plots):
+            y = data[ch]
+            if count >= N:
+                curve.setData(t, y, connect='all')
+            else:
+                curve.setData(t[-count:], y[:count], connect='all')
+
+    def _on_log(self, msg: str):
+        self._log.append(msg)
+
+    def _on_error(self, msg: str):
+        self._log.append(f"<span style='color:{C_RED};'>ERROR: {msg}</span>")
+
+    def _on_op_done(self, op: str):
+        if op == "connect":
+            self._connect_btn.setEnabled(False)
+            self._disconnect_btn.setEnabled(True)
+            self._port_edit.setEnabled(False)
+        elif op == "disconnect":
+            self._connect_btn.setEnabled(True)
+            self._disconnect_btn.setEnabled(False)
+            self._port_edit.setEnabled(True)
+
+    # ── Button actions ────────────────────────────────────────────────────────
+
+    def _do_connect(self):
+        port = self._port_edit.text().strip()
+        save_connection_setting("coredaq_port", port)
+        self._sig_connect.emit(port)
+
+    # ── Public API (used by DAQPanel sweep↔power logging) ──────────────────
+
+    def latest_power_w(self):
+        """Last cached (head1..head4) watts snapshot, or None if not connected."""
+        return self._worker._last_power_w if self._connected else None
+
+    def pause_polling(self):
+        """Stops the live poll loop — must not run concurrently with a Fast
+        Sweep's direct hardware access, since they share one serial
+        connection. The short sleep lets an already-in-flight do_poll() (its
+        queued signal may have fired just before .stop() took effect) finish
+        before we hand the connection off."""
+        self._poll_timer.stop()
+        time.sleep(0.05)
+
+    def resume_polling(self):
+        if self._connected:
+            self._poll_timer.start()
+
+    def cleanup(self):
+        if HAS_SERIAL and HAS_COREDAQ:
+            self._poll_timer.stop()
             self._sig_disconnect.emit()
             self._thread.quit()
             self._thread.wait(2000)
@@ -3674,6 +6544,11 @@ class DetachedWindow(QMainWindow):
         lay.addWidget(btn)
         lay.addWidget(panel)
 
+        # QTabWidget.removeTab() hides the page it removes (it's leaving the
+        # internal QStackedWidget); that explicit-hidden state survives the
+        # reparent into this window's layout, so the panel must be shown again.
+        panel.setVisible(True)
+
         self.setCentralWidget(container)
         self._size_and_center()
 
@@ -3701,25 +6576,186 @@ class UnifiedMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("YPL Lab Control")
 
-        self.daq_panel   = DAQPanel()
-        self.itla_panel  = ITLAPanel()
-        self.conex_panel = ConexPanel()
+        self.daq_panel     = DAQPanel()
+        self.itla_panel    = ITLAPanel()
+        self.conex_panel   = ConexPanel()
+        self.hp8168f_panel = HP8168FPanel()
+        self.santec_panel  = SantecPanel()
+        self.coredaq_panel = CoreDAQPanel()
+        self.daq_panel.pin_view.set_coredaq_panel(self.coredaq_panel)
+        self.itla_panel.set_coredaq_panel(self.coredaq_panel)
+        self.hp8168f_panel.set_coredaq_panel(self.coredaq_panel)
+        self.santec_panel.set_coredaq_panel(self.coredaq_panel)
 
         self._detached: dict[str, DetachedWindow] = {}
 
         self.tabs = QTabWidget()
         self.tabs.setCornerWidget(self._make_popout_btn(), Qt.Corner.TopRightCorner)
-        self.setCentralWidget(self.tabs)
+        self.tabs.setCornerWidget(self._make_popout_all_btn(), Qt.Corner.TopLeftCorner)
 
-        self.tabs.addTab(self.daq_panel,   "DAQ Control")
-        self.tabs.addTab(self.itla_panel,  "ITLA Laser")
-        self.tabs.addTab(self.conex_panel, "CONEX Motor")
+        self.tabs.addTab(self.daq_panel,     "DAQ Control")
+        self.tabs.addTab(self.coredaq_panel, "CoreDAQ Power Meter")
+        self.tabs.addTab(self.santec_panel,  "Santec Laser")
+        self.tabs.addTab(self.conex_panel,   "CONEX Motor")
+        self.tabs.addTab(self.itla_panel,    "ITLA Laser")
+        self.tabs.addTab(self.hp8168f_panel, "HP-8168F Laser")
+
+        # Recording bar sits above the tabs so it's visible no matter which
+        # tab is active — recording spans every connected device, not just
+        # the one currently in view.
+        central = QWidget()
+        central_lay = QVBoxLayout(central)
+        central_lay.setContentsMargins(0, 0, 0, 0)
+        central_lay.setSpacing(0)
+        central_lay.addWidget(self._build_recorder_bar())
+        central_lay.addWidget(self.tabs)
+        self.setCentralWidget(central)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
 
+        self._recording    = False
+        self._rec_t0       = 0.0
+        self._rec_records  = []
+        self._rec_plot_win = None
+        self._rec_timer = QTimer()
+        self._rec_timer.setInterval(GLOBAL_REC_TICK_MS)
+        self._rec_timer.timeout.connect(self._global_record_tick)
+
         self._size_and_center()
+
+    # ── Global combined recorder ────────────────────────────────────────────────
+
+    def _build_recorder_bar(self):
+        bar = QWidget()
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lbl = QLabel("Global Recording (all connected devices):")
+        lbl.setStyleSheet(f"color: {C_GRAY};")
+        self._rec_btn = QPushButton("⏺  Start Recording")
+        self._rec_btn.clicked.connect(self._toggle_global_recording)
+        self._rec_status_lbl = QLabel("Idle")
+        self._rec_status_lbl.setStyleSheet(f"color: {C_GRAY};")
+        self._rec_save_btn = QPushButton("💾  Save Combined CSV…")
+        self._rec_save_btn.setEnabled(False)
+        self._rec_save_btn.clicked.connect(self._save_global_csv)
+        lay.addWidget(lbl)
+        lay.addWidget(self._rec_btn)
+        lay.addSpacing(10)
+        lay.addWidget(self._rec_status_lbl)
+        lay.addStretch()
+        lay.addWidget(self._rec_save_btn)
+        return bar
+
+    def _toggle_global_recording(self):
+        if not self._recording:
+            self._start_global_recording()
+        else:
+            self._stop_global_recording()
+
+    def _start_global_recording(self):
+        self._recording   = True
+        self._rec_records = []
+        self._rec_t0      = time.time()
+        self._rec_btn.setText("⏹  Stop Recording")
+        self._rec_btn.setStyleSheet(f"color: {C_RED};")
+        self._rec_status_lbl.setText("● Recording — 0 samples")
+        self._rec_status_lbl.setStyleSheet(f"color: {C_RED};")
+        self._rec_save_btn.setEnabled(False)
+        if self._rec_plot_win:
+            self._rec_plot_win.close()
+            self._rec_plot_win = None
+        self._rec_timer.start()
+
+    def _stop_global_recording(self):
+        self._recording = False
+        self._rec_timer.stop()
+        self._rec_btn.setText("⏺  Start Recording")
+        self._rec_btn.setStyleSheet("")
+        n = len(self._rec_records)
+        self._rec_status_lbl.setStyleSheet(f"color: {C_GRAY};")
+        if n == 0:
+            self._rec_status_lbl.setText("Idle — no data recorded (nothing was connected)")
+            return
+        self._rec_status_lbl.setText(f"Idle — {n} samples recorded")
+        self._rec_save_btn.setEnabled(True)
+        self._show_global_plot()
+
+    def _global_record_tick(self):
+        t = time.time() - self._rec_t0
+        row = {"t": t}
+
+        ao = self.daq_panel.pin_view.latest_ao_snapshot()
+        if ao:
+            label, unit, values = ao
+            for i, v in enumerate(values):
+                row[f"AO_{label}_pin{i:02d}_{unit}"] = v
+
+        powers = self.coredaq_panel.latest_power_w()
+        if powers:
+            for i, p in enumerate(powers):
+                row[f"CoreDAQ_head{i+1}_W"] = p
+
+        itla = self.itla_panel.latest_reading()
+        if itla:
+            row["ITLA_wavelength_nm"] = itla["nm"]
+            row["ITLA_power_mW"]     = itla["power_mw"]
+
+        hp = self.hp8168f_panel.latest_reading()
+        if hp and hp["wavelength_nm"] is not None:
+            row["HP8168F_wavelength_nm"] = hp["wavelength_nm"]
+            row["HP8168F_power_mW"]     = hp["power_mw"]
+
+        santec = self.santec_panel.latest_reading()
+        if santec and santec["wavelength_nm"] is not None:
+            row["Santec_wavelength_nm"] = santec["wavelength_nm"]
+            row["Santec_power_mW"]     = santec["power_mw"]
+
+        self._rec_records.append(row)
+        self._rec_status_lbl.setText(f"● Recording — {len(self._rec_records)} samples")
+
+    def _series_keys(self):
+        keys = set()
+        for row in self._rec_records:
+            keys.update(k for k in row.keys() if k != "t")
+        return sorted(keys)
+
+    def _show_global_plot(self):
+        keys = self._series_keys()
+        if not keys:
+            return
+        series = {}
+        for k in keys:
+            xs = [r["t"] for r in self._rec_records if k in r]
+            ys = [r[k]   for r in self._rec_records if k in r]
+            unit = k.rsplit("_", 1)[-1] if "_" in k else ""
+            series[k] = (xs, ys, unit)
+        win = MultiSeriesPlotWindow("Combined Recording", "Time", "s")
+        win.show_data(series)
+        win.move(self.x() + self.width() + 16, self.y() + 40)
+        self._rec_plot_win = win
+
+    def _save_global_csv(self):
+        if not self._rec_records:
+            return
+        import datetime
+        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        os.makedirs(data_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(data_dir, f"global_recording_{stamp}.csv")
+        keys   = self._series_keys()
+        header = ["t"] + keys
+        rows = []
+        for r in self._rec_records:
+            rows.append([f"{r['t']:.3f}"] + [
+                (f"{r[k]:.6g}" if k in r else "") for k in keys
+            ])
+        write_csv_with_metadata(
+            fname, [f"global combined recording, {len(self._rec_records)} samples"],
+            header, rows)
+        print(f"[Global Recording] Saved {len(rows)} rows → {fname}")
+        self.status_bar.showMessage(f"Saved {len(rows)} rows → {fname}", 5000)
 
     # ── Pop-out ────────────────────────────────────────────────────────────────
 
@@ -3729,6 +6765,17 @@ class UnifiedMainWindow(QMainWindow):
         btn.setToolTip("Open the active tab in its own window")
         btn.clicked.connect(self._popout_current)
         return btn
+
+    def _make_popout_all_btn(self):
+        btn = QPushButton("⬡⬡  Pop out all tabs")
+        btn.setFixedHeight(24)
+        btn.setToolTip("Open every remaining tab in its own window")
+        btn.clicked.connect(self._popout_all)
+        return btn
+
+    def _popout_all(self):
+        while self.tabs.count() > 0:
+            self._popout_current()
 
     def _popout_current(self):
         idx = self.tabs.currentIndex()
@@ -3767,7 +6814,8 @@ class UnifiedMainWindow(QMainWindow):
 
     def _reattach(self, panel: QWidget, title: str):
         self._detached.pop(title, None)
-        order = {"DAQ Control": 0, "ITLA Laser": 1, "CONEX Motor": 2}
+        order = {"DAQ Control": 0, "CoreDAQ Power Meter": 1, "Santec Laser": 2,
+                  "CONEX Motor": 3, "ITLA Laser": 4, "HP-8168F Laser": 5}
         slot = order.get(title, self.tabs.count())
         self.tabs.insertTab(slot, panel, title)
         self.tabs.setCurrentIndex(slot)
@@ -3792,6 +6840,9 @@ class UnifiedMainWindow(QMainWindow):
         self.daq_panel.cleanup()
         self.itla_panel.cleanup()
         self.conex_panel.cleanup()
+        self.hp8168f_panel.cleanup()
+        self.santec_panel.cleanup()
+        self.coredaq_panel.cleanup()
         event.accept()
 
 

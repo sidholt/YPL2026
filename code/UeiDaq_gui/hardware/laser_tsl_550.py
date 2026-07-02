@@ -101,6 +101,27 @@ class TSL550(VisaInterface):
     def off(self):
         self.write('POW:STAT 0')
 
+    def configure_step_sweep(self, start_wavelength: float, stop_wavelength: float,
+                              step: float, dwell: float) -> None:
+        """Programs the TSL-550's built-in one-way step sweep (call start_sweep() to run it)."""
+        self.write('WAV:SWE:MOD 0')          # step sweep, one-way
+        self.write(f'WAV:SWE:STAR {start_wavelength}')
+        self.write(f'WAV:SWE:STOP {stop_wavelength}')
+        self.write(f'WAV:SWE:STEP {step}')
+        self.write(f'WAV:SWE:DWEL {dwell}')
+        self.write('WAV:SWE:CYCL 1')
+
+    def start_sweep(self) -> None:
+        self.write('WAV:SWE 1')
+
+    def stop_sweep(self) -> None:
+        self.write('WAV:SWE 0')
+
+    @property
+    def sweep_status(self) -> int:
+        """0=stopped, 1=running, 2=paused, 3=waiting for trigger, 4=setting error."""
+        return int(float(self.query('WAV:SWE?')))
+
     async def laser_sweep(
             self,
             input_channels: Union[int, Sequence[int]] = [0, 1],

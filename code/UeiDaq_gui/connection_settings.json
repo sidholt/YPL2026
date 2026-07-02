@@ -1,0 +1,7 @@
+{
+  "coredaq_port": "16",
+  "hp8168f_gpib_addr": 9,
+  "santec_gpib_addr": 1,
+  "prologix_com_port": 6,
+  "moku_ip": "172.28.5.6"
+}
