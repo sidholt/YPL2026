@@ -3,5 +3,9 @@
   "hp8168f_gpib_addr": 9,
   "santec_gpib_addr": 1,
   "prologix_com_port": 6,
-  "moku_ip": "172.28.5.6"
+  "moku_ip": "172.28.5.6",
+  "santec_last_power_mw": 2.0,
+  "santec_last_wavelength_nm": 1550.0,
+  "conex_x_com_port": 13,
+  "conex_y_com_port": 12
 }

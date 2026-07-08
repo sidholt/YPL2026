@@ -280,7 +280,9 @@ READBACK_DECIMALS      = 6
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 PROMICRO_PLOT_WINDOW_S = 10.0
-COREDAQ_PLOT_WINDOW_S  = 10.0
+COREDAQ_PLOT_WINDOW_S  = 5.0
+COREDAQ_Y_SPAN_NW      = 10.0   # fixed y-axis span (nW) — recenters instead of autoscaling
+COREDAQ_Y_RECENTER_NW  = 3.0    # recenter once the trace drifts this far from the current center
 
 PROMICRO_PORT = "COM11"
 PROMICRO_BAUD = 9600
@@ -2414,14 +2416,31 @@ class DAQPanel(QWidget):
             self.stacked.setCurrentIndex(1)
             self.daq_box.refresh()
             return
+        self._connect_card(idx, on_connected=lambda: self._show_pin_view(idx))
+
+    def _show_pin_view(self, idx: int):
+        cs = self.card_sessions[idx]
+        self.pin_view.load_card(cs)
+        self.stacked.setCurrentIndex(1)
+        self.daq_box.refresh()
+
+    def _connect_card(self, idx: int, on_connected=None):
+        """Connect a card in the background. Used both for the manual
+        Connect button and for auto-connecting every card on launch."""
+        cs = self.card_sessions[idx]
+        if cs.connected:
+            if on_connected:
+                on_connected()
+            return
 
         self._status(f"Connecting to {CARDS[idx]['label']}…")
 
         def do_connect():
             try:
                 cs.connect()
-                QTimer.singleShot(0, lambda: self._card_connected(idx))
+                QTimer.singleShot(0, lambda: self._card_connected(idx, on_connected))
             except Exception as e:
+                print(f"[DAQ] FAILED to connect — {CARDS[idx]['label']}: {e}")
                 QTimer.singleShot(0, lambda: self._status(
                     f"Connection error: {e}"))
 
@@ -2433,14 +2452,15 @@ class DAQPanel(QWidget):
                            if t in self._connect_threads else None)
         t.start()
 
-    def _card_connected(self, idx: int):
+    def _card_connected(self, idx: int, on_connected=None):
         cs = self.card_sessions[idx]
         self._status(
             f"Connected — {CARDS[idx]['label']} — "
             f"{cs.min_val} to {cs.max_val} {cs.unit}")
-        self.pin_view.load_card(cs)
-        self.stacked.setCurrentIndex(1)
+        print(f"[DAQ] Connected — {CARDS[idx]['label']}")
         self.daq_box.refresh()
+        if on_connected:
+            on_connected()
 
     def _disconnect_card(self, idx: int):
         cs = self.card_sessions[idx]
@@ -3904,8 +3924,12 @@ class ConexPanel(QWidget):
     _sig_dump_config  = pyqtSignal()
     _sig_disconnect   = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, label: str = "", settings_key: str = "conex_com_port",
+                 default_port: int = 4):
         super().__init__(parent)
+        self._label        = label
+        self._settings_key = settings_key
+        self._default_port = default_port
 
         if not HAS_PYVISA:
             lay = QVBoxLayout(self)
@@ -3959,7 +3983,7 @@ class ConexPanel(QWidget):
         final.addLayout(root)
 
         # ── Left: Connection ──────────────────────────────────────────────────
-        conn_box = QGroupBox("Connection")
+        conn_box = QGroupBox(f"Connection — {self._label}" if self._label else "Connection")
         conn_lay = QGridLayout(conn_box)
 
         conn_lay.addWidget(QLabel("Motor Status:"), 0, 0)
@@ -3970,7 +3994,7 @@ class ConexPanel(QWidget):
         conn_lay.addWidget(QLabel("COM Port #:"), 1, 0)
         self._port_spin = NoScrollSpinBox()
         self._port_spin.setRange(1, 99)
-        self._port_spin.setValue(load_connection_settings().get("conex_com_port", 4))
+        self._port_spin.setValue(load_connection_settings().get(self._settings_key, self._default_port))
         conn_lay.addWidget(self._port_spin, 1, 1)
 
         self._connect_btn = QPushButton("Connect to Motor")
@@ -4079,7 +4103,10 @@ class ConexPanel(QWidget):
         move_lay.addWidget(self._vel_btn, 4, 2)
 
         self._stop_btn = QPushButton("⚠ EMERGENCY STOP ⚠")
-        self._stop_btn.setEnabled(False)
+        # Always enabled, independent of connect/disconnect state — an
+        # e-stop that's only clickable while the app *thinks* it's connected
+        # defeats the purpose. do_stop() is a no-op error (logged, not
+        # raised) if there's no motor handle open.
         self._stop_btn.setStyleSheet("background: #B71C1C; color: white; font-weight: bold; font-size: 13px;")
         self._stop_btn.clicked.connect(lambda: self._sig_stop.emit())
         move_lay.addWidget(self._stop_btn, 5, 0, 1, 3)
@@ -4152,7 +4179,7 @@ class ConexPanel(QWidget):
     def _on_op_done(self, op: str):
         if op == "connect":
             for btn in [self._home_btn, self._pos_btn, self._vel_check_btn,
-                        self._disconnect_btn, self._state_btn, self._stop_btn,
+                        self._disconnect_btn, self._state_btn,
                         self._identity_btn, self._config_btn,
                         self._pos_limit_btn, self._neg_limit_btn,
                         self._vel_check_btn]:
@@ -4162,7 +4189,7 @@ class ConexPanel(QWidget):
                 btn.setEnabled(True)
         elif op == "disconnect":
             for btn in [self._home_btn, self._pos_btn, self._vel_check_btn,
-                        self._disconnect_btn, self._state_btn, self._stop_btn,
+                        self._disconnect_btn, self._state_btn,
                         self._identity_btn, self._config_btn,
                         self._pos_limit_btn, self._neg_limit_btn,
                         self._abs_btn, self._rel_btn, self._vel_btn]:
@@ -4171,7 +4198,7 @@ class ConexPanel(QWidget):
     # ── Button actions ────────────────────────────────────────────────────────
 
     def _do_connect(self):
-        save_connection_setting("conex_com_port", self._port_spin.value())
+        save_connection_setting(self._settings_key, self._port_spin.value())
         self._sig_connect.emit(self._port_spin.value())
 
     def _do_move_abs(self):
@@ -4183,11 +4210,89 @@ class ConexPanel(QWidget):
     def _do_set_vel(self):
         self._sig_set_vel.emit(self._vel_spin.value())
 
+    # ── Public API for the dual-axis (XY) container ──────────────────────────
+
+    def move_absolute(self, pos: float):
+        """Fire-and-forget move, queued to this motor's own worker thread —
+        used by ConexDualPanel to kick off X and Y moves back-to-back so they
+        run concurrently instead of one waiting for the other to finish."""
+        self._sig_move_abs.emit(pos)
+
+    def home(self):
+        self._sig_home.emit()
+
     def cleanup(self):
         if HAS_PYVISA:
             self._sig_disconnect.emit()
             self._thread.quit()
             self._thread.wait(2000)
+
+
+class ConexDualPanel(QWidget):
+    """
+    Two independent CONEX-CC motors (X and Y), each with its own COM port,
+    worker thread, and manual controls — plus a synchronized-move box that
+    kicks off an absolute move on both at once, so the stage can be driven
+    diagonally instead of one axis at a time.
+
+    Each ConexPanel below owns its motor's blocking PyVISA calls on its own
+    QThread, so firing move_absolute() on both back-to-back from the GUI
+    thread queues two independent moves that actually run concurrently.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.motor_x = ConexPanel(label="X Axis", settings_key="conex_x_com_port", default_port=4)
+        self.motor_y = ConexPanel(label="Y Axis", settings_key="conex_y_com_port", default_port=5)
+
+        final = QVBoxLayout(self)
+        final.setContentsMargins(10, 10, 10, 10)
+
+        if HAS_PYVISA:
+            sync_box = QGroupBox("Synchronized XY Move")
+            sync_lay = QGridLayout(sync_box)
+
+            sync_lay.addWidget(QLabel("Target X (mm):"), 0, 0)
+            self._x_spin = NoScrollDoubleSpinBox()
+            self._x_spin.setRange(0.0, 12.0)
+            self._x_spin.setDecimals(4)
+            self._x_spin.setSingleStep(0.1)
+            sync_lay.addWidget(self._x_spin, 0, 1)
+
+            sync_lay.addWidget(QLabel("Target Y (mm):"), 0, 2)
+            self._y_spin = NoScrollDoubleSpinBox()
+            self._y_spin.setRange(0.0, 12.0)
+            self._y_spin.setDecimals(4)
+            self._y_spin.setSingleStep(0.1)
+            sync_lay.addWidget(self._y_spin, 0, 3)
+
+            self._move_xy_btn = QPushButton("MOVE XY")
+            self._move_xy_btn.clicked.connect(self._do_move_xy)
+            sync_lay.addWidget(self._move_xy_btn, 0, 4)
+
+            self._home_xy_btn = QPushButton("HOME BOTH")
+            self._home_xy_btn.clicked.connect(self._do_home_xy)
+            sync_lay.addWidget(self._home_xy_btn, 1, 0, 1, 2)
+
+            final.addWidget(sync_box)
+
+        tabs = QTabWidget()
+        tabs.addTab(self.motor_x, "X Axis")
+        tabs.addTab(self.motor_y, "Y Axis")
+        final.addWidget(tabs, stretch=1)
+
+    def _do_move_xy(self):
+        self.motor_x.move_absolute(self._x_spin.value())
+        self.motor_y.move_absolute(self._y_spin.value())
+
+    def _do_home_xy(self):
+        self.motor_x.home()
+        self.motor_y.home()
+
+    def cleanup(self):
+        self.motor_x.cleanup()
+        self.motor_y.cleanup()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5056,7 +5161,6 @@ class SantecWorker(QObject):
     power_update      = pyqtSignal(float)
     output_update     = pyqtSignal(bool)
     range_update      = pyqtSignal(float, float, float)   # min_nm, max_nm, max_mw
-    sweep_progress    = pyqtSignal(int, int, float)        # idx, total, wavelength_nm
     power_sweep_progress = pyqtSignal(int, int, float)     # idx, total, power_mw
     log_message       = pyqtSignal(str)
     error              = pyqtSignal(str)
@@ -5065,7 +5169,7 @@ class SantecWorker(QObject):
     def __init__(self):
         super().__init__()
         self._laser = None
-        # threading.Event, not a plain bool: Stop must take effect while do_sweep()
+        # threading.Event, not a plain bool: Stop must take effect while do_power_sweep()
         # is blocking the worker thread's event loop, so it can't wait for a queued
         # cross-thread signal to be delivered — the GUI thread sets this directly.
         self._stop_event = threading.Event()
@@ -5096,6 +5200,22 @@ class SantecWorker(QObject):
             self.op_done.emit("connect")
         except Exception as e:
             self.error.emit(f"Connect failed: {e}")
+
+    def do_refresh_status(self):
+        """Re-queries the laser's actual current wavelength/power/output so the
+        GUI keeps reflecting reality rather than just whatever was last
+        commanded from this panel — e.g. if the laser drifted, or someone
+        adjusted it from the front panel. Called on a periodic timer while
+        idle (not mid-sweep, where the sweep loop itself is already the
+        source of truth for wavelength progress)."""
+        if self._laser is None:
+            return
+        try:
+            self.wavelength_update.emit(self._laser.wavelength)
+            self.power_update.emit(self._laser.power)
+            self.output_update.emit(not self._laser.shutter)
+        except Exception:
+            pass
 
     def do_set_wavelength(self, nm: float):
         try:
@@ -5130,56 +5250,6 @@ class SantecWorker(QObject):
             self.op_done.emit("set_output")
         except Exception as e:
             self.error.emit(f"Set output error: {e}")
-
-    def do_sweep(self, nm_start: float, nm_stop: float, nm_step: float, dwell_s: float):
-        """
-        Runs the TSL-550's built-in one-way step sweep from nm_start to nm_stop in
-        nm_step increments, dwelling dwell_s at each point on the instrument itself
-        (rather than the host writing a new WAV setpoint and sleeping for each point).
-        Direction follows nm_start → nm_stop. We poll the laser's live wavelength/
-        sweep-status registers to report progress and let the GUI log CoreDAQ power
-        at each step as the instrument reaches it.
-        """
-        try:
-            if nm_step <= 0:
-                self.error.emit("Step size must be positive")
-                return
-
-            self._stop_event.clear()
-            total = int(abs(nm_stop - nm_start) / nm_step + 1e-9) + 1
-
-            self.status_changed.emit("SWEEPING")
-            self.log_message.emit(
-                f"Sweep: {total} points, {nm_start:.4f} → {nm_stop:.4f} nm, "
-                f"{nm_step:.4f} nm step, {dwell_s:.2f} s dwell (Santec built-in step sweep)")
-
-            self._laser.configure_step_sweep(nm_start, nm_stop, nm_step, dwell_s)
-            self._laser.start_sweep()
-            self._sleep_interruptible(0.05)   # let the sweep engine start moving
-
-            idx = 0
-            last_wl = None
-            while not self._stop_event.is_set():
-                wl = self._laser.wavelength
-                if last_wl is None or abs(wl - last_wl) >= abs(nm_step) * 0.5:
-                    last_wl = wl
-                    idx += 1
-                    self.wavelength_update.emit(wl)
-                    self.sweep_progress.emit(min(idx, total), total, wl)
-                if self._laser.sweep_status == 0:
-                    break
-                self._sleep_interruptible(0.08)
-
-            if self._stop_event.is_set():
-                self._laser.stop_sweep()
-                self.log_message.emit("Sweep stopped by user")
-
-            self.status_changed.emit("CONNECTED")
-            self.log_message.emit("Sweep complete")
-            self.op_done.emit("sweep")
-        except Exception as e:
-            self.error.emit(f"Sweep error: {e}")
-            self.status_changed.emit("CONNECTED")
 
     def do_power_sweep(self, mw_start: float, mw_stop: float, mw_step: float, dwell_s: float):
         """
@@ -5255,11 +5325,13 @@ class SantecPanel(QWidget):
     _sig_set_wl      = pyqtSignal(float)
     _sig_set_power   = pyqtSignal(float)
     _sig_set_output  = pyqtSignal(bool)
-    _sig_sweep       = pyqtSignal(float, float, float, float)
     _sig_power_sweep = pyqtSignal(float, float, float, float)
     _sig_stop_sweep  = pyqtSignal()
     _sig_disconnect  = pyqtSignal()
-    _sig_run_fast_sweep = pyqtSignal()
+    _sig_run_fast_sweep  = pyqtSignal()
+    _sig_refresh_status  = pyqtSignal()
+
+    STATUS_POLL_MS = 1000   # periodic re-read of actual laser wavelength/power/output
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -5286,10 +5358,10 @@ class SantecPanel(QWidget):
         self._sig_set_wl.connect(self._worker.do_set_wavelength)
         self._sig_set_power.connect(self._worker.do_set_power)
         self._sig_set_output.connect(self._worker.do_set_output)
-        self._sig_sweep.connect(self._worker.do_sweep)
         self._sig_power_sweep.connect(self._worker.do_power_sweep)
         self._sig_stop_sweep.connect(self._worker.do_stop_sweep)
         self._sig_disconnect.connect(self._worker.do_disconnect)
+        self._sig_refresh_status.connect(self._worker.do_refresh_status)
 
         # Connect worker signals → GUI slots
         self._worker.status_changed.connect(self._on_status)
@@ -5297,11 +5369,19 @@ class SantecPanel(QWidget):
         self._worker.power_update.connect(self._on_power)
         self._worker.output_update.connect(self._on_output)
         self._worker.range_update.connect(self._on_range)
-        self._worker.sweep_progress.connect(self._on_sweep_progress)
         self._worker.power_sweep_progress.connect(self._on_power_sweep_progress)
         self._worker.log_message.connect(self._on_log)
         self._worker.error.connect(self._on_error)
         self._worker.op_done.connect(self._on_op_done)
+
+        # Periodic re-read of actual laser state — keeps the "Current
+        # Wavelength/Power" labels honest even between explicit set/sweep
+        # actions (e.g. front-panel adjustments, or just to reflect reality
+        # rather than a stale value from whenever it was last written).
+        self._status_poll_timer = QTimer()
+        self._status_poll_timer.setInterval(self.STATUS_POLL_MS)
+        self._status_poll_timer.timeout.connect(self._poll_status)
+        self._status_poll_timer.start()
 
         # ── Fast Sweep worker thread — direct laser+DAQ refs, single blocking
         # method arms the DAQ, fires the laser's one-shot start trigger, and
@@ -5321,14 +5401,15 @@ class SantecPanel(QWidget):
         self._last_wavelength_nm = None
         self._last_power_mw     = None
         self._coredaq_panel     = None
-        self._sweep_logging     = False
-        self._sweep_power_log   = []
         self._power_sweep_logging = False
         self._power_sweep_log     = []
         self._fast_sweep_running  = False
         self._fast_sweep_result   = None   # (wavelengths[], [ch1_W..ch4_W])
 
         self._build_ui()
+
+        # auto-connect on launch using the saved GPIB/COM settings
+        self._do_connect()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -5410,91 +5491,26 @@ class SantecPanel(QWidget):
         self._wl_spin = NoScrollDoubleSpinBox()
         self._wl_spin.setDecimals(4)
         self._wl_spin.setRange(1400.0, 1700.0)   # narrowed to instrument range after connect
-        self._wl_spin.setValue(1550.0)
+        self._wl_spin.setValue(load_connection_settings().get("santec_last_wavelength_nm", 1550.0))
         man_lay.addWidget(self._wl_spin, 2, 1)
         self._wl_btn = QPushButton("SET!")
         self._wl_btn.setEnabled(False)
-        self._wl_btn.clicked.connect(lambda: self._sig_set_wl.emit(self._wl_spin.value()))
+        self._wl_btn.clicked.connect(self._do_set_wl)
         man_lay.addWidget(self._wl_btn, 2, 2)
 
         man_lay.addWidget(QLabel("Set Power (mW):"), 3, 0)
         self._pow_spin = NoScrollDoubleSpinBox()
         self._pow_spin.setDecimals(3)
         self._pow_spin.setRange(0.0, 20.0)       # narrowed to instrument range after connect
-        self._pow_spin.setValue(1.0)
+        self._pow_spin.setValue(load_connection_settings().get("santec_last_power_mw", 1.0))
         man_lay.addWidget(self._pow_spin, 3, 1)
         self._pow_btn = QPushButton("SET!")
         self._pow_btn.setEnabled(False)
-        self._pow_btn.clicked.connect(lambda: self._sig_set_power.emit(self._pow_spin.value()))
+        self._pow_btn.clicked.connect(self._do_set_power)
         man_lay.addWidget(self._pow_btn, 3, 2)
 
         man_lay.setRowStretch(4, 1)
         root.addWidget(man_box)
-
-        # ── Right: Wavelength sweep ───────────────────────────────────────────
-        sweep_box = QGroupBox("Wavelength Sweep")
-        sw_lay = QGridLayout(sweep_box)
-
-        sw_lay.addWidget(QLabel("Start (nm):"), 0, 0)
-        self._sw_start = NoScrollDoubleSpinBox()
-        self._sw_start.setDecimals(4)
-        self._sw_start.setRange(1400.0, 1700.0)
-        self._sw_start.setValue(1545.0)
-        sw_lay.addWidget(self._sw_start, 0, 1)
-
-        sw_lay.addWidget(QLabel("Stop (nm):"), 1, 0)
-        self._sw_stop = NoScrollDoubleSpinBox()
-        self._sw_stop.setDecimals(4)
-        self._sw_stop.setRange(1400.0, 1700.0)
-        self._sw_stop.setValue(1555.0)
-        sw_lay.addWidget(self._sw_stop, 1, 1)
-
-        sw_lay.addWidget(QLabel("Step (nm):"), 2, 0)
-        self._sw_step = NoScrollDoubleSpinBox()
-        self._sw_step.setDecimals(4)
-        self._sw_step.setRange(0.0001, 100.0)
-        self._sw_step.setValue(0.1)
-        sw_lay.addWidget(self._sw_step, 2, 1)
-
-        sw_lay.addWidget(QLabel("Dwell (s):"), 3, 0)
-        self._sw_dwell = NoScrollDoubleSpinBox()
-        self._sw_dwell.setDecimals(2)
-        self._sw_dwell.setRange(0.0, 60.0)
-        self._sw_dwell.setValue(0.5)
-        sw_lay.addWidget(self._sw_dwell, 3, 1)
-
-        self._sw_info_lbl = QLabel("")
-        self._sw_info_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
-        sw_lay.addWidget(self._sw_info_lbl, 4, 0, 1, 2)
-
-        self._sw_run_btn  = QPushButton("Run Sweep")
-        self._sw_stop_btn = QPushButton("Stop")
-        self._sw_run_btn.setEnabled(False)
-        self._sw_stop_btn.setEnabled(False)
-        self._sw_run_btn.clicked.connect(self._do_sweep)
-        self._sw_stop_btn.clicked.connect(self._do_stop_sweep)
-        sw_lay.addWidget(self._sw_run_btn, 5, 0, 1, 2)
-        sw_lay.addWidget(self._sw_stop_btn, 6, 0, 1, 2)
-
-        self._sw_progress_lbl = QLabel("")
-        self._sw_progress_lbl.setStyleSheet(f"color: {C_GRAY};")
-        sw_lay.addWidget(self._sw_progress_lbl, 7, 0, 1, 2)
-
-        self._sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
-        self._sweep_log_chk.setToolTip(
-            "Records the CoreDAQ optical power meter at each sweep step")
-        sw_lay.addWidget(self._sweep_log_chk, 8, 0, 1, 2)
-        self._sweep_export_btn = QPushButton("Export CSV…")
-        self._sweep_export_btn.setEnabled(False)
-        self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
-        sw_lay.addWidget(self._sweep_export_btn, 9, 0, 1, 2)
-
-        sw_lay.setRowStretch(10, 1)
-        root.addWidget(sweep_box, stretch=1)
-
-        for sb in (self._sw_start, self._sw_stop, self._sw_step, self._sw_dwell):
-            sb.valueChanged.connect(self._update_sweep_info)
-        self._update_sweep_info()
 
         # ── Power Sweep (Cal 2-DC: power only, wavelength stays fixed) ───────
         pw_box = QGroupBox("Power Sweep  (wavelength stays fixed — laser must already be ON)")
@@ -5606,7 +5622,7 @@ class SantecPanel(QWidget):
             sb.valueChanged.connect(self._update_fast_sweep_info)
         self._update_fast_sweep_info()
 
-        final.addWidget(fs_box)
+        root.addWidget(fs_box, stretch=1)
 
         # ── Bottom: Log ───────────────────────────────────────────────────────
         log_box = QGroupBox("Log")
@@ -5618,6 +5634,14 @@ class SantecPanel(QWidget):
         final.addWidget(log_box)
 
     # ── Slot handlers ─────────────────────────────────────────────────────────
+
+    def _poll_status(self):
+        """Fired every STATUS_POLL_MS — only queries the laser while idle and
+        connected. Mid-sweep the worker thread is already busy running the
+        blocking sweep loop (which emits its own wavelength updates), so a
+        queued refresh here would just pile up behind it for no benefit."""
+        if self._status_lbl.text() == "CONNECTED" and not self._fast_sweep_running:
+            self._sig_refresh_status.emit()
 
     def _on_status(self, s: str):
         self._status_lbl.setText(s)
@@ -5634,8 +5658,6 @@ class SantecPanel(QWidget):
         # so it counts as "busy" for every control that would otherwise also
         # touch that object concurrently — same lockout as a regular SWEEPING.
         busy      = s == "SWEEPING" or self._fast_sweep_running
-        self._sw_run_btn.setEnabled(connected and not busy)
-        self._sw_stop_btn.setEnabled(s == "SWEEPING")
         self._pw_run_btn.setEnabled(connected and not busy)
         self._pw_stop_btn.setEnabled(s == "SWEEPING")
         self._wl_btn.setEnabled(connected and not busy)
@@ -5667,8 +5689,7 @@ class SantecPanel(QWidget):
         self._output_lbl.setStyleSheet(f"color: {C_RED if on else C_GRAY}; font-weight: bold;")
 
     def _on_range(self, min_nm: float, max_nm: float, max_mw: float):
-        for spin in (self._wl_spin, self._sw_start, self._sw_stop):
-            spin.setRange(min_nm, max_nm)
+        self._wl_spin.setRange(min_nm, max_nm)
         self._pow_spin.setRange(0.0, max_mw)
         self._log.append(f"Wavelength range: {min_nm:.3f}–{max_nm:.3f} nm,  max power {max_mw:.3f} mW")
 
@@ -5677,6 +5698,9 @@ class SantecPanel(QWidget):
 
     def _on_error(self, msg: str):
         self._log.append(f"<span style='color:{C_RED};'>ERROR: {msg}</span>")
+        connected = self._status_lbl.text() != "DISCONNECTED"
+        print(f"[Santec] ERROR: {msg}" if connected
+              else f"[Santec] FAILED to connect: {msg}")
 
     def _on_op_done(self, op: str):
         if op == "connect":
@@ -5684,28 +5708,18 @@ class SantecPanel(QWidget):
             self._disconnect_btn.setEnabled(True)
             self._gpib_spin.setEnabled(False)
             self._prologix_port_spin.setEnabled(False)
+            print(f"[Santec] Connected — GPIB {self._gpib_spin.value()} "
+                  f"via Prologix COM{self._prologix_port_spin.value()}")
         elif op == "disconnect":
             self._connect_btn.setEnabled(True)
             self._disconnect_btn.setEnabled(False)
             self._gpib_spin.setEnabled(True)
             self._prologix_port_spin.setEnabled(True)
-        elif op == "sweep" and self._sweep_logging:
-            self._sweep_logging = False
-            if self._sweep_power_log:
-                self._sweep_export_btn.setEnabled(True)
-                self._show_sweep_power_plot()
         elif op == "power_sweep":
             self._power_sweep_logging = False
             if self._power_sweep_log:
                 self._power_sweep_export_btn.setEnabled(True)
                 self._show_power_sweep_plot()
-
-    def _on_sweep_progress(self, idx: int, total: int, wl: float):
-        self._sw_progress_lbl.setText(f"[{idx}/{total}]  {wl:.4f} nm")
-        if self._sweep_logging and self._coredaq_panel is not None:
-            powers = self._coredaq_panel.latest_power_w()
-            if powers is not None:
-                self._sweep_power_log.append((wl, *powers))
 
     def _on_power_sweep_progress(self, idx: int, total: int, mw: float):
         self._pw_progress_lbl.setText(f"[{idx}/{total}]  {mw:.3f} mW")
@@ -5714,46 +5728,12 @@ class SantecPanel(QWidget):
             if powers is not None:
                 self._power_sweep_log.append((mw, *powers))
 
-    def _show_sweep_power_plot(self):
-        series = {}
-        for ch in range(4):
-            xs = [row[0] for row in self._sweep_power_log]
-            ys = [row[1 + ch] for row in self._sweep_power_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
-        win = MultiSeriesPlotWindow("Santec Sweep — CoreDAQ Power", "Wavelength", "nm")
-        win.show_data(series)
-        mw = self.window()
-        win.move(mw.x() + mw.width() + 16, mw.y() + 40)
-        self._sweep_plot_win = win
-
-    def _export_sweep_power_csv(self):
-        if not self._sweep_power_log:
-            return
-        import datetime
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
-        os.makedirs(data_dir, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = os.path.join(data_dir, f"santec_sweep_coredaq_{stamp}.csv")
-        comments = [
-            "laser: Santec TSL-550",
-            f"sweep: {self._sw_start.value():.4f} -> {self._sw_stop.value():.4f} nm, "
-            f"step {self._sw_step.value():.4f} nm, dwell {self._sw_dwell.value():.2f} s",
-            f"power_setpoint_mw: {self._pow_spin.value():.3f}",
-        ]
-        header = ["wavelength_nm",
-                  "coredaq_ch1_W", "coredaq_ch2_W", "coredaq_ch3_W", "coredaq_ch4_W"]
-        rows = [[f"{wl:.4f}"] + [f"{w:.9e}" for w in powers]
-                for wl, *powers in self._sweep_power_log]
-        write_csv_with_metadata(fname, comments, header, rows)
-        print(f"[Santec Sweep] Saved {len(rows)} rows → {fname}")
-        self._log.append(f"Saved {len(rows)} sweep/power rows → {fname}")
-
     def _show_power_sweep_plot(self):
         series = {}
         for ch in range(4):
             xs = [row[0] for row in self._power_sweep_log]
-            ys = [row[1 + ch] for row in self._power_sweep_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
+            ys = [row[1 + ch] * 1e9 for row in self._power_sweep_log]
+            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "nW")
         win = MultiSeriesPlotWindow("Santec Power Sweep — CoreDAQ Power", "Laser power", "mW")
         win.show_data(series)
         mw = self.window()
@@ -5784,36 +5764,20 @@ class SantecPanel(QWidget):
 
     # ── Button actions ────────────────────────────────────────────────────────
 
-    def _update_sweep_info(self):
-        start = self._sw_start.value()
-        stop  = self._sw_stop.value()
-        step  = self._sw_step.value()
-        dwell = self._sw_dwell.value()
-        if step <= 0:
-            self._sw_info_lbl.setText("")
-            return
-        npts = int(abs(stop - start) / step) + 1
-        self._sw_info_lbl.setText(
-            f"{npts} points · ~{npts * dwell:.1f} s total")
-
     def _do_connect(self):
         save_connection_setting("santec_gpib_addr", self._gpib_spin.value())
         save_connection_setting("prologix_com_port", self._prologix_port_spin.value())
         self._sig_connect.emit(self._gpib_spin.value(), self._prologix_port_spin.value())
 
-    def _do_sweep(self):
-        start = self._sw_start.value()
-        stop  = self._sw_stop.value()
-        step  = self._sw_step.value()
-        dwell = self._sw_dwell.value()
-        if abs(start - stop) < 1e-9:
-            QMessageBox.warning(self, "Sweep", "Start and stop must differ.")
-            return
-        self._sw_progress_lbl.setText("")
-        self._sweep_power_log = []
-        self._sweep_export_btn.setEnabled(False)
-        self._sweep_logging = self._sweep_log_chk.isChecked()
-        self._sig_sweep.emit(start, stop, step, dwell)
+    def _do_set_wl(self):
+        nm = self._wl_spin.value()
+        save_connection_setting("santec_last_wavelength_nm", nm)
+        self._sig_set_wl.emit(nm)
+
+    def _do_set_power(self):
+        mw = self._pow_spin.value()
+        save_connection_setting("santec_last_power_mw", mw)
+        self._sig_set_power.emit(mw)
 
     def _do_power_sweep(self):
         start = self._pw_start.value()
@@ -5850,10 +5814,10 @@ class SantecPanel(QWidget):
     def _set_fast_sweep_controls_enabled(self, enabled: bool):
         # The fast sweep drives the raw laser/DAQ objects directly from its own
         # thread \u2014 anything else that could also touch them concurrently
-        # (manual wavelength/power/output, the regular sweeps) must be locked
+        # (manual wavelength/power/output, the power sweep) must be locked
         # out for the duration, same as SWEEPING already locks them out for
-        # do_sweep()/do_power_sweep().
-        for w in (self._fs_run_btn, self._sw_run_btn, self._pw_run_btn,
+        # do_power_sweep().
+        for w in (self._fs_run_btn, self._pw_run_btn,
                   self._wl_btn, self._pow_btn, self._on_btn, self._off_btn,
                   self._disconnect_btn):
             w.setEnabled(enabled)
@@ -5912,7 +5876,8 @@ class SantecPanel(QWidget):
         wavelengths, power_ch = self._fast_sweep_result
         series = {}
         for ch in range(min(4, len(power_ch))):
-            series[f"CoreDAQ Head {ch + 1}"] = (wavelengths, power_ch[ch], "W")
+            ys_nw = [w * 1e9 for w in power_ch[ch]]
+            series[f"CoreDAQ Head {ch + 1}"] = (wavelengths, ys_nw, "nW")
         win = MultiSeriesPlotWindow("Santec Fast Sweep \u2014 CoreDAQ Power", "Wavelength", "nm")
         win.show_data(series)
         mw = self.window()
@@ -5944,6 +5909,7 @@ class SantecPanel(QWidget):
 
     def cleanup(self):
         if HAS_PYVISA and HAS_SANTEC:
+            self._status_poll_timer.stop()
             self._sig_disconnect.emit()
             self._thread.quit()
             self._thread.wait(2000)
@@ -5982,6 +5948,18 @@ def write_csv_with_metadata(path: str, comments: list, header: list, rows: list)
             w.writerow(r)
 
 
+if HAS_PYQTGRAPH:
+    class _DecimalAxisItem(pg.AxisItem):
+        """AxisItem that always renders tick labels in plain decimal notation.
+        pyqtgraph's default tickStrings() falls back to scientific notation
+        ("%g") for values below 0.001 or at/above 10000 — unreadable for the
+        tiny (sub-µW) CoreDAQ power readings on the Santec sweep plots."""
+        def tickStrings(self, values, scale, spacing):
+            eff = spacing * scale
+            places = max(0, math.ceil(-math.log10(eff))) if eff > 0 else 0
+            return [("%%0.%df" % places) % (v * scale) for v in values]
+
+
 class MultiSeriesPlotWindow(QWidget):
     """
     Generic 2-column grid of pyqtgraph plots, one per named series — mirrors
@@ -6008,7 +5986,10 @@ class MultiSeriesPlotWindow(QWidget):
             return
         for i, (name, (xs, ys, y_unit)) in enumerate(series_data.items()):
             if name not in self._plots:
-                pw = pg.PlotWidget()
+                pw = pg.PlotWidget(axisItems={
+                    'bottom': _DecimalAxisItem(orientation='bottom'),
+                    'left':   _DecimalAxisItem(orientation='left'),
+                })
                 pw.setLabel('bottom', self._x_label, units=self._x_unit)
                 pw.setLabel('left', name, units=y_unit)
                 pw.getAxis('left').enableAutoSIPrefix(False)
@@ -6040,6 +6021,13 @@ class CoreDAQWorker(QObject):
     numeric mV/gain labels and latest_power_w() are refreshed on a much
     slower wall-clock throttle (LABEL_HZ) since they don't need per-sample
     freshness.
+
+    Poll loop is self-pacing, not a fixed-interval timer: do_poll() only
+    schedules the next tick (via QTimer.singleShot(0, ...), fired on this
+    same worker thread — no cross-thread signal) after the current one
+    finishes. A fixed-rate timer firing faster than the serial round trip
+    would queue up an ever-growing backlog of pending polls, which is what
+    made the live plots stutter/freeze under load.
     """
     status_changed = pyqtSignal(str)             # DISCONNECTED / CONNECTED
     info_update     = pyqtSignal(str, str, str)   # idn, frontend_type, detector_type
@@ -6054,6 +6042,7 @@ class CoreDAQWorker(QObject):
         super().__init__()
         self._daq = None
         self._last_power_w = None
+        self._polling = False
 
         # ── Plot ring buffer: pre-allocated, fixed-size, circular ───────────
         # Sized generously for COREDAQ_PLOT_WINDOW_S at up to ~1 kHz — actual
@@ -6061,9 +6050,16 @@ class CoreDAQWorker(QObject):
         # smaller fraction of the window, which is fine.
         self.plot_buffer_len  = max(2, int(COREDAQ_PLOT_WINDOW_S * 1000))
         self.plot_buffer      = np.zeros((4, self.plot_buffer_len), dtype=np.float32)
+        # Actual wall-clock time of each sample — the real poll rate is capped
+        # by serial round-trip time and runs nowhere near the 1 kHz the buffer
+        # is sized for, so the display side needs real timestamps (not an
+        # assumed-rate linspace) to know which samples actually fall within
+        # the last COREDAQ_PLOT_WINDOW_S seconds.
+        self.plot_time_buffer = np.zeros(self.plot_buffer_len, dtype=np.float64)
         self.plot_write_index = 0
         self.plot_filled      = 0
         self._display_buf     = np.zeros((4, self.plot_buffer_len), dtype=np.float32)
+        self._display_time_buf = np.zeros(self.plot_buffer_len, dtype=np.float64)
 
         self._last_label_emit_t = 0.0
         self._err_count = 0
@@ -6108,6 +6104,8 @@ class CoreDAQWorker(QObject):
             self.info_update.emit(idn, frontend, detector)
             self.log_message.emit(f"Connected — {idn}")
             self.op_done.emit("connect")
+            self._polling = True
+            QTimer.singleShot(0, self.do_poll)
         except PermissionError as e:
             self.error.emit(
                 f"Connect failed: {e} — port is already open elsewhere "
@@ -6120,19 +6118,20 @@ class CoreDAQWorker(QObject):
             self.error.emit(f"Connect failed: {e}")
 
     def do_poll(self):
-        if self._daq is None:
+        if not self._polling or self._daq is None:
             return
         try:
             power_w = self._daq.snapshot_W()
             data = np.asarray(power_w[:4], dtype=np.float32)
             self._last_power_w = tuple(float(x) for x in power_w[:4])
 
+            now = time.monotonic()
             self.plot_buffer[:, self.plot_write_index] = data
+            self.plot_time_buffer[self.plot_write_index] = now
             self.plot_write_index = (self.plot_write_index + 1) % self.plot_buffer_len
             if self.plot_filled < self.plot_buffer_len:
                 self.plot_filled += 1
 
-            now = time.monotonic()
             if (now - self._last_label_emit_t) >= (1.0 / self.LABEL_HZ):
                 self._last_label_emit_t = now
                 mv, gains = self._daq.snapshot_mV()
@@ -6141,17 +6140,37 @@ class CoreDAQWorker(QObject):
             self._err_count += 1
             if self._err_count % 200 == 1:
                 self.error.emit(f"Poll error (×{self._err_count}): {e}")
+        finally:
+            # Chain the next tick only once this one is done — never race
+            # ahead of the actual serial round-trip time.
+            if self._polling:
+                QTimer.singleShot(0, self.do_poll)
+
+    def do_pause_poll(self):
+        """Stops the self-pacing loop. Runs on this worker thread, invoked
+        via a blocking queued connection so the caller (Fast Sweep, which
+        is about to touch the raw CoreDAQ handle from a different thread)
+        knows for certain no poll is in flight once this returns."""
+        self._polling = False
+
+    def do_resume_poll(self):
+        if self._daq is not None and not self._polling:
+            self._polling = True
+            QTimer.singleShot(0, self.do_poll)
 
     def get_display_data(self):
         """
-        Returns (data, count): the plot ring buffer stitched chronologically
-        (oldest first) into a pre-allocated scratch buffer — no allocation on
-        this hot path, called directly (not via a queued signal) by the GUI's
-        independent display-refresh timer.
+        Returns (data, times, count): the plot ring buffer stitched
+        chronologically (oldest first) into pre-allocated scratch buffers —
+        no allocation on this hot path, called directly (not via a queued
+        signal) by the GUI's independent display-refresh timer. `times` are
+        time.monotonic() wall-clock timestamps for each sample, so the
+        caller can plot against actual elapsed time instead of an assumed
+        sample rate.
         """
         count = self.plot_filled
         if count == 0:
-            return self._display_buf, 0
+            return self._display_buf, self._display_time_buf, 0
 
         N    = self.plot_buffer_len
         widx = self.plot_write_index
@@ -6159,13 +6178,17 @@ class CoreDAQWorker(QObject):
         if count >= N:
             if widx == 0:
                 np.copyto(self._display_buf, self.plot_buffer)
+                np.copyto(self._display_time_buf, self.plot_time_buffer)
             else:
                 self._display_buf[:, :N - widx] = self.plot_buffer[:, widx:]
                 self._display_buf[:, N - widx:] = self.plot_buffer[:, :widx]
+                self._display_time_buf[:N - widx] = self.plot_time_buffer[widx:]
+                self._display_time_buf[N - widx:] = self.plot_time_buffer[:widx]
         else:
             np.copyto(self._display_buf[:, :count], self.plot_buffer[:, :count])
+            np.copyto(self._display_time_buf[:count], self.plot_time_buffer[:count])
 
-        return self._display_buf, count
+        return self._display_buf, self._display_time_buf, count
 
     def do_set_gain(self, head: int, value: int):
         try:
@@ -6184,6 +6207,7 @@ class CoreDAQWorker(QObject):
             self.error.emit(f"Set wavelength error: {e}")
 
     def do_disconnect(self):
+        self._polling = False
         try:
             if self._daq is not None:
                 self._daq.close()
@@ -6202,19 +6226,19 @@ class CoreDAQPanel(QWidget):
     """
 
     _sig_connect       = pyqtSignal(str)
-    _sig_poll          = pyqtSignal()
+    _sig_pause_poll    = pyqtSignal()
+    _sig_resume_poll   = pyqtSignal()
     _sig_set_gain      = pyqtSignal(int, int)
     _sig_set_wl        = pyqtSignal(float)
     _sig_disconnect    = pyqtSignal()
 
-    POLL_MS    = 2    # request poll ticks as fast as Qt/serial will sustain
-    DISPLAY_MS = 33   # ~30 Hz plot redraw, decoupled from the poll/acquire rate
+    DISPLAY_MS = 16   # ~60 Hz plot redraw, decoupled from the poll/acquire rate
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._connected     = False
         self._frontend_type = None
-        self._live_t_axis   = None   # cached, built once per plot-buffer size
+        self._y_center      = [None, None, None, None]   # per-channel fixed-span center (nW)
 
         if not HAS_SERIAL or not HAS_COREDAQ:
             lay = QVBoxLayout(self)
@@ -6234,7 +6258,12 @@ class CoreDAQPanel(QWidget):
         self._thread.start()
 
         self._sig_connect.connect(self._worker.do_connect)
-        self._sig_poll.connect(self._worker.do_poll)
+        # Blocking so pause_polling() only returns once the worker thread
+        # has actually stopped — required before Fast Sweep touches the raw
+        # CoreDAQ handle from its own thread. Resume doesn't need to block.
+        self._sig_pause_poll.connect(self._worker.do_pause_poll,
+                                      Qt.ConnectionType.BlockingQueuedConnection)
+        self._sig_resume_poll.connect(self._worker.do_resume_poll)
         self._sig_set_gain.connect(self._worker.do_set_gain)
         self._sig_set_wl.connect(self._worker.do_set_wavelength)
         self._sig_disconnect.connect(self._worker.do_disconnect)
@@ -6246,10 +6275,6 @@ class CoreDAQPanel(QWidget):
         self._worker.error.connect(self._on_error)
         self._worker.op_done.connect(self._on_op_done)
 
-        self._poll_timer = QTimer()
-        self._poll_timer.setInterval(self.POLL_MS)
-        self._poll_timer.timeout.connect(lambda: self._sig_poll.emit())
-
         # Independent redraw timer — reads the worker's ring buffer directly
         # (get_display_data() is a plain, allocation-free method call, not a
         # queued signal) so plot refresh rate never depends on how fast the
@@ -6260,6 +6285,9 @@ class CoreDAQPanel(QWidget):
         self._display_timer.start()
 
         self._build_ui()
+
+        # auto-connect on launch using the saved port
+        self._do_connect()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -6376,7 +6404,7 @@ class CoreDAQPanel(QWidget):
             colors = (C_BLUE, C_GOLD, C_GREEN, C_RED)
             for ch in range(4):
                 pw = pg.PlotWidget()
-                pw.setLabel('left', f'Head {ch + 1}', units='W')
+                pw.setLabel('left', f'Head {ch + 1}', units='nW')
                 pw.setLabel('bottom', 'Time', units='s')
                 pw.getAxis('left').enableAutoSIPrefix(False)
                 pw.setMinimumHeight(160)
@@ -6387,6 +6415,14 @@ class CoreDAQPanel(QWidget):
                 pw.plotItem.setDownsampling(auto=True, mode='peak')
                 pw.plotItem.setClipToView(True)
                 pw.setXRange(-COREDAQ_PLOT_WINDOW_S, 0.0, padding=0)
+                # Fixed-span Y instead of autorange: autorange rescaled to
+                # whatever min/max happened to be in the 3 s window, which
+                # made an actually-stable signal look like it was swinging
+                # wildly. A constant COREDAQ_Y_SPAN_NW window (recentered in
+                # _update_live_plot only once the trace drifts near an edge)
+                # makes real stability/noise easy to judge by eye.
+                pw.enableAutoRange(axis='y', enable=False)
+                pw.setYRange(-COREDAQ_Y_SPAN_NW / 2, COREDAQ_Y_SPAN_NW / 2, padding=0)
                 curve = pw.plot([], [], pen=pg.mkPen(colors[ch], width=2), skipFiniteCheck=True)
                 row, col = divmod(ch, 2)
                 plot_grid.addWidget(pw, row, col)
@@ -6413,13 +6449,14 @@ class CoreDAQPanel(QWidget):
             f"color: {C_BLUE if self._connected else C_RED}; font-weight: bold;")
         self._wl_btn.setEnabled(self._connected)
         if self._connected:
-            self._live_t_axis = None   # rebuilt on next redraw, in case buffer size changed
+            self._y_center = [None, None, None, None]
             if HAS_PYQTGRAPH:
-                for _, curve in self._live_plots:
+                for pw, curve in self._live_plots:
                     curve.setData([], [])
-            self._poll_timer.start()
+                    pw.setYRange(-COREDAQ_Y_SPAN_NW / 2, COREDAQ_Y_SPAN_NW / 2, padding=0)
+            # Polling itself is started/stopped by the worker (do_connect /
+            # do_disconnect) — it lives entirely on the worker thread now.
         else:
-            self._poll_timer.stop()
             for lbl in self._power_lbls: lbl.setText("—")
             for lbl in self._raw_lbls:   lbl.setText("—")
             for combo, btn in zip(self._gain_combos, self._gain_btns):
@@ -6448,35 +6485,51 @@ class CoreDAQPanel(QWidget):
         """Called by the independent ~30 Hz display timer — pulls whatever the
         worker's ring buffer currently holds. Decoupled from the acquisition
         rate: a slow serial link just means fewer new points per redraw, not
-        a slower UI."""
+        a slower UI.
+
+        The buffer is sized for up to ~1 kHz sampling, but the real poll rate
+        is capped by serial round-trip time and is usually far slower — so we
+        can't assume samples are 1 ms apart. Instead each sample carries its
+        own time.monotonic() timestamp, and here we convert to "seconds ago"
+        and drop anything older than the window so stale samples can't linger
+        on screen mislabeled as recent.
+        """
         if not HAS_PYQTGRAPH or not self._connected:
             return
-        data, count = self._worker.get_display_data()
+        data, times, count = self._worker.get_display_data()
         if count <= 0:
             return
-        if self._live_t_axis is None or len(self._live_t_axis) != data.shape[1]:
-            N = data.shape[1]
-            self._live_t_axis = np.linspace(-COREDAQ_PLOT_WINDOW_S, 0.0, N)
-        t = self._live_t_axis
-        N = len(t)
+        times = times[:count]
+        rel = times - time.monotonic()
+        mask = rel >= -COREDAQ_PLOT_WINDOW_S
+        rel = rel[mask]
+        if rel.size == 0:
+            return
         for ch, (pw, curve) in enumerate(self._live_plots):
-            y = data[ch]
-            if count >= N:
-                curve.setData(t, y, connect='all')
-            else:
-                curve.setData(t[-count:], y[:count], connect='all')
+            y_nw = data[ch, :count][mask] * 1e9   # W -> nW
+            curve.setData(rel, y_nw, connect='all')
+
+            latest  = float(y_nw[-1])
+            center  = self._y_center[ch]
+            if center is None or abs(latest - center) > COREDAQ_Y_RECENTER_NW:
+                self._y_center[ch] = latest
+                pw.setYRange(latest - COREDAQ_Y_SPAN_NW / 2,
+                             latest + COREDAQ_Y_SPAN_NW / 2, padding=0)
 
     def _on_log(self, msg: str):
         self._log.append(msg)
 
     def _on_error(self, msg: str):
         self._log.append(f"<span style='color:{C_RED};'>ERROR: {msg}</span>")
+        print(f"[CoreDAQ] FAILED to connect: {msg}" if not self._connected
+              else f"[CoreDAQ] ERROR: {msg}")
 
     def _on_op_done(self, op: str):
         if op == "connect":
             self._connect_btn.setEnabled(False)
             self._disconnect_btn.setEnabled(True)
             self._port_edit.setEnabled(False)
+            print(f"[CoreDAQ] Connected — {self._idn_lbl.text()}")
         elif op == "disconnect":
             self._connect_btn.setEnabled(True)
             self._disconnect_btn.setEnabled(False)
@@ -6498,19 +6551,17 @@ class CoreDAQPanel(QWidget):
     def pause_polling(self):
         """Stops the live poll loop — must not run concurrently with a Fast
         Sweep's direct hardware access, since they share one serial
-        connection. The short sleep lets an already-in-flight do_poll() (its
-        queued signal may have fired just before .stop() took effect) finish
-        before we hand the connection off."""
-        self._poll_timer.stop()
-        time.sleep(0.05)
+        connection. Blocks until the worker thread confirms polling has
+        actually stopped (no fixed sleep-and-hope needed)."""
+        if self._connected:
+            self._sig_pause_poll.emit()
 
     def resume_polling(self):
         if self._connected:
-            self._poll_timer.start()
+            self._sig_resume_poll.emit()
 
     def cleanup(self):
         if HAS_SERIAL and HAS_COREDAQ:
-            self._poll_timer.stop()
             self._sig_disconnect.emit()
             self._thread.quit()
             self._thread.wait(2000)
@@ -6578,7 +6629,7 @@ class UnifiedMainWindow(QMainWindow):
 
         self.daq_panel     = DAQPanel()
         self.itla_panel    = ITLAPanel()
-        self.conex_panel   = ConexPanel()
+        self.conex_panel   = ConexDualPanel()
         self.hp8168f_panel = HP8168FPanel()
         self.santec_panel  = SantecPanel()
         self.coredaq_panel = CoreDAQPanel()
@@ -6591,7 +6642,6 @@ class UnifiedMainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setCornerWidget(self._make_popout_btn(), Qt.Corner.TopRightCorner)
-        self.tabs.setCornerWidget(self._make_popout_all_btn(), Qt.Corner.TopLeftCorner)
 
         self.tabs.addTab(self.daq_panel,     "DAQ Control")
         self.tabs.addTab(self.coredaq_panel, "CoreDAQ Power Meter")
@@ -6765,17 +6815,6 @@ class UnifiedMainWindow(QMainWindow):
         btn.setToolTip("Open the active tab in its own window")
         btn.clicked.connect(self._popout_current)
         return btn
-
-    def _make_popout_all_btn(self):
-        btn = QPushButton("⬡⬡  Pop out all tabs")
-        btn.setFixedHeight(24)
-        btn.setToolTip("Open every remaining tab in its own window")
-        btn.clicked.connect(self._popout_all)
-        return btn
-
-    def _popout_all(self):
-        while self.tabs.count() > 0:
-            self._popout_current()
 
     def _popout_current(self):
         idx = self.tabs.currentIndex()
