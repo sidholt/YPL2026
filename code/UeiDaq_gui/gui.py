@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QComboBox, QLineEdit, QCheckBox, QTabWidget, QTextEdit,
     QMessageBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QObject, QEventLoop
 from PyQt6.QtGui import QPalette, QColor
 
 # ── Optional hardware libraries (each tab degrades gracefully) ────────────────
@@ -3691,6 +3691,16 @@ class ConexWorker(QObject):
     error           = pyqtSignal(str)
     op_done         = pyqtSignal(str)          # name of finished operation
 
+    # Hard ceiling on any single hardware call, on top of the VISA-level
+    # motor.timeout (5000 ms, set in do_connect). That VISA timeout is
+    # normally what bounds a query, but — same class of issue as CoreDAQ —
+    # a wedged NI-VISA/serial driver can occasionally block underneath it in
+    # an uninterruptible kernel wait no VISA-level timeout can preempt.
+    # Every _call_with_timeout() call below runs the real call on a
+    # throwaway daemon thread so this worker thread (and therefore the app)
+    # is never the one stuck.
+    HW_TIMEOUT_S = 7.0
+
     def __init__(self):
         super().__init__()
         self._motor = None
@@ -3698,11 +3708,37 @@ class ConexWorker(QObject):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def _call_with_timeout(self, func, *args, **kwargs):
+        """Runs a blocking VISA/serial call on a throwaway daemon thread with a
+        hard timeout, so a wedged call can't freeze this worker thread (or the
+        whole app) unkillably. NOTE: the CoreDAQ worker deliberately does NOT
+        use this pattern — its poll loop ran often enough that the per-call
+        thread churn became the freeze, so it calls the hardware directly on
+        its own worker thread instead (see CoreDAQWorker._call)."""
+        result = {}
+        def _run():
+            try:
+                result['value'] = func(*args, **kwargs)
+            except Exception as e:
+                result['error'] = e
+            finally:
+                result['done'] = True
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(self.HW_TIMEOUT_S)
+        if not result.get('done'):
+            raise TimeoutError(
+                f"Conex motor stopped responding (no reply within {self.HW_TIMEOUT_S:.0f}s) "
+                "— the serial connection is likely wedged. Unplug/replug the controller.")
+        if 'error' in result:
+            raise result['error']
+        return result['value']
+
     def _query(self, cmd: str) -> str:
-        return self._motor.query(cmd)
+        return self._call_with_timeout(self._motor.query, cmd)
 
     def _write(self, cmd: str):
-        self._motor.write(cmd)
+        self._call_with_timeout(self._motor.write, cmd)
 
     def _get_state_code(self) -> str:
         resp = self._query("1TS")
@@ -3744,18 +3780,32 @@ class ConexWorker(QObject):
 
     def do_connect(self, port: int):
         try:
+            if self._motor is not None:
+                # Reconnecting (e.g. double-clicked Connect, or retry after a
+                # failed attempt) — release the old handle first so it can't
+                # leak the port open and make this attempt fail as "busy".
+                try:
+                    self._call_with_timeout(self._motor.close)
+                except Exception:
+                    pass
+                self._motor = None
             if self._rm is None:
                 self._rm = pyvisa.ResourceManager()
             address = f"ASRL{port}::INSTR"
-            self._motor = self._rm.open_resource(address)
-            self._motor.baud_rate       = 921600
-            self._motor.data_bits       = 8
-            self._motor.parity          = pyvisa.constants.Parity.none
-            self._motor.stop_bits       = pyvisa.constants.StopBits.one
-            self._motor.flow_control    = pyvisa.constants.ControlFlow.xon_xoff
-            self._motor.write_termination = '\r\n'
-            self._motor.read_termination  = '\r\n'
-            self._motor.timeout         = 5000
+            motor = self._call_with_timeout(self._rm.open_resource, address)
+            try:
+                motor.baud_rate       = 921600
+                motor.data_bits       = 8
+                motor.parity          = pyvisa.constants.Parity.none
+                motor.stop_bits       = pyvisa.constants.StopBits.one
+                motor.flow_control    = pyvisa.constants.ControlFlow.xon_xoff
+                motor.write_termination = '\r\n'
+                motor.read_termination  = '\r\n'
+                motor.timeout         = 5000
+            except Exception:
+                self._call_with_timeout(motor.close)
+                raise
+            self._motor = motor
             self.log_message.emit(f"Connected to COM{port}")
             self.status_changed.emit("CONNECTED")
             self._refresh()
@@ -3875,7 +3925,7 @@ class ConexWorker(QObject):
         try:
             if self._rm is None:
                 self._rm = pyvisa.ResourceManager()
-            resources = self._rm.list_resources()
+            resources = self._call_with_timeout(self._rm.list_resources)
             self.log_message.emit(f"VISA resources: {resources}")
             self.op_done.emit("list_resources")
         except Exception as e:
@@ -3892,7 +3942,7 @@ class ConexWorker(QObject):
     def do_disconnect(self):
         try:
             if self._motor:
-                self._motor.close()
+                self._call_with_timeout(self._motor.close)
                 self._motor = None
             self.status_changed.emit("DISCONNECTED")
             self.log_message.emit("Disconnected from motor")
@@ -3971,6 +4021,9 @@ class ConexPanel(QWidget):
         self._worker.op_done.connect(self._on_op_done)
 
         self._build_ui()
+
+        # auto-connect on launch using the saved COM port, same as SantecPanel
+        self._do_connect()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -5187,6 +5240,14 @@ class SantecWorker(QObject):
 
     def do_connect(self, gpib_addr: int, prologix_port: int):
         try:
+            if self._laser is not None:
+                # Reconnecting — release the old handle first so it can't
+                # leak the port open and make this attempt fail as "busy".
+                try:
+                    self._laser.close()
+                except Exception:
+                    pass
+                self._laser = None
             device_name = f"Prologix::{gpib_addr}::ASRL{prologix_port}::INSTR"
             self._laser = TSL550(device_name=device_name, force_connect=True)
             self.status_changed.emit("CONNECTED")
@@ -5836,7 +5897,14 @@ class SantecPanel(QWidget):
 
         # Pause CoreDAQ's own ~5 Hz poll loop \u2014 it shares the same serial
         # connection the sweep worker is about to drive directly.
-        self._coredaq_panel.pause_polling()
+        if not self._coredaq_panel.pause_polling():
+            QMessageBox.warning(
+                self, "Fast Sweep",
+                "CoreDAQ isn't responding (a poll call may be stuck on a "
+                "hardware read) \u2014 refusing to start Fast Sweep since it "
+                "would touch the same serial connection concurrently. "
+                "Try reconnecting the CoreDAQ panel.")
+            return
 
         self._fast_sweep_result  = None
         self._fast_sweep_running = True
@@ -6035,8 +6103,18 @@ class CoreDAQWorker(QObject):
     log_message     = pyqtSignal(str)
     error           = pyqtSignal(str)
     op_done         = pyqtSignal(str)
+    poll_paused     = pyqtSignal()
 
     LABEL_HZ = 10.0   # wall-clock throttle for numeric-label refresh + extra snapshot_mV() call
+
+    # Minimum spacing between poll ticks. The poll loop is self-chained (the
+    # next tick is scheduled only after the current one finishes), so this is
+    # a floor, not a fixed rate — the real cadence is whatever the slower of
+    # this interval and the serial round-trip time works out to. A small
+    # non-zero floor (vs. the old singleShot(0) "as fast as possible") keeps
+    # the worker thread from pegging a core and starving the GUI thread of
+    # the GIL, which is what made the whole app feel frozen while connected.
+    POLL_INTERVAL_MS = 15
 
     def __init__(self):
         super().__init__()
@@ -6064,13 +6142,32 @@ class CoreDAQWorker(QObject):
         self._last_label_emit_t = 0.0
         self._err_count = 0
 
+    def _call(self, func, *args, **kwargs):
+        """Invoke a blocking CoreDAQ serial call directly on this worker thread.
+
+        This used to run every call on a throwaway daemon thread with a hard
+        timeout, so a wedged read could never block the worker. That backfired
+        badly: the poll loop spawned hundreds of short-lived daemon threads per
+        second, and the resulting GIL contention/thread churn made the whole
+        GUI unresponsive. Worse, a timed-out call abandoned a live daemon
+        thread that still held the serial port open, so the COM port stayed
+        locked until a reboot.
+
+        CoreDAQ's own pyserial read timeout (0.15 s) already bounds normal
+        calls, and because this runs on the worker QThread (not the GUI
+        thread), even a rare hard wedge only stalls this one background thread
+        and stops the tab updating — the rest of the app stays usable. This is
+        the same direct-call model the reliable reference GUI uses."""
+        return func(*args, **kwargs)
+
     def do_connect(self, port: str):
         # Defensive: release any handle we're still holding from a prior
         # attempt before opening a new one, so we're never the reason a
-        # retry fails with "port already open".
+        # retry fails with "port already open". Bounded like every other
+        # hardware call — close() can itself block on a wedged port.
         if self._daq is not None:
             try:
-                self._daq.close()
+                self._call(self._daq.close)
             except Exception:
                 pass
             self._daq = None
@@ -6082,18 +6179,18 @@ class CoreDAQWorker(QObject):
             if port.isdigit():
                 port = f"COM{port}"
             if port:
-                daq = CoreDAQ(port)
+                daq = self._call(CoreDAQ, port)
             else:
-                ports = CoreDAQ.find()
+                ports = self._call(CoreDAQ.find)
                 if not ports:
                     self.error.emit("No CoreDAQ device found — check USB connection")
                     return
                 self.log_message.emit(f"Auto-detected CoreDAQ on {ports[0]}")
-                daq = CoreDAQ(ports[0])
+                daq = self._call(CoreDAQ, ports[0])
             self._daq = daq
-            idn       = self._daq.idn()
-            frontend  = self._daq.frontend_type()
-            detector  = self._daq.detector_type()
+            idn       = self._call(self._daq.idn)
+            frontend  = self._call(self._daq.frontend_type)
+            detector  = self._call(self._daq.detector_type)
             # Fresh connection: drop any stale samples from a previous device
             # so the plot window doesn't briefly show old data.
             self.plot_write_index   = 0
@@ -6105,7 +6202,7 @@ class CoreDAQWorker(QObject):
             self.log_message.emit(f"Connected — {idn}")
             self.op_done.emit("connect")
             self._polling = True
-            QTimer.singleShot(0, self.do_poll)
+            QTimer.singleShot(self.POLL_INTERVAL_MS, self.do_poll)
         except PermissionError as e:
             self.error.emit(
                 f"Connect failed: {e} — port is already open elsewhere "
@@ -6121,7 +6218,7 @@ class CoreDAQWorker(QObject):
         if not self._polling or self._daq is None:
             return
         try:
-            power_w = self._daq.snapshot_W()
+            power_w = self._call(self._daq.snapshot_W)
             data = np.asarray(power_w[:4], dtype=np.float32)
             self._last_power_w = tuple(float(x) for x in power_w[:4])
 
@@ -6134,29 +6231,32 @@ class CoreDAQWorker(QObject):
 
             if (now - self._last_label_emit_t) >= (1.0 / self.LABEL_HZ):
                 self._last_label_emit_t = now
-                mv, gains = self._daq.snapshot_mV()
+                mv, gains = self._call(self._daq.snapshot_mV)
                 self.raw_update.emit(list(power_w[:4]), list(mv[:4]), list(gains[:4]))
         except Exception as e:
             self._err_count += 1
             if self._err_count % 200 == 1:
                 self.error.emit(f"Poll error (×{self._err_count}): {e}")
         finally:
-            # Chain the next tick only once this one is done — never race
-            # ahead of the actual serial round-trip time.
+            # Chain the next tick only once this one is done, paced by
+            # POLL_INTERVAL_MS so the loop never busy-spins the worker thread.
             if self._polling:
-                QTimer.singleShot(0, self.do_poll)
+                QTimer.singleShot(self.POLL_INTERVAL_MS, self.do_poll)
 
     def do_pause_poll(self):
-        """Stops the self-pacing loop. Runs on this worker thread, invoked
-        via a blocking queued connection so the caller (Fast Sweep, which
-        is about to touch the raw CoreDAQ handle from a different thread)
-        knows for certain no poll is in flight once this returns."""
+        """Stops the self-pacing loop and confirms via poll_paused so the
+        caller (Fast Sweep, which is about to touch the raw CoreDAQ handle
+        from a different thread) knows no poll is in flight. Queued
+        (non-blocking) — if a poll call is currently wedged in a hardware
+        read, this request simply waits behind it in this thread's own
+        queue instead of also blocking the GUI thread."""
         self._polling = False
+        self.poll_paused.emit()
 
     def do_resume_poll(self):
         if self._daq is not None and not self._polling:
             self._polling = True
-            QTimer.singleShot(0, self.do_poll)
+            QTimer.singleShot(self.POLL_INTERVAL_MS, self.do_poll)
 
     def get_display_data(self):
         """
@@ -6192,7 +6292,7 @@ class CoreDAQWorker(QObject):
 
     def do_set_gain(self, head: int, value: int):
         try:
-            self._daq.set_gain(head, value)
+            self._call(self._daq.set_gain, head, value)
             self.log_message.emit(f"Head {head} gain set to G{value}")
             self.op_done.emit("set_gain")
         except Exception as e:
@@ -6200,7 +6300,7 @@ class CoreDAQWorker(QObject):
 
     def do_set_wavelength(self, nm: float):
         try:
-            self._daq.set_wavelength_nm(nm)
+            self._call(self._daq.set_wavelength_nm, nm)
             self.log_message.emit(f"Measurement wavelength set to {nm:.2f} nm")
             self.op_done.emit("set_wavelength")
         except Exception as e:
@@ -6208,13 +6308,18 @@ class CoreDAQWorker(QObject):
 
     def do_disconnect(self):
         self._polling = False
+        daq = self._daq
+        self._daq = None
+        # Reflect the disconnect in the UI first, then do the (possibly slow)
+        # port close. That way the GUI flips to DISCONNECTED immediately even
+        # if close() blocks briefly on a sluggish link, instead of looking
+        # like the button did nothing.
+        self.status_changed.emit("DISCONNECTED")
+        self.op_done.emit("disconnect")
         try:
-            if self._daq is not None:
-                self._daq.close()
-                self._daq = None
-            self.status_changed.emit("DISCONNECTED")
+            if daq is not None:
+                self._call(daq.close)
             self.log_message.emit("Disconnected from CoreDAQ")
-            self.op_done.emit("disconnect")
         except Exception as e:
             self.error.emit(f"Disconnect error: {e}")
 
@@ -6232,7 +6337,12 @@ class CoreDAQPanel(QWidget):
     _sig_set_wl        = pyqtSignal(float)
     _sig_disconnect    = pyqtSignal()
 
-    DISPLAY_MS = 16   # ~60 Hz plot redraw, decoupled from the poll/acquire rate
+    DISPLAY_MS = 33   # ~30 Hz plot redraw, decoupled from the poll/acquire rate
+    MAX_PLOT_POINTS = 1500   # cap points handed to pyqtgraph per curve per redraw —
+                              # a fast poll rate can fill the 5s window with several
+                              # thousand samples/channel, and re-rendering all of them
+                              # 30x/sec was enough GUI-thread work to make the tab feel
+                              # frozen even though nothing was actually stuck
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6258,11 +6368,10 @@ class CoreDAQPanel(QWidget):
         self._thread.start()
 
         self._sig_connect.connect(self._worker.do_connect)
-        # Blocking so pause_polling() only returns once the worker thread
-        # has actually stopped — required before Fast Sweep touches the raw
-        # CoreDAQ handle from its own thread. Resume doesn't need to block.
-        self._sig_pause_poll.connect(self._worker.do_pause_poll,
-                                      Qt.ConnectionType.BlockingQueuedConnection)
+        # Queued (not blocking): pause_polling() below waits for poll_paused
+        # itself, via a QEventLoop with a timeout, so a poll call wedged in
+        # a hardware read can never freeze the GUI thread — see pause_polling().
+        self._sig_pause_poll.connect(self._worker.do_pause_poll)
         self._sig_resume_poll.connect(self._worker.do_resume_poll)
         self._sig_set_gain.connect(self._worker.do_set_gain)
         self._sig_set_wl.connect(self._worker.do_set_wavelength)
@@ -6278,16 +6387,19 @@ class CoreDAQPanel(QWidget):
         # Independent redraw timer — reads the worker's ring buffer directly
         # (get_display_data() is a plain, allocation-free method call, not a
         # queued signal) so plot refresh rate never depends on how fast the
-        # serial link can actually sustain do_poll() ticks.
+        # serial link can actually sustain do_poll() ticks. Left stopped here:
+        # the live plot is hidden by default and only starts redrawing when the
+        # user ticks "Show live plot" (see _on_show_plot_toggled). Keeping it
+        # off by default removes a continuous 30 Hz GUI-thread render load.
         self._display_timer = QTimer()
         self._display_timer.setInterval(self.DISPLAY_MS)
         self._display_timer.timeout.connect(self._update_live_plot)
-        self._display_timer.start()
 
         self._build_ui()
 
-        # auto-connect on launch using the saved port
-        self._do_connect()
+        # Auto-connect on launch was removed: a wedged/blocking serial read
+        # here froze the whole GUI at startup, unrecoverable short of a
+        # reboot. Connect manually via the button instead.
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -6319,7 +6431,7 @@ class CoreDAQPanel(QWidget):
 
         self._disconnect_btn = QPushButton("DISCONNECT")
         self._disconnect_btn.setEnabled(False)
-        self._disconnect_btn.clicked.connect(lambda: self._sig_disconnect.emit())
+        self._disconnect_btn.clicked.connect(self._do_disconnect)
         conn_lay.addWidget(self._disconnect_btn, 3, 0, 1, 2)
 
         conn_lay.addWidget(QLabel("IDN:"), 4, 0)
@@ -6396,8 +6508,22 @@ class CoreDAQPanel(QWidget):
         ch_lay.setRowStretch(4, 1)
         root.addWidget(ch_box, stretch=1)
 
+        # ── Live plot toggle — OFF by default ────────────────────────────────
+        # The live plot is the single most expensive thing this tab does
+        # (a 30 Hz GUI-thread redraw of up to 4×1500 points). It stays hidden
+        # and un-timed until the user opts in, so simply connecting and reading
+        # the numeric channel values never pays that cost.
+        self._show_plot_chk = QCheckBox("Show live plot")
+        self._show_plot_chk.setChecked(False)
+        self._show_plot_chk.setToolTip(
+            "Off by default. The rolling per-channel plot is CPU-heavy; enable "
+            "it only when you need to watch the waveform.")
+        self._show_plot_chk.toggled.connect(self._on_show_plot_toggled)
+        final.addWidget(self._show_plot_chk)
+
         # ── Live plot — rolling per-channel power vs time ────────────────────
         plot_box = QGroupBox(f"Live Plot  (last {COREDAQ_PLOT_WINDOW_S:.0f} s)")
+        self._plot_box = plot_box
         plot_grid = QGridLayout(plot_box)
         self._live_plots = []
         if HAS_PYQTGRAPH:
@@ -6429,6 +6555,7 @@ class CoreDAQPanel(QWidget):
                 self._live_plots.append((pw, curve))
         else:
             plot_grid.addWidget(QLabel("pyqtgraph required for live plots"), 0, 0)
+        plot_box.setVisible(False)   # hidden until "Show live plot" is ticked
         final.addWidget(plot_box)
 
         # ── Bottom: Log ───────────────────────────────────────────────────────
@@ -6454,6 +6581,10 @@ class CoreDAQPanel(QWidget):
                 for pw, curve in self._live_plots:
                     curve.setData([], [])
                     pw.setYRange(-COREDAQ_Y_SPAN_NW / 2, COREDAQ_Y_SPAN_NW / 2, padding=0)
+            # Re-sync the redraw timer to the checkbox: on a reconnect the plot
+            # should resume automatically if "Show live plot" is still ticked.
+            if self._show_plot_chk.isChecked() and not self._display_timer.isActive():
+                self._display_timer.start()
             # Polling itself is started/stopped by the worker (do_connect /
             # do_disconnect) — it lives entirely on the worker thread now.
         else:
@@ -6481,6 +6612,23 @@ class CoreDAQPanel(QWidget):
             g = gains[i] if i < len(gains) else 0
             self._raw_lbls[i].setText(f"{mv[i]:.2f} mV  (G{g})")
 
+    def _on_show_plot_toggled(self, checked: bool):
+        """Show/hide the live plot and start/stop its redraw timer. While
+        hidden, the timer is stopped so the tab does zero plotting work —
+        polling and the numeric readouts keep running regardless."""
+        self._plot_box.setVisible(checked)
+        if checked:
+            # Clear any stale curve/range left from a previous session so the
+            # first frame starts clean, then begin redrawing.
+            if HAS_PYQTGRAPH:
+                self._y_center = [None, None, None, None]
+                for pw, curve in self._live_plots:
+                    curve.setData([], [])
+                    pw.setYRange(-COREDAQ_Y_SPAN_NW / 2, COREDAQ_Y_SPAN_NW / 2, padding=0)
+            self._display_timer.start()
+        else:
+            self._display_timer.stop()
+
     def _update_live_plot(self):
         """Called by the independent ~30 Hz display timer — pulls whatever the
         worker's ring buffer currently holds. Decoupled from the acquisition
@@ -6505,8 +6653,18 @@ class CoreDAQPanel(QWidget):
         rel = rel[mask]
         if rel.size == 0:
             return
+        # Decimate before handing anything to pyqtgraph — a fast poll rate
+        # can put several thousand points/channel in the window, and
+        # setData() on the full array every redraw is real GUI-thread work
+        # that scales with point count regardless of how fast the plot
+        # itself renders.
+        mask_idx = np.nonzero(mask)[0]
+        if rel.size > self.MAX_PLOT_POINTS:
+            step = rel.size // self.MAX_PLOT_POINTS
+            rel = rel[::step]
+            mask_idx = mask_idx[::step]
         for ch, (pw, curve) in enumerate(self._live_plots):
-            y_nw = data[ch, :count][mask] * 1e9   # W -> nW
+            y_nw = data[ch, :count][mask_idx] * 1e9   # W -> nW
             curve.setData(rel, y_nw, connect='all')
 
             latest  = float(y_nw[-1])
@@ -6542,19 +6700,52 @@ class CoreDAQPanel(QWidget):
         save_connection_setting("coredaq_port", port)
         self._sig_connect.emit(port)
 
+    def _do_disconnect(self):
+        """Disconnect with instant UI feedback. Flipping the worker's
+        `_polling` flag off here (a plain bool the worker thread also reads)
+        stops the poll loop from re-arming right away, and updating the UI on
+        this GUI thread means the button always responds immediately — even if
+        the worker is momentarily busy in a serial call and can't process the
+        queued do_disconnect for a few ms. The worker still performs the real
+        port close() when it picks up the signal."""
+        if hasattr(self, "_worker"):
+            self._worker._polling = False
+        self._on_status("DISCONNECTED")
+        self._on_op_done("disconnect")
+        self._sig_disconnect.emit()
+
     # ── Public API (used by DAQPanel sweep↔power logging) ──────────────────
 
     def latest_power_w(self):
         """Last cached (head1..head4) watts snapshot, or None if not connected."""
         return self._worker._last_power_w if self._connected else None
 
-    def pause_polling(self):
+    def pause_polling(self, timeout_ms: int = 3000) -> bool:
         """Stops the live poll loop — must not run concurrently with a Fast
         Sweep's direct hardware access, since they share one serial
-        connection. Blocks until the worker thread confirms polling has
-        actually stopped (no fixed sleep-and-hope needed)."""
-        if self._connected:
-            self._sig_pause_poll.emit()
+        connection. Waits (pumping the GUI event loop, not freezing it) for
+        the worker thread to confirm polling has actually stopped, up to
+        timeout_ms. Returns False on timeout — e.g. a poll call is wedged
+        in a hardware read — in which case the caller must NOT touch the
+        raw CoreDAQ handle, since the worker thread still owns it.
+        Previously this used Qt.ConnectionType.BlockingQueuedConnection,
+        which blocked the GUI thread with no timeout — a single stuck
+        serial read froze the entire application, unrecoverable even via
+        Task Manager (the thread was wedged in uninterruptible kernel I/O)."""
+        if not self._connected:
+            return True
+        loop = QEventLoop()
+        confirmed = False
+        def _on_confirmed():
+            nonlocal confirmed
+            confirmed = True
+            loop.quit()
+        self._worker.poll_paused.connect(_on_confirmed)
+        QTimer.singleShot(timeout_ms, loop.quit)
+        self._sig_pause_poll.emit()
+        loop.exec()
+        self._worker.poll_paused.disconnect(_on_confirmed)
+        return confirmed
 
     def resume_polling(self):
         if self._connected:

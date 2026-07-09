@@ -26,6 +26,7 @@ class VisaDevice:
         self.id_cmd = id_cmd
         self._is_binary = not isinstance(id_cmd, str)
         self.read_buffer_len = read_buffer_len
+        self._last_open_error: Optional[Exception] = None
         
         # Pull the force_connect flag from kwargs
         self.force_connect = kwargs.get('force_connect', False)
@@ -58,7 +59,8 @@ class VisaDevice:
             device = self._find_device_by_identifier(resource_manager=rm, identifier=identifier)
 
         if device is None:
-            raise Exception(f"{self.__class__.__name__} with identifier={identifier!a}, device_name={device_name!a}, not found.")
+            reason = f" ({self._last_open_error})" if self._last_open_error else ""
+            raise Exception(f"{self.__class__.__name__} with identifier={identifier!a}, device_name={device_name!a}, not found.{reason}")
 
         self._device_name = device.resource_name
         
@@ -86,19 +88,27 @@ class VisaDevice:
                 this_device = self.active_devices[device_name]
             else:
                 this_device = resource_manager.open_resource(device_name)
-        except Exception:
+        except Exception as e:
+            self._last_open_error = e
             return None
 
-        this_device = self.pre_initialization(this_device)
-        
-        # Immediately return the device if we are forcing the connection
-        if self.force_connect:
-            return self.post_initialization(this_device)
-            
         try:
-            this_identifier = self.static_query(this_device, self.id_cmd, self.read_buffer_len)
+            this_device = self.pre_initialization(this_device)
+
+            # Immediately return the device if we are forcing the connection
+            if self.force_connect:
+                return self.post_initialization(this_device)
+
+            try:
+                this_identifier = self.static_query(this_device, self.id_cmd, self.read_buffer_len)
+            except Exception:
+                this_identifier = None
         except Exception:
-            this_identifier = None
+            # pre_initialization (e.g. the Prologix ++mode handshake) failed —
+            # close the handle now instead of leaking an open port that makes
+            # every subsequent connect attempt fail with "resource busy".
+            this_device.close()
+            raise
 
         if this_identifier is None:
             this_device.close()
@@ -163,17 +173,24 @@ class VisaDevice:
 
         rm = pyvisa.ResourceManager(self.visa_library)
         this_device = rm.open_resource(self.device_name)
-        this_device = self.pre_initialization(this_device)
-        this_device = self.post_initialization(this_device)
+        try:
+            this_device = self.pre_initialization(this_device)
+            this_device = self.post_initialization(this_device)
 
-        if not self.force_connect:
-            if self._is_binary:
-                this_device.write_raw(self.id_cmd)
-                if this_device.read_bytes(self.read_buffer_len) != self.__identifier:
-                    raise Exception(f"Device {self.device_name!a} is not the expected device.")
-            else:
-                if this_device.query(self.id_cmd).strip() != self.identifier:
-                    raise Exception(f"Device {self.device_name!a} is not the expected device.")
+            if not self.force_connect:
+                if self._is_binary:
+                    this_device.write_raw(self.id_cmd)
+                    if this_device.read_bytes(self.read_buffer_len) != self.__identifier:
+                        raise Exception(f"Device {self.device_name!a} is not the expected device.")
+                else:
+                    if this_device.query(self.id_cmd).strip() != self.identifier:
+                        raise Exception(f"Device {self.device_name!a} is not the expected device.")
+        except Exception:
+            # Don't leak the handle on a failed handshake/identity check —
+            # otherwise the port stays locked and every retry fails with
+            # "resource busy" until the whole app is restarted.
+            this_device.close()
+            raise
 
         self.active_devices.add_id(id(self), this_device)
 
