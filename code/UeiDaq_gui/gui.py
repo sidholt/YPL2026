@@ -50,6 +50,16 @@ except ImportError:
     print("[WARNING] pyqtgraph not found — plots disabled. Run: uv pip install pyqtgraph")
 
 try:
+    import matplotlib
+    matplotlib.use("QtAgg")
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("[WARNING] matplotlib not found — Santec Fast Sweep plot disabled. Run: uv pip install matplotlib")
+
+try:
     from moku.instruments import Oscilloscope
     HAS_MOKU = True
 except ImportError:
@@ -224,6 +234,28 @@ AO_CHANNEL_NAMES_FILE = os.path.join(os.path.dirname(__file__), "ao_channel_name
 
 CONNECTION_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "connection_settings.json")
 
+# Saved sweep/recording CSVs go here — anchored to this script's own location
+# (gui.py's dir -> code -> project root -> "data") instead of a hardcoded
+# absolute path. This file used to live at C:\Users\sih93\Desktop\Sid\GUI and
+# a hardcoded data_dir pointed there; after the project moved to the
+# OneDrive-synced folder, every save kept silently writing into that old,
+# no-longer-visited, unsynced local folder instead of anywhere the user
+# looked (or OneDrive backed up). Deriving it from __file__ means it always
+# resolves inside wherever the project actually lives.
+DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data")
+
+
+def open_saved_file(path: str) -> None:
+    """Opens a just-saved file with its default Windows application (e.g.
+    Excel for .csv) — one click of a Save/Export button gets you a saved
+    file AND a view of it, instead of a second manual trip through File
+    Explorer to find it."""
+    try:
+        os.startfile(path)
+    except Exception as e:
+        print(f"[OpenFile] Failed to open {path}: {e}")
+
 
 def load_connection_settings() -> dict:
     """Last-used IP/port/address per device, keyed by a short device tag."""
@@ -280,7 +312,7 @@ READBACK_DECIMALS      = 6
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 PROMICRO_PLOT_WINDOW_S = 10.0
-COREDAQ_PLOT_WINDOW_S  = 10.0
+COREDAQ_PLOT_WINDOW_S  = 30.0
 
 PROMICRO_PORT = "COM11"
 PROMICRO_BAUD = 9600
@@ -2048,7 +2080,7 @@ class PinConfigView(QWidget):
         import csv, datetime
         if not self._rec_records or self.card_session is None:
             return
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         mode  = self.card_session.mode
         dev   = self.card_session.dev
@@ -2083,6 +2115,7 @@ class PinConfigView(QWidget):
                             [f"{v:.4f}" for v in r['daq']])
         print(f"[Recording] Saved {len(self._rec_records)} rows → {fname}")
         self._status(f"Saved {len(self._rec_records)} samples → {fname}")
+        open_saved_file(fname)
 
     def _show_plots(self):
         if not self._rec_records or self.card_session is None:
@@ -2183,7 +2216,7 @@ class PinConfigView(QWidget):
             return
         import datetime
         cs = self.card_session
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"ao_sweep_coredaq_{stamp}.csv")
@@ -2196,6 +2229,7 @@ class PinConfigView(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[Sweep] Saved {len(rows)} rows → {fname}")
         self._status(f"Saved {len(rows)} sweep/power rows → {fname}")
+        open_saved_file(fname)
 
     def _sb_changed(self, idx, val):
         if self._syncing: return
@@ -3511,7 +3545,7 @@ class ITLAPanel(QWidget):
         if not self._sweep_power_log:
             return
         import datetime
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"itla_sweep_coredaq_{stamp}.csv")
@@ -3528,6 +3562,7 @@ class ITLAPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[ITLA Sweep] Saved {len(rows)} rows → {fname}")
         self._status(f"Saved {len(rows)} sweep/power rows → {fname}")
+        open_saved_file(fname)
 
     def _show_power_sweep_plot(self):
         series = {}
@@ -3545,7 +3580,7 @@ class ITLAPanel(QWidget):
         if not self._power_sweep_log:
             return
         import datetime
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"itla_power_sweep_coredaq_{stamp}.csv")
@@ -3562,6 +3597,7 @@ class ITLAPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[ITLA Power Sweep] Saved {len(rows)} rows → {fname}")
         self._status(f"Saved {len(rows)} power-sweep rows → {fname}")
+        open_saved_file(fname)
 
     # ── Button handlers ───────────────────────────────────────────────────────
 
@@ -5061,7 +5097,7 @@ class HP8168FPanel(QWidget):
         if not self._sweep_power_log:
             return
         import datetime
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"hp8168f_sweep_coredaq_{stamp}.csv")
@@ -5078,6 +5114,7 @@ class HP8168FPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[HP-8168F Sweep] Saved {len(rows)} rows → {fname}")
         self._log.append(f"Saved {len(rows)} sweep/power rows → {fname}")
+        open_saved_file(fname)
 
     def _show_power_sweep_plot(self):
         series = {}
@@ -5095,7 +5132,7 @@ class HP8168FPanel(QWidget):
         if not self._power_sweep_log:
             return
         import datetime
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"hp8168f_power_sweep_coredaq_{stamp}.csv")
@@ -5112,6 +5149,7 @@ class HP8168FPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[HP-8168F Power Sweep] Saved {len(rows)} rows → {fname}")
         self._log.append(f"Saved {len(rows)} power-sweep rows → {fname}")
+        open_saved_file(fname)
 
     # ── Button actions ────────────────────────────────────────────────────────
 
@@ -5407,14 +5445,23 @@ class SantecWorker(QObject):
         except Exception as e:
             self.error.emit(f"Set power error: {e}")
 
-    def do_set_output(self, on: bool):
+    def do_set_output(self, on: bool, nm: float = 0.0, mw: float = 0.0):
         # Leaves the laser diode itself running either way — only the shutter
         # is toggled, so this never forces a warm-up/re-lock cycle. Turning
         # the diode fully on/off only ever happens once, right after connect.
         try:
             if on:
+                # Apply the currently-dialed-in wavelength/power BEFORE
+                # opening the shutter, so "Output ON" always starts the
+                # laser emitting at the settings shown on screen instead of
+                # whatever it was last left at.
+                self._laser.wavelength = nm
+                self.wavelength_update.emit(nm)
+                self._laser.power = mw
+                self.power_update.emit(mw)
                 self._laser.on()
                 self._laser.shutter = False
+                self.log_message.emit(f"Wavelength set to {nm:.4f} nm, power set to {mw:.3f} mW")
             else:
                 self._laser.shutter = True
             self.output_update.emit(on)
@@ -5496,7 +5543,7 @@ class SantecPanel(QWidget):
     _sig_connect     = pyqtSignal(int, int)   # gpib_addr, prologix_com_port
     _sig_set_wl      = pyqtSignal(float)
     _sig_set_power   = pyqtSignal(float)
-    _sig_set_output  = pyqtSignal(bool)
+    _sig_set_output  = pyqtSignal(bool, float, float)   # on, wavelength_nm, power_mw
     _sig_power_sweep = pyqtSignal(float, float, float, float)
     _sig_stop_sweep  = pyqtSignal()
     _sig_disconnect  = pyqtSignal()
@@ -5636,8 +5683,8 @@ class SantecPanel(QWidget):
         self._off_btn = QPushButton("Output OFF")
         self._on_btn.setEnabled(False)
         self._off_btn.setEnabled(False)
-        self._on_btn.clicked.connect(lambda: self._sig_set_output.emit(True))
-        self._off_btn.clicked.connect(lambda: self._sig_set_output.emit(False))
+        self._on_btn.clicked.connect(self._do_output_on)
+        self._off_btn.clicked.connect(lambda: self._sig_set_output.emit(False, 0.0, 0.0))
         out_row.addWidget(self._on_btn)
         out_row.addWidget(self._off_btn)
         conn_lay.addLayout(out_row, 6, 0, 1, 2)
@@ -5916,7 +5963,7 @@ class SantecPanel(QWidget):
         if not self._power_sweep_log:
             return
         import datetime
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"santec_power_sweep_coredaq_{stamp}.csv")
@@ -5933,6 +5980,7 @@ class SantecPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[Santec Power Sweep] Saved {len(rows)} rows → {fname}")
         self._log.append(f"Saved {len(rows)} power-sweep rows → {fname}")
+        open_saved_file(fname)
 
     # ── Button actions ────────────────────────────────────────────────────────
 
@@ -5950,6 +5998,17 @@ class SantecPanel(QWidget):
         mw = self._pow_spin.value()
         save_connection_setting("santec_last_power_mw", mw)
         self._sig_set_power.emit(mw)
+
+    def _do_output_on(self):
+        """Output ON also (re-)applies whatever wavelength/power are
+        currently dialed into Manual Control, so turning the laser on
+        always reflects what's set on screen instead of requiring two
+        separate SET! clicks first."""
+        nm = self._wl_spin.value()
+        mw = self._pow_spin.value()
+        save_connection_setting("santec_last_wavelength_nm", nm)
+        save_connection_setting("santec_last_power_mw", mw)
+        self._sig_set_output.emit(True, nm, mw)
 
     def _do_power_sweep(self):
         start = self._pw_start.value()
@@ -6052,12 +6111,17 @@ class SantecPanel(QWidget):
     def _show_fast_sweep_plot(self):
         if not self._fast_sweep_result:
             return
+        if not HAS_MATPLOTLIB:
+            self._log.append(
+                f"<span style='color:{C_RED};'>matplotlib not installed \u2014 "
+                "can't show Fast Sweep plot. Run: uv pip install matplotlib</span>")
+            return
         wavelengths, power_ch = self._fast_sweep_result
         series = {}
         for ch in range(min(4, len(power_ch))):
             ys_nw = [w * 1e9 for w in power_ch[ch]]
             series[f"CoreDAQ Head {ch + 1}"] = (wavelengths, ys_nw, "nW")
-        win = MultiSeriesPlotWindow("Santec Fast Sweep \u2014 CoreDAQ Power", "Wavelength", "nm")
+        win = FastSweepMatplotlibWindow("Santec Fast Sweep \u2014 CoreDAQ Power", "Wavelength", "nm")
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -6068,7 +6132,7 @@ class SantecPanel(QWidget):
             return
         import datetime
         wavelengths, power_ch = self._fast_sweep_result
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"santec_fast_sweep_coredaq_{stamp}.csv")
@@ -6085,6 +6149,7 @@ class SantecPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[Santec Fast Sweep] Saved {len(rows)} rows \u2192 {fname}")
         self._log.append(f"Saved {len(rows)} fast-sweep rows \u2192 {fname}")
+        open_saved_file(fname)
 
     def cleanup(self):
         if HAS_PYVISA and HAS_SANTEC:
@@ -6180,6 +6245,62 @@ class MultiSeriesPlotWindow(QWidget):
                 self._plots[name] = (pw, curve)
             _, curve = self._plots[name]
             curve.setData(xs, ys)
+        self.show()
+        self.raise_()
+
+
+class FastSweepMatplotlibWindow(QWidget):
+    """
+    Matplotlib results window for the Santec Fast Sweep — all CoreDAQ heads
+    overlaid on one white-background axes with a legend you can click to
+    toggle each head, plus the standard Matplotlib pan/zoom/save toolbar.
+    Deliberately separate from MultiSeriesPlotWindow (pyqtgraph, dark theme,
+    one-subplot-per-series grid) used by the other sweep tabs — this is a
+    print/report-friendly look for fast-sweep results specifically.
+    """
+
+    _COLORS = ("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e",
+               "#9467bd", "#17becf", "#8c564b", "#e377c2")
+
+    def __init__(self, title: str, x_label: str, x_unit: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(900, 650)
+        self.setStyleSheet("background-color: white;")
+        self._x_label = x_label
+        self._x_unit  = x_unit
+
+        layout = QVBoxLayout(self)
+        self._fig = Figure(figsize=(9, 6), dpi=100, facecolor="white")
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._ax = self._fig.add_subplot(111, facecolor="white")
+        layout.addWidget(self._canvas)
+        try:
+            from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+            layout.addWidget(NavigationToolbar2QT(self._canvas, self))
+        except Exception:
+            pass
+
+    def show_data(self, series_data: dict):
+        """series_data: {name: (xs, ys, y_unit)}"""
+        self._ax.clear()
+        self._ax.set_facecolor("white")
+        y_unit = ""
+        for i, (name, (xs, ys, unit)) in enumerate(series_data.items()):
+            y_unit = unit or y_unit
+            self._ax.plot(xs, ys, label=name, color=self._COLORS[i % len(self._COLORS)],
+                           linewidth=1.6)
+        x_label = f"{self._x_label} ({self._x_unit})" if self._x_unit else self._x_label
+        y_label = f"Power ({y_unit})" if y_unit else "Power"
+        self._ax.set_xlabel(x_label)
+        self._ax.set_ylabel(y_label)
+        self._ax.set_title(self.windowTitle())
+        self._ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.5, color="#cccccc")
+        self._ax.legend(loc="best", frameon=True, fontsize=9)
+        for side in ("top", "right"):
+            self._ax.spines[side].set_visible(False)
+        self._fig.tight_layout()
+        self._canvas.draw()
         self.show()
         self.raise_()
 
@@ -7088,7 +7209,7 @@ class UnifiedMainWindow(QMainWindow):
         if not self._rec_records:
             return
         import datetime
-        data_dir = r"C:\Users\sih93\Desktop\Sid\GUI\data"
+        data_dir = DATA_DIR
         os.makedirs(data_dir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.join(data_dir, f"global_recording_{stamp}.csv")
@@ -7104,6 +7225,7 @@ class UnifiedMainWindow(QMainWindow):
             header, rows)
         print(f"[Global Recording] Saved {len(rows)} rows → {fname}")
         self.status_bar.showMessage(f"Saved {len(rows)} rows → {fname}", 5000)
+        open_saved_file(fname)
 
     # ── Pop-out ────────────────────────────────────────────────────────────────
 
