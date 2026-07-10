@@ -280,9 +280,7 @@ READBACK_DECIMALS      = 6
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 PROMICRO_PLOT_WINDOW_S = 10.0
-COREDAQ_PLOT_WINDOW_S  = 5.0
-COREDAQ_Y_SPAN_NW      = 10.0   # fixed y-axis span (nW) — recenters instead of autoscaling
-COREDAQ_Y_RECENTER_NW  = 3.0    # recenter once the trace drifts this far from the current center
+COREDAQ_PLOT_WINDOW_S  = 10.0
 
 PROMICRO_PORT = "COM11"
 PROMICRO_BAUD = 9600
@@ -3849,6 +3847,48 @@ class ConexWorker(QObject):
         except Exception as e:
             self.error.emit(f"Move relative error: {e}")
 
+    # Travel limits (mm) for the TRA12CC — jog drives toward these extremes
+    # and relies on do_jog_stop() to halt on button-release.
+    JOG_MIN = 0.0
+    JOG_MAX = 12.0
+
+    def do_jog_start(self, direction: int):
+        """Begin a continuous jog toward a travel limit.
+
+        NON-BLOCKING on purpose: unlike do_move_absolute/relative this fires
+        the move and returns immediately WITHOUT looping in _wait_for_ready().
+        That keeps this worker thread's event loop free so the queued
+        do_jog_stop() (sent the instant the button is released) is processed
+        right away instead of waiting for a blocking move slot to finish.
+        """
+        try:
+            target = self.JOG_MAX if direction > 0 else self.JOG_MIN
+            self._write(f"1PA{target:.4f}")
+            self.status_changed.emit("MOVING")
+            self.log_message.emit(f"Jogging {'▶ (+)' if direction > 0 else '◀ (–)'}… release to stop")
+        except Exception as e:
+            self.error.emit(f"Jog start error: {e}")
+
+    def do_jog_stop(self):
+        try:
+            self._write("ST")
+            self.log_message.emit("Jog stopped")
+            time.sleep(0.15)          # let the stage finish decelerating
+            self._refresh()           # report the real resting position/state
+            self.op_done.emit("jog_stop")
+        except Exception as e:
+            self.error.emit(f"Jog stop error: {e}")
+
+    def do_poll_position(self):
+        """Lightweight position read for live jog feedback — no logging, no
+        op_done, so it can be fired repeatedly from a timer without spam."""
+        try:
+            raw = self._query("1TP")
+            val = round(float(raw.replace("1TP", "").strip()), 4)
+            self.position_update.emit(val)
+        except Exception:
+            pass
+
     def do_set_velocity(self, vel: float):
         try:
             capped = min(vel, 0.4)
@@ -3962,6 +4002,9 @@ class ConexPanel(QWidget):
     _sig_home         = pyqtSignal()
     _sig_move_abs     = pyqtSignal(float)
     _sig_move_rel     = pyqtSignal(float)
+    _sig_jog_start    = pyqtSignal(int)
+    _sig_jog_stop     = pyqtSignal()
+    _sig_poll_pos     = pyqtSignal()
     _sig_set_vel      = pyqtSignal(float)
     _sig_stop         = pyqtSignal()
     _sig_check_pos    = pyqtSignal()
@@ -4000,6 +4043,9 @@ class ConexPanel(QWidget):
         self._sig_home.connect(self._worker.do_home)
         self._sig_move_abs.connect(self._worker.do_move_absolute)
         self._sig_move_rel.connect(self._worker.do_move_relative)
+        self._sig_jog_start.connect(self._worker.do_jog_start)
+        self._sig_jog_stop.connect(self._worker.do_jog_stop)
+        self._sig_poll_pos.connect(self._worker.do_poll_position)
         self._sig_set_vel.connect(self._worker.do_set_velocity)
         self._sig_stop.connect(self._worker.do_stop)
         self._sig_check_pos.connect(self._worker.do_check_position)
@@ -4021,6 +4067,12 @@ class ConexPanel(QWidget):
         self._worker.op_done.connect(self._on_op_done)
 
         self._build_ui()
+
+        # Polls the position ~4×/s while an arrow is held so the readout
+        # tracks the stage during a jog (started/stopped in _start_jog/_stop_jog).
+        self._jog_timer = QTimer(self)
+        self._jog_timer.setInterval(250)
+        self._jog_timer.timeout.connect(lambda: self._sig_poll_pos.emit())
 
         # auto-connect on launch using the saved COM port, same as SantecPanel
         self._do_connect()
@@ -4127,10 +4179,28 @@ class ConexPanel(QWidget):
         self._abs_spin.setDecimals(4)
         self._abs_spin.setSingleStep(0.1)
         move_lay.addWidget(self._abs_spin, 2, 1)
+        # ◀  GO!  ▶ — GO! moves to the absolute position above; the arrows
+        # nudge RELATIVE by that same distance in either direction.
+        abs_btns = QHBoxLayout()
+        abs_btns.setContentsMargins(0, 0, 0, 0)
+        abs_btns.setSpacing(3)
+        self._abs_left_btn = QPushButton("◀")
+        self._abs_left_btn.setEnabled(False)
+        self._abs_left_btn.setToolTip("Move left (negative) by the distance above")
+        self._abs_left_btn.setFixedWidth(32)
+        self._abs_left_btn.clicked.connect(lambda: self._do_abs_arrow(-1))
         self._abs_btn = QPushButton("GO!")
         self._abs_btn.setEnabled(False)
         self._abs_btn.clicked.connect(self._do_move_abs)
-        move_lay.addWidget(self._abs_btn, 2, 2)
+        self._abs_right_btn = QPushButton("▶")
+        self._abs_right_btn.setEnabled(False)
+        self._abs_right_btn.setToolTip("Move right (positive) by the distance above")
+        self._abs_right_btn.setFixedWidth(32)
+        self._abs_right_btn.clicked.connect(lambda: self._do_abs_arrow(1))
+        abs_btns.addWidget(self._abs_left_btn)
+        abs_btns.addWidget(self._abs_btn)
+        abs_btns.addWidget(self._abs_right_btn)
+        move_lay.addLayout(abs_btns, 2, 2)
 
         move_lay.addWidget(QLabel("Move Relative (mm):"), 3, 0)
         self._rel_spin = NoScrollDoubleSpinBox()
@@ -4143,17 +4213,38 @@ class ConexPanel(QWidget):
         self._rel_btn.clicked.connect(self._do_move_rel)
         move_lay.addWidget(self._rel_btn, 3, 2)
 
-        move_lay.addWidget(QLabel("Set Velocity (mm/s):"), 4, 0)
+        # ── Hold-to-move (jog) ────────────────────────────────────────────────
+        # Press and HOLD an arrow to drive continuously at the set velocity;
+        # release to stop. Uses pressed/released instead of clicked.
+        move_lay.addWidget(QLabel("Hold to Move (Jog):"), 4, 0)
+        jog_btns = QHBoxLayout()
+        jog_btns.setContentsMargins(0, 0, 0, 0)
+        jog_btns.setSpacing(3)
+        self._jog_left_btn = QPushButton("◀ Hold")
+        self._jog_left_btn.setEnabled(False)
+        self._jog_left_btn.setToolTip("Hold to jog left (negative); release to stop")
+        self._jog_left_btn.pressed.connect(lambda: self._start_jog(-1))
+        self._jog_left_btn.released.connect(self._stop_jog)
+        self._jog_right_btn = QPushButton("Hold ▶")
+        self._jog_right_btn.setEnabled(False)
+        self._jog_right_btn.setToolTip("Hold to jog right (positive); release to stop")
+        self._jog_right_btn.pressed.connect(lambda: self._start_jog(1))
+        self._jog_right_btn.released.connect(self._stop_jog)
+        jog_btns.addWidget(self._jog_left_btn)
+        jog_btns.addWidget(self._jog_right_btn)
+        move_lay.addLayout(jog_btns, 4, 1, 1, 2)
+
+        move_lay.addWidget(QLabel("Set Velocity (mm/s):"), 5, 0)
         self._vel_spin = NoScrollDoubleSpinBox()
         self._vel_spin.setRange(0.0001, 0.4)
         self._vel_spin.setDecimals(4)
         self._vel_spin.setValue(0.1)
         self._vel_spin.setSingleStep(0.05)
-        move_lay.addWidget(self._vel_spin, 4, 1)
+        move_lay.addWidget(self._vel_spin, 5, 1)
         self._vel_btn = QPushButton("SET!")
         self._vel_btn.setEnabled(False)
         self._vel_btn.clicked.connect(self._do_set_vel)
-        move_lay.addWidget(self._vel_btn, 4, 2)
+        move_lay.addWidget(self._vel_btn, 5, 2)
 
         self._stop_btn = QPushButton("⚠ EMERGENCY STOP ⚠")
         # Always enabled, independent of connect/disconnect state — an
@@ -4162,35 +4253,35 @@ class ConexPanel(QWidget):
         # raised) if there's no motor handle open.
         self._stop_btn.setStyleSheet("background: #B71C1C; color: white; font-weight: bold; font-size: 13px;")
         self._stop_btn.clicked.connect(lambda: self._sig_stop.emit())
-        move_lay.addWidget(self._stop_btn, 5, 0, 1, 3)
+        move_lay.addWidget(self._stop_btn, 6, 0, 1, 3)
 
-        move_lay.addWidget(QLabel("Diagnostics:"), 6, 0, 1, 3)
+        move_lay.addWidget(QLabel("Diagnostics:"), 7, 0, 1, 3)
 
         self._pos_limit_btn = QPushButton("Get Positive Limit")
         self._pos_limit_btn.setEnabled(False)
         self._pos_limit_btn.clicked.connect(lambda: self._sig_pos_limit.emit())
-        move_lay.addWidget(self._pos_limit_btn, 7, 0)
+        move_lay.addWidget(self._pos_limit_btn, 8, 0)
 
         self._neg_limit_btn = QPushButton("Get Negative Limit")
         self._neg_limit_btn.setEnabled(False)
         self._neg_limit_btn.clicked.connect(lambda: self._sig_neg_limit.emit())
-        move_lay.addWidget(self._neg_limit_btn, 7, 1)
+        move_lay.addWidget(self._neg_limit_btn, 8, 1)
 
         self._identity_btn = QPushButton("Get Device Info")
         self._identity_btn.setEnabled(False)
         self._identity_btn.clicked.connect(lambda: self._sig_identity.emit())
-        move_lay.addWidget(self._identity_btn, 8, 0)
+        move_lay.addWidget(self._identity_btn, 9, 0)
 
         self._resources_btn = QPushButton("List VISA Resources")
         self._resources_btn.clicked.connect(lambda: self._sig_list_res.emit())
-        move_lay.addWidget(self._resources_btn, 8, 1)
+        move_lay.addWidget(self._resources_btn, 9, 1)
 
         self._config_btn = QPushButton("Dump All Config (1ZT)")
         self._config_btn.setEnabled(False)
         self._config_btn.clicked.connect(lambda: self._sig_dump_config.emit())
-        move_lay.addWidget(self._config_btn, 8, 2)
+        move_lay.addWidget(self._config_btn, 9, 2)
 
-        move_lay.setRowStretch(9, 1)
+        move_lay.setRowStretch(10, 1)
         root.addWidget(move_box, stretch=1)
 
         # ── Bottom: Log ───────────────────────────────────────────────────────
@@ -4238,14 +4329,18 @@ class ConexPanel(QWidget):
                         self._vel_check_btn]:
                 btn.setEnabled(True)
         elif op == "home":
-            for btn in [self._abs_btn, self._rel_btn, self._vel_btn]:
+            for btn in [self._abs_btn, self._rel_btn, self._vel_btn,
+                        self._abs_left_btn, self._abs_right_btn,
+                        self._jog_left_btn, self._jog_right_btn]:
                 btn.setEnabled(True)
         elif op == "disconnect":
             for btn in [self._home_btn, self._pos_btn, self._vel_check_btn,
                         self._disconnect_btn, self._state_btn,
                         self._identity_btn, self._config_btn,
                         self._pos_limit_btn, self._neg_limit_btn,
-                        self._abs_btn, self._rel_btn, self._vel_btn]:
+                        self._abs_btn, self._rel_btn, self._vel_btn,
+                        self._abs_left_btn, self._abs_right_btn,
+                        self._jog_left_btn, self._jog_right_btn]:
                 btn.setEnabled(False)
 
     # ── Button actions ────────────────────────────────────────────────────────
@@ -4259,6 +4354,22 @@ class ConexPanel(QWidget):
 
     def _do_move_rel(self):
         self._sig_move_rel.emit(self._rel_spin.value())
+
+    def _do_abs_arrow(self, direction: int):
+        """Left/right arrows next to Move Absolute: nudge RELATIVE by the
+        distance in the Move Absolute box, in the chosen direction."""
+        self._sig_move_rel.emit(direction * self._abs_spin.value())
+
+    def _start_jog(self, direction: int):
+        """Button pressed and held — begin a continuous jog and poll the
+        position live so the readout tracks the stage while it moves."""
+        self._sig_jog_start.emit(direction)
+        self._jog_timer.start()
+
+    def _stop_jog(self):
+        """Button released — stop polling and halt the stage."""
+        self._jog_timer.stop()
+        self._sig_jog_stop.emit()
 
     def _do_set_vel(self):
         self._sig_set_vel.emit(self._vel_spin.value())
@@ -6348,7 +6459,6 @@ class CoreDAQPanel(QWidget):
         super().__init__(parent)
         self._connected     = False
         self._frontend_type = None
-        self._y_center      = [None, None, None, None]   # per-channel fixed-span center (nW)
 
         if not HAS_SERIAL or not HAS_COREDAQ:
             lay = QVBoxLayout(self)
@@ -6521,41 +6631,43 @@ class CoreDAQPanel(QWidget):
         self._show_plot_chk.toggled.connect(self._on_show_plot_toggled)
         final.addWidget(self._show_plot_chk)
 
-        # ── Live plot — rolling per-channel power vs time ────────────────────
+        # ── Live plot — all 4 heads on one shared plot ───────────────────────
         plot_box = QGroupBox(f"Live Plot  (last {COREDAQ_PLOT_WINDOW_S:.0f} s)")
         self._plot_box = plot_box
-        plot_grid = QGridLayout(plot_box)
-        self._live_plots = []
+        plot_lay = QVBoxLayout(plot_box)
+        self._live_curves = []
         if HAS_PYQTGRAPH:
             colors = (C_BLUE, C_GOLD, C_GREEN, C_RED)
+            pw = pg.PlotWidget()
+            self._plot_widget = pw
+            pw.setLabel('left', 'Power', units='nW')
+            pw.setLabel('bottom', 'Time', units='s')
+            pw.getAxis('left').enableAutoSIPrefix(False)
+            pw.setMinimumHeight(320)
+            # Render-side speedups: downsample large point counts to the
+            # visible pixel width, clip off-screen data, and skip the
+            # per-point NaN/Inf check (our ring-buffer data is always
+            # finite) — mirrors the lab's assembled_gui.py live-plot setup.
+            pw.plotItem.setDownsampling(auto=True, mode='peak')
+            pw.plotItem.setClipToView(True)
+            pw.setXRange(-COREDAQ_PLOT_WINDOW_S, 0.0, padding=0)
+            # Autorange Y: with all 4 heads sharing one axis, their power
+            # levels can differ a lot (e.g. different gains/detectors), so a
+            # fixed per-channel span no longer makes sense — let pyqtgraph
+            # fit the axis to whatever is currently visible/enabled.
+            pw.enableAutoRange(axis='y', enable=True)
+            # Legend entries are clickable in pyqtgraph — clicking a head's
+            # swatch toggles that curve's visibility, giving show/hide per
+            # head for free (pyqtgraph.LegendItem.ItemSample.mouseClickEvent).
+            legend = pw.addLegend(offset=(10, 10))
             for ch in range(4):
-                pw = pg.PlotWidget()
-                pw.setLabel('left', f'Head {ch + 1}', units='nW')
-                pw.setLabel('bottom', 'Time', units='s')
-                pw.getAxis('left').enableAutoSIPrefix(False)
-                pw.setMinimumHeight(160)
-                # Render-side speedups: downsample large point counts to the
-                # visible pixel width, clip off-screen data, and skip the
-                # per-point NaN/Inf check (our ring-buffer data is always
-                # finite) — mirrors the lab's assembled_gui.py live-plot setup.
-                pw.plotItem.setDownsampling(auto=True, mode='peak')
-                pw.plotItem.setClipToView(True)
-                pw.setXRange(-COREDAQ_PLOT_WINDOW_S, 0.0, padding=0)
-                # Fixed-span Y instead of autorange: autorange rescaled to
-                # whatever min/max happened to be in the 3 s window, which
-                # made an actually-stable signal look like it was swinging
-                # wildly. A constant COREDAQ_Y_SPAN_NW window (recentered in
-                # _update_live_plot only once the trace drifts near an edge)
-                # makes real stability/noise easy to judge by eye.
-                pw.enableAutoRange(axis='y', enable=False)
-                pw.setYRange(-COREDAQ_Y_SPAN_NW / 2, COREDAQ_Y_SPAN_NW / 2, padding=0)
-                curve = pw.plot([], [], pen=pg.mkPen(colors[ch], width=2), skipFiniteCheck=True)
-                row, col = divmod(ch, 2)
-                plot_grid.addWidget(pw, row, col)
-                self._live_plots.append((pw, curve))
+                curve = pw.plot([], [], pen=pg.mkPen(colors[ch], width=2),
+                                 name=f'Head {ch + 1}', skipFiniteCheck=True)
+                self._live_curves.append(curve)
+            plot_lay.addWidget(pw)
         else:
-            plot_grid.addWidget(QLabel("pyqtgraph required for live plots"), 0, 0)
-        plot_box.setVisible(False)   # hidden until "Show live plot" is ticked
+            plot_lay.addWidget(QLabel("pyqtgraph required for live plots"))
+        plot_box.setVisible(False)   # hidden until connected / "Show live plot" ticked
         final.addWidget(plot_box)
 
         # ── Bottom: Log ───────────────────────────────────────────────────────
@@ -6576,11 +6688,9 @@ class CoreDAQPanel(QWidget):
             f"color: {C_BLUE if self._connected else C_RED}; font-weight: bold;")
         self._wl_btn.setEnabled(self._connected)
         if self._connected:
-            self._y_center = [None, None, None, None]
             if HAS_PYQTGRAPH:
-                for pw, curve in self._live_plots:
+                for curve in self._live_curves:
                     curve.setData([], [])
-                    pw.setYRange(-COREDAQ_Y_SPAN_NW / 2, COREDAQ_Y_SPAN_NW / 2, padding=0)
             # Re-sync the redraw timer to the checkbox: on a reconnect the plot
             # should resume automatically if "Show live plot" is still ticked.
             if self._show_plot_chk.isChecked() and not self._display_timer.isActive():
@@ -6618,13 +6728,11 @@ class CoreDAQPanel(QWidget):
         polling and the numeric readouts keep running regardless."""
         self._plot_box.setVisible(checked)
         if checked:
-            # Clear any stale curve/range left from a previous session so the
+            # Clear any stale curve left from a previous session so the
             # first frame starts clean, then begin redrawing.
             if HAS_PYQTGRAPH:
-                self._y_center = [None, None, None, None]
-                for pw, curve in self._live_plots:
+                for curve in self._live_curves:
                     curve.setData([], [])
-                    pw.setYRange(-COREDAQ_Y_SPAN_NW / 2, COREDAQ_Y_SPAN_NW / 2, padding=0)
             self._display_timer.start()
         else:
             self._display_timer.stop()
@@ -6663,16 +6771,9 @@ class CoreDAQPanel(QWidget):
             step = rel.size // self.MAX_PLOT_POINTS
             rel = rel[::step]
             mask_idx = mask_idx[::step]
-        for ch, (pw, curve) in enumerate(self._live_plots):
+        for ch, curve in enumerate(self._live_curves):
             y_nw = data[ch, :count][mask_idx] * 1e9   # W -> nW
             curve.setData(rel, y_nw, connect='all')
-
-            latest  = float(y_nw[-1])
-            center  = self._y_center[ch]
-            if center is None or abs(latest - center) > COREDAQ_Y_RECENTER_NW:
-                self._y_center[ch] = latest
-                pw.setYRange(latest - COREDAQ_Y_SPAN_NW / 2,
-                             latest + COREDAQ_Y_SPAN_NW / 2, padding=0)
 
     def _on_log(self, msg: str):
         self._log.append(msg)
@@ -6687,6 +6788,12 @@ class CoreDAQPanel(QWidget):
             self._connect_btn.setEnabled(False)
             self._disconnect_btn.setEnabled(True)
             self._port_edit.setEnabled(False)
+            # Auto-show the live plot on every successful connect. setChecked
+            # only fires _on_show_plot_toggled (which shows the box + starts
+            # the redraw timer) when the box wasn't already checked; if it
+            # was, _on_status (fired just before this) already resumed the
+            # timer, so there's no gap either way.
+            self._show_plot_chk.setChecked(True)
             print(f"[CoreDAQ] Connected — {self._idn_lbl.text()}")
         elif op == "disconnect":
             self._connect_btn.setEnabled(True)
