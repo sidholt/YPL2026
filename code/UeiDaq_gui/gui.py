@@ -289,9 +289,16 @@ SLEW_RATE_MA = 10.0
 STEP_V       = SLEW_RATE_V  * (RAMP_TICK_MS / 1000.0)
 STEP_MA      = SLEW_RATE_MA * (RAMP_TICK_MS / 1000.0)
 
-# Window sizing — computed once at startup, never auto-resized afterwards
-MAIN_WINDOW_W     = 800
-MAIN_WINDOW_MAX_H = 1000
+# Window sizing — computed once at startup, never auto-resized afterwards.
+# MAIN_WINDOW_MAX_H is intentionally set well above any real screen height —
+# _size_and_center() always clamps to (available screen height - 60), so
+# raising this ceiling just means the window uses whatever room the monitor
+# actually has instead of stopping short at an arbitrarily small fixed size.
+# This mattered most for the DAQ Control pin list (PinConfigView), whose
+# scroll area only got ~450px of a 1000px-tall window — most of a 32-channel
+# card's pins were then a pin or two per scroll instead of visible at once.
+MAIN_WINDOW_W     = 1000
+MAIN_WINDOW_MAX_H = 1400
 
 GLOBAL_REC_TICK_MS = 250   # 4 Hz — global cross-device recorder sample rate
 
@@ -1284,7 +1291,7 @@ class PinConfigView(QWidget):
             row_widget.setStyleSheet(
                 f"background-color: {'#1D2127' if (i // 4) % 2 else 'transparent'};")
             rl  = QHBoxLayout(row_widget)
-            rl.setContentsMargins(4, 3, 4, 3)
+            rl.setContentsMargins(4, 1, 4, 1)
             rl.setSpacing(6)
             lbl = QLabel(f"Pin {i:02d}")
             lbl.setFixedWidth(50)

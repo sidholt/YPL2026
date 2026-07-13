@@ -3,6 +3,7 @@ FEQ.code-workspace
 
 # Python virtual environments
 .venv/
+.venv32/
 
 # Python cache
 __pycache__/

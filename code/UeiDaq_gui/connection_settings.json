@@ -5,7 +5,7 @@
   "prologix_com_port": 6,
   "moku_ip": "172.28.5.6",
   "santec_last_power_mw": 3.0,
-  "santec_last_wavelength_nm": 1528.55,
+  "santec_last_wavelength_nm": 1550.55,
   "conex_x_com_port": 13,
   "conex_y_com_port": 12,
   "itla_com_port": 15
