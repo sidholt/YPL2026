@@ -11,6 +11,68 @@ each on its own tab, each degrading gracefully (tab stays visible with a
 message instead of crashing the app) if its hardware library isn't installed
 or its instrument isn't connected.
 
+## Features
+
+**DAQ Control** (UEI PowerDNA analog output cards)
+- Per-card analog output control (Dev0/Dev1/Dev2 — current or voltage mode),
+  up to 32 channels
+- Per-pin live control: value spinbox + slider, custom nicknames, ramped
+  (slew-rate-limited) or instant "Set", plus "Write All" / "Zero All"
+- Automatic pin sweep (by step count or step size, adjustable dwell time),
+  with optional CoreDAQ optical-power logging at each step and CSV export
+- Software waveform generator — sine/cosine output on any pin with
+  adjustable frequency, amplitude, offset, and update rate
+- Data recording (start/stop) with live commanded-vs-measured and V-I plots,
+  saved to CSV
+- Live Guardian ADC readback for the AO-333 card (optional — needs the
+  32-bit bridge, see below)
+- Embedded Moku:Go oscilloscope panel
+- Combined/global recording across multiple sources into one CSV
+
+**CoreDAQ Power Meter**
+- Connects over USB-serial (auto-detect or manual COM port)
+- Per-head (1–4) gain control for LINEAR frontends
+- Wavelength-corrected power readout per head
+- Live combined plot of all 4 heads over the last 30s, with a legend you can
+  click to show/hide individual heads — opens automatically on connect
+
+**Santec Laser (TSL-550)**
+- Connects via Prologix GPIB-to-USB
+- Manual wavelength/power set; "Output ON" also applies whatever
+  wavelength/power is currently dialed in
+- Power sweep (Cal 2-DC) with CoreDAQ logging and CSV export
+- Hardware-triggered Fast Sweep (continuous wavelength sweep, captured by
+  CoreDAQ in free-run) with a clean white-background matplotlib results plot
+
+**CONEX Motor (Newport CONEX-CC / TRA12CC)**
+- Independent X/Y axis control, each on its own COM port
+- Home, move absolute (with left/right nudge-by-that-distance buttons), and
+  move relative
+- Hold-to-jog — press and hold to move continuously, release to stop
+- Velocity control and emergency stop
+- Diagnostics: state/position/velocity queries, travel limits, device
+  identity, VISA resource listing
+
+**ITLA Laser (Emcore TTX)**
+- Connects via Prologix GPIB
+- ITU-grid channel tuning or direct wavelength entry (with optional FTF
+  sub-grid detuning)
+- Live wavelength/power retuning without an off/on power cycle
+- Wavelength sweep (grid-snapped) and power sweep, with CoreDAQ logging and
+  CSV export
+- Dither mode, plus diagnostics readback (temperature, fatal status, etc.)
+
+**HP-8168F Laser**
+- Connects via Prologix GPIB
+- Manual wavelength/power set, output on/off
+- Wavelength sweep and power sweep with CoreDAQ logging and CSV export
+
+**Across every tab**
+- Pop any tab out into its own window (and reattach it later)
+- COM ports, GPIB addresses, and last-used wavelength/power are remembered
+  automatically between runs
+- Every CSV export opens automatically right after saving
+
 ## Repository Layout
 
 - `code/UeiDaq_gui/`
@@ -126,6 +188,27 @@ uv pip install --python .venv32\Scripts\python.exe numpy==1.26.4 pywin32 `
 
 `gui.py` looks for `.venv32\Scripts\python.exe` at startup and auto-launches
 `ao333_bridge.py` as a subprocess if it's there — nothing else to configure.
+
+## Usage
+
+Once setup is done, day-to-day this is the only command you need, run from
+the repo root:
+
+```powershell
+uv run code\UeiDaq_gui\gui.py
+```
+
+This opens one window sized to use most of your screen, with a tab per
+instrument (see [Features](#features) above). A few things worth knowing:
+
+- Tabs try to auto-connect on launch using whatever COM port/GPIB
+  address/wavelength was last used — nothing to re-enter for a setup you've
+  already run before.
+- The "⬡ Pop out tab" button (top-right corner of the tab bar) detaches the
+  current tab into its own window — useful for watching two instruments side
+  by side. A detached window has its own control to reattach it.
+- Closing the main window disconnects and cleans up every instrument, even
+  ones currently popped out into their own windows.
 
 ## Configuration
 
