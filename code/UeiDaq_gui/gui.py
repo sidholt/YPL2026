@@ -230,6 +230,42 @@ CARDS = {
         "channels": MAX_PINS},
 }
 
+# Physical pin remap — maps "GUI/logical pin index" -> "actual physical
+# output channel index" for cards whose connector/cable doesn't wire in
+# straight sequential order. Keyed by CARDS[...]["dev"]. An empty/missing
+# entry means identity (no remap), which MUST stay the default until a
+# pin's real mapping has been directly confirmed with pin_identify_test.py
+# — do not guess entries here. An unconfirmed remap is more dangerous than
+# none at all: it would silently send commanded voltage to a physical pin
+# you don't think you're touching. Populate only pins you've verified;
+# unlisted pins are assumed correct (identity) until proven otherwise.
+#
+# Confirmed observations on Dev2 (via pin_identify_test.py / multimeter):
+#   2026-07-15: logical pin 0  -> physical pin 31
+#               logical pin 31 -> physical pin 0
+#   2026-07-16: logical pin 15 -> physical pin 15 (UNCHANGED)
+# The 2026-07-16 point is important: pin 15 staying put DISPROVES the
+# tempting "the whole connector is reversed" theory (a full i->31-i reversal
+# would put 15 on 16). It also rules out a constant offset and any single XOR
+# mask — each contradicts at least one of the three known points. In other
+# words, endpoints are swapped but the middle is fixed, and three points out
+# of 32 do not determine the other 29. Per this file's standing rule, the
+# unconfirmed pins stay identity until walked: only 0<->31 are encoded below.
+# To finish the map, run pin_identify_test.py with PIN_REMAP EMPTY (a raw
+# walk) — with the Guardian ADC auto-scan it reports the true physical
+# landing channel for every logical pin whose target is in 0-7, and the
+# multimeter covers the rest — then copy the observed logical->physical pairs
+# in here. Do NOT guess the gaps.
+PIN_REMAP = {
+    "Dev2": {0: 31, 31: 0},
+}
+
+
+def remap_pin(dev: str, logical_pin: int) -> int:
+    """GUI pin index -> actual physical channel index to write/read for `dev`."""
+    return PIN_REMAP.get(dev, {}).get(logical_pin, logical_pin)
+
+
 AO_CHANNEL_NAMES_FILE = os.path.join(os.path.dirname(__file__), "ao_channel_names.json")
 
 CONNECTION_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "connection_settings.json")
@@ -245,12 +281,18 @@ CONNECTION_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "connection_s
 DATA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data")
 
+# Plot images (currently: Santec Fast Sweep results) saved alongside their
+# CSV export, so a sweep's picture and data stay next to each other under
+# data/ instead of the image being a one-off you'd have to regenerate later.
+IMAGES_DIR = os.path.join(DATA_DIR, "images")
+
 
 def open_saved_file(path: str) -> None:
-    """Opens a just-saved file with its default Windows application (e.g.
-    Excel for .csv) — one click of a Save/Export button gets you a saved
-    file AND a view of it, instead of a second manual trip through File
-    Explorer to find it."""
+    """Opens `path` with its default Windows application (e.g. Excel for
+    .csv). Wired to each tab's "📂 Open" button, which opens the most
+    recently exported/saved file for that button — not auto-launched on
+    save itself, since forcing a new Excel window open every export got in
+    the way more than it helped."""
     try:
         os.startfile(path)
     except Exception as e:
@@ -276,6 +318,24 @@ def save_connection_setting(key: str, value) -> None:
         os.replace(tmp, CONNECTION_SETTINGS_FILE)
     except Exception as e:
         print(f"[Settings] Failed to save {CONNECTION_SETTINGS_FILE}: {e}")
+
+
+def persist_spinbox(spin, key: str) -> None:
+    """Restores `spin`'s value from connection_settings.json under `key` (if
+    a value was saved previously) and wires it to auto-save on every change,
+    so numeric fields — sweep ranges, set-points, dwell times, etc. — survive
+    between sessions without needing their own explicit Set/Run click to
+    "commit" them. Deliberately NOT used for the DAQ Control per-pin output
+    spinboxes — restoring old output values automatically on launch is a
+    hardware-safety footgun in a way a sweep parameter or wavelength
+    set-point isn't."""
+    settings = load_connection_settings()
+    if key in settings:
+        try:
+            spin.setValue(settings[key])
+        except Exception:
+            pass
+    spin.valueChanged.connect(lambda v: save_connection_setting(key, v))
 
 
 MODE_RANGES = {
@@ -816,7 +876,8 @@ class CardSession:
                 next_vals.append(current + self._step * (1 if diff > 0 else -1))
         try:
             self.write(next_vals)
-        except Exception:
+        except Exception as e:
+            print(f"[Ramp] write to {self.dev} failed: {e}")
             self._timer.stop()
             return
         if next_vals == self._targets:
@@ -825,7 +886,31 @@ class CardSession:
     def write(self, values: list):
         if not self.connected:
             raise RuntimeError("Session not connected")
-        scaled = [v / 1000.0 for v in values] if self.mode == "current" else values
+        # Every write path (Set, Write All, Set All To, ramp, sweep, wave)
+        # funnels through here, so this is the one place a confirmed
+        # PIN_REMAP entry needs to be applied — `values` stays in GUI/logical
+        # pin order for everything else (self.values, the spinboxes, etc.);
+        # only what's actually sent to the hardware gets reordered.
+        remap = PIN_REMAP.get(self.dev)
+        if remap:
+            # Build the physical-channel array by placing each logical pin's
+            # value onto the physical channel it actually drives. Iterating
+            # EVERY logical pin through remap_pin() (identity for unlisted
+            # pins) guarantees a complete, leak-free assignment for any
+            # bijection. The old loop iterated only the listed swap entries and
+            # left every other position holding its stale same-index copy —
+            # correct for a clean 0<->31 swap, but silently wrong the moment
+            # the map is anything else (which is exactly the situation we're
+            # now in). This is the same remap_pin() lookup the Guardian
+            # readback path uses, so writes and readbacks stay in agreement.
+            physical = list(values)
+            for logical_pin in range(len(values)):
+                phys = remap_pin(self.dev, logical_pin)
+                if 0 <= phys < len(physical):
+                    physical[phys] = values[logical_pin]
+        else:
+            physical = values
+        scaled = [v / 1000.0 for v in physical] if self.mode == "current" else physical
         self.writer.WriteSingleScan(scaled)
         self.values = list(values)
 
@@ -1219,6 +1304,8 @@ class PinConfigView(QWidget):
         super().__init__(parent)
         self.card_session: CardSession = None
         self._syncing = False
+        self._last_recording_csv = None
+        self._last_sweep_csv     = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -1248,26 +1335,25 @@ class PinConfigView(QWidget):
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         root.addWidget(sep)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # No inner QScrollArea here on purpose: DAQPanel already wraps this
+        # entire PinConfigView in an outer QScrollArea (see pin_scroll in
+        # DAQPanel.__init__), so the whole page scrolls together if the
+        # window is too short. Nesting a second QScrollArea just for the pin
+        # list collapses it to Qt's tiny default sizeHint (~256x192px)
+        # instead of its actual content size, which is what made pin
+        # adjustment happen inside a cramped little box even on tall
+        # windows — the fix is one scroll area, not two.
+        #
+        # Two side-by-side columns (pins 0-15 / 16-31) instead of one long
+        # vertical list — same total row count fits in roughly half the
+        # window height, so a 32-channel card needs far less scrolling to
+        # see everything at once.
+        PIN_COL_SPLIT = MAX_PINS // 2   # 16
 
         pin_container = QWidget()
-        self.pin_layout = QVBoxLayout(pin_container)
-        self.pin_layout.setSpacing(2)
-        self.pin_layout.setContentsMargins(4, 4, 4, 4)
-
-        col_row = QHBoxLayout()
-        for text, width in [("Pin", 50), ("Name", 90), ("Value", 120), ("Slider", -1), ("", 60), ("Readback", 90)]:
-            lbl = QLabel(text)
-            if width > 0: lbl.setFixedWidth(width)
-            col_row.addWidget(lbl)
-        self.pin_layout.addLayout(col_row)
-
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setFrameShadow(QFrame.Shadow.Sunken)
-        self.pin_layout.addWidget(sep2)
+        outer_pin_lay = QHBoxLayout(pin_container)
+        outer_pin_lay.setSpacing(16)
+        outer_pin_lay.setContentsMargins(4, 4, 4, 4)
 
         self.spinboxes, self.sliders = [], []
         self._readback_lbls = []
@@ -1276,20 +1362,44 @@ class PinConfigView(QWidget):
         self._active_n    = NUM_PINS
         self._channel_names = self._load_channel_names()
 
-        self._group_seps = []   # [(first_pin_idx_in_group, separator_widget), ...]
+        self._group_seps  = []   # [(first_pin_idx_in_group, separator_widget), ...]
+        self._pin_columns = []   # column container widgets, hidden when empty
+
+        for col in range(2):
+            col_widget = QWidget()
+            col_lay = QVBoxLayout(col_widget)
+            col_lay.setSpacing(2)
+            col_lay.setContentsMargins(0, 0, 0, 0)
+
+            col_row = QHBoxLayout()
+            for text, width in [("Pin", 50), ("Name", 90), ("Value", 120), ("Slider", -1), ("", 60), ("Readback", 90)]:
+                lbl = QLabel(text)
+                if width > 0: lbl.setFixedWidth(width)
+                col_row.addWidget(lbl)
+            col_lay.addLayout(col_row)
+
+            sep2 = QFrame()
+            sep2.setFrameShape(QFrame.Shape.HLine)
+            sep2.setFrameShadow(QFrame.Shadow.Sunken)
+            col_lay.addWidget(sep2)
+
+            self._pin_columns.append((col_widget, col_lay))
+            outer_pin_lay.addWidget(col_widget)
 
         for i in range(MAX_PINS):
-            if i > 0 and i % 4 == 0:
+            col_widget, col_lay = self._pin_columns[i // PIN_COL_SPLIT]
+            local_i = i % PIN_COL_SPLIT
+            if local_i > 0 and local_i % 4 == 0:
                 group_sep = QFrame()
                 group_sep.setFrameShape(QFrame.Shape.HLine)
                 group_sep.setStyleSheet(f"color: {C_GRAY};")
                 group_sep.setFixedHeight(1)
                 self._group_seps.append((i, group_sep))
-                self.pin_layout.addWidget(group_sep)
+                col_lay.addWidget(group_sep)
 
             row_widget = QWidget()
             row_widget.setStyleSheet(
-                f"background-color: {'#1D2127' if (i // 4) % 2 else 'transparent'};")
+                f"background-color: {'#1D2127' if (local_i // 4) % 2 else 'transparent'};")
             rl  = QHBoxLayout(row_widget)
             rl.setContentsMargins(4, 1, 4, 1)
             rl.setSpacing(6)
@@ -1327,12 +1437,12 @@ class PinConfigView(QWidget):
             self._readback_lbls.append(rb_lbl)
             self._name_edits.append(name_edit)
             self._pin_rows.append(row_widget)
-            self.pin_layout.addWidget(row_widget)
+            col_lay.addWidget(row_widget)
 
-        self.pin_layout.addStretch()
+        for _, col_lay in self._pin_columns:
+            col_lay.addStretch()
         self._set_active_channels(NUM_PINS)
-        scroll.setWidget(pin_container)
-        root.addWidget(scroll, stretch=1)
+        root.addWidget(pin_container)
 
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.Shape.HLine)
@@ -1352,6 +1462,16 @@ class PinConfigView(QWidget):
         bottom.addWidget(zero_btn)
         bottom.addSpacing(16)
         bottom.addWidget(self._ramp_chk)
+        bottom.addSpacing(16)
+        bottom.addWidget(QLabel("Set All To:"))
+        self._set_all_spin = NoScrollDoubleSpinBox()
+        self._set_all_spin.setDecimals(3)
+        self._set_all_spin.setFixedWidth(100)
+        bottom.addWidget(self._set_all_spin)
+        set_all_btn = QPushButton("Apply")
+        set_all_btn.setToolTip("Set every active pin's value box to the amount above, then write it")
+        set_all_btn.clicked.connect(self._set_all_to)
+        bottom.addWidget(set_all_btn)
         bottom.addStretch()
         root.addLayout(bottom)
 
@@ -1376,12 +1496,14 @@ class PinConfigView(QWidget):
         self.sweep_start = NoScrollDoubleSpinBox()
         self.sweep_start.setDecimals(3)
         self.sweep_start.setFixedWidth(90)
+        persist_spinbox(self.sweep_start, "daq_sweep_start")
         row1.addWidget(self.sweep_start)
         row1.addSpacing(10)
         row1.addWidget(QLabel("Stop:"))
         self.sweep_stop = NoScrollDoubleSpinBox()
         self.sweep_stop.setDecimals(3)
         self.sweep_stop.setFixedWidth(90)
+        persist_spinbox(self.sweep_stop, "daq_sweep_stop")
         row1.addWidget(self.sweep_stop)
         row1.addStretch()
         sg.addLayout(row1)
@@ -1396,12 +1518,14 @@ class PinConfigView(QWidget):
         self.sweep_steps_sb.setRange(2, 10000)
         self.sweep_steps_sb.setValue(SWEEP_DEFAULT_STEPS)
         self.sweep_steps_sb.setFixedWidth(70)
+        persist_spinbox(self.sweep_steps_sb, "daq_sweep_steps")
         self.sweep_stepsize_sb = NoScrollDoubleSpinBox()
         self.sweep_stepsize_sb.setDecimals(4)
         self.sweep_stepsize_sb.setRange(0.0001, 100.0)
         self.sweep_stepsize_sb.setValue(1.0)
         self.sweep_stepsize_sb.setFixedWidth(90)
         self.sweep_stepsize_sb.setVisible(False)
+        persist_spinbox(self.sweep_stepsize_sb, "daq_sweep_stepsize")
         self.sweep_derived_lbl = QLabel("")
         self.sweep_derived_lbl.setMinimumWidth(140)
         row2.addWidget(self._sweep_mode_combo)
@@ -1418,6 +1542,7 @@ class PinConfigView(QWidget):
         self.sweep_dwell_sb.setRange(20, 60000)
         self.sweep_dwell_sb.setValue(SWEEP_DEFAULT_DWELL_MS)
         self.sweep_dwell_sb.setFixedWidth(80)
+        persist_spinbox(self.sweep_dwell_sb, "daq_sweep_dwell_ms")
         row3.addWidget(self.sweep_dwell_sb)
         row3.addSpacing(10)
         self.sweep_run_btn  = QPushButton("Run Sweep")
@@ -1451,6 +1576,11 @@ class PinConfigView(QWidget):
         self._sweep_export_btn.setEnabled(False)
         self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
         row4.addWidget(self._sweep_export_btn)
+        self._sweep_open_btn = QPushButton("📂 Open")
+        self._sweep_open_btn.setEnabled(False)
+        self._sweep_open_btn.setToolTip("Open the last-exported sweep CSV")
+        self._sweep_open_btn.clicked.connect(lambda: open_saved_file(self._last_sweep_csv))
+        row4.addWidget(self._sweep_open_btn)
         sg.addLayout(row4)
 
         root.addWidget(sweep_group)
@@ -1491,6 +1621,7 @@ class PinConfigView(QWidget):
         self.wave_freq_sb.setRange(0.001, 1000.0)
         self.wave_freq_sb.setValue(1.0)
         self.wave_freq_sb.setFixedWidth(90)
+        persist_spinbox(self.wave_freq_sb, "daq_wave_freq_hz")
         wrow2.addWidget(self.wave_freq_sb)
         wrow2.addSpacing(10)
         wrow2.addWidget(QLabel("Amplitude:"))
@@ -1498,6 +1629,7 @@ class PinConfigView(QWidget):
         self.wave_amp_sb.setDecimals(3)
         self.wave_amp_sb.setValue(1.0)
         self.wave_amp_sb.setFixedWidth(90)
+        persist_spinbox(self.wave_amp_sb, "daq_wave_amplitude")
         wrow2.addWidget(self.wave_amp_sb)
         wrow2.addSpacing(10)
         wrow2.addWidget(QLabel("Offset:"))
@@ -1505,6 +1637,7 @@ class PinConfigView(QWidget):
         self.wave_offset_sb.setDecimals(3)
         self.wave_offset_sb.setValue(0.0)
         self.wave_offset_sb.setFixedWidth(90)
+        persist_spinbox(self.wave_offset_sb, "daq_wave_offset")
         wrow2.addWidget(self.wave_offset_sb)
         wrow2.addStretch()
         wg.addLayout(wrow2)
@@ -1515,6 +1648,7 @@ class PinConfigView(QWidget):
         self.wave_tick_sb.setRange(5, 1000)
         self.wave_tick_sb.setValue(20)
         self.wave_tick_sb.setFixedWidth(70)
+        persist_spinbox(self.wave_tick_sb, "daq_wave_tick_ms")
         wrow3.addWidget(self.wave_tick_sb)
         wrow3.addSpacing(10)
         self.wave_run_btn  = QPushButton("Run Wave")
@@ -1547,6 +1681,11 @@ class PinConfigView(QWidget):
         rec_row1.addWidget(self._rec_btn)
         rec_row1.addSpacing(8)
         rec_row1.addWidget(self._save_btn)
+        self._save_open_btn = QPushButton("📂 Open")
+        self._save_open_btn.setEnabled(False)
+        self._save_open_btn.setToolTip("Open the last-saved recording CSV")
+        self._save_open_btn.clicked.connect(lambda: open_saved_file(self._last_recording_csv))
+        rec_row1.addWidget(self._save_open_btn)
         rec_row1.addSpacing(10)
         rec_row1.addWidget(self._rec_status_lbl)
         rec_row1.addStretch()
@@ -1931,6 +2070,11 @@ class PinConfigView(QWidget):
             row.setVisible(i < n)
         for first_idx, sep in self._group_seps:
             sep.setVisible(first_idx < n)
+        # Hide the second column entirely for a ≤16-channel card instead of
+        # showing an empty column with just a header.
+        pin_col_split = MAX_PINS // len(self._pin_columns)
+        for col_idx, (col_widget, _) in enumerate(self._pin_columns):
+            col_widget.setVisible(col_idx * pin_col_split < n)
 
     def load_card(self, cs: CardSession):
         self.card_session = cs
@@ -1948,6 +2092,10 @@ class PinConfigView(QWidget):
             self.spinboxes[i].setValue(cs.values[i])
             self.sliders[i].setValue(int(cs.values[i] * 100))
         self._syncing = False
+
+        self._set_all_spin.setMinimum(cs.min_val)
+        self._set_all_spin.setMaximum(cs.max_val)
+        self._set_all_spin.setSuffix(f" {cs.unit}")
 
         self.sweep_pin_combo.clear()
         self.wave_pin_combo.clear()
@@ -1980,12 +2128,16 @@ class PinConfigView(QWidget):
             self._rec_plot_win = None
 
         # Guardian readback — only for voltage card (Dev2 / AO-333), and only
-        # for its first NUM_PINS channels: the ao333_bridge.py readback bridge
-        # still only streams 8 monitor channels even though Dev2 now exposes
-        # MAX_PINS=32 outputs. Channels 8-31 have no hardware readback.
+        # for whichever NUM_PINS logical pins actually land on physical
+        # channels 0-7: the ao333_bridge.py readback bridge only streams 8
+        # monitor channels even though Dev2 now exposes MAX_PINS=32 outputs,
+        # and PIN_REMAP means "logical pin i" isn't necessarily "physical
+        # channel i" — a pin remapped onto physical 8-31 has no hardware
+        # readback even if i < NUM_PINS, and conversely a pin remapped IN
+        # from beyond 31 would (there isn't one, but the check stays general).
         is_voltage = cs.mode == "voltage"
         for i, lbl in enumerate(self._readback_lbls):
-            lbl.setVisible(is_voltage and i < NUM_PINS)
+            lbl.setVisible(is_voltage and remap_pin(cs.dev, i) < NUM_PINS)
             lbl.setText("—")
         self._guardian_values = [0.0] * NUM_PINS
         self._pm_plot_group.setVisible(True)
@@ -2015,16 +2167,23 @@ class PinConfigView(QWidget):
             QTimer.singleShot(0, self._guardian_worker.stop)
 
     def _on_guardian_readback(self, values: list):
+        # `values` is indexed by PHYSICAL Guardian ADC channel (0-7) — always
+        # go through remap_pin() to find which physical channel a given
+        # logical pin actually landed on before indexing into it.
         self._guardian_values = values
+        dev = self.card_session.dev if self.card_session else None
         self._last_guardian_v = float(np.mean(values[:NUM_PINS]))
-        for i, v in enumerate(values[:NUM_PINS]):
-            self._readback_lbls[i].setText(f"{v:+.{READBACK_DECIMALS}f}V")
+        for i, lbl in enumerate(self._readback_lbls):
+            phys = remap_pin(dev, i) if dev else i
+            if phys < len(values):
+                lbl.setText(f"{values[phys]:+.{READBACK_DECIMALS}f}V")
 
         if (self._cmp_src_combo.currentData() == "guardian"
                 and self._cmp_win and self._cmp_win.isVisible()
                 and self.card_session):
-            pin = self._cmp_win.get_pin()
-            v   = values[pin] if pin < len(values) else 0.0
+            pin  = self._cmp_win.get_pin()
+            phys = remap_pin(self.card_session.dev, pin)
+            v    = values[phys] if phys < len(values) else 0.0
             self._push_comparison(v, dt=AO333_GUARDIAN_POLL_MS / 1000.0)
 
         if (self._recording and self.card_session
@@ -2122,7 +2281,8 @@ class PinConfigView(QWidget):
                             [f"{v:.4f}" for v in r['daq']])
         print(f"[Recording] Saved {len(self._rec_records)} rows → {fname}")
         self._status(f"Saved {len(self._rec_records)} samples → {fname}")
-        open_saved_file(fname)
+        self._last_recording_csv = fname
+        self._save_open_btn.setEnabled(True)
 
     def _show_plots(self):
         if not self._rec_records or self.card_session is None:
@@ -2236,7 +2396,8 @@ class PinConfigView(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[Sweep] Saved {len(rows)} rows → {fname}")
         self._status(f"Saved {len(rows)} sweep/power rows → {fname}")
-        open_saved_file(fname)
+        self._last_sweep_csv = fname
+        self._sweep_open_btn.setEnabled(True)
 
     def _sb_changed(self, idx, val):
         if self._syncing: return
@@ -2325,6 +2486,36 @@ class PinConfigView(QWidget):
                 t.run = do_zero
                 t.start()
                 self._status("Instant zero all pins")
+        except Exception as e:
+            self._status(f"Error: {e}")
+
+    def _set_all_to(self):
+        """Sets every active pin's value box (and slider) to the amount in
+        "Set All To", then writes it out — same ramp-vs-instant behavior as
+        Write All/Zero All, just with a configurable target instead of
+        whatever's already dialed into each pin, or a hardcoded zero."""
+        cs = self.card_session
+        if cs is None: return
+        value = self._set_all_spin.value()
+        try:
+            if not cs.connected: cs.connect()
+            self._syncing = True
+            for sb in self.spinboxes[:cs.num_pins]: sb.setValue(value)
+            for sl in self.sliders[:cs.num_pins]:   sl.setValue(int(value * 100))
+            self._syncing = False
+            if self._ramp_chk.isChecked():
+                cs.ramp_to([value] * cs.num_pins)
+                self._status(f"Ramping all pins to {value:.3f} {cs.unit}")
+            else:
+                def do_set_all():
+                    try:
+                        cs.write([value] * cs.num_pins)
+                    except Exception as e:
+                        print(f"[SetAll] {e}")
+                t = QThread(self)
+                t.run = do_set_all
+                t.start()
+                self._status(f"Instant set all pins to {value:.3f} {cs.unit}")
         except Exception as e:
             self._status(f"Error: {e}")
 
@@ -2993,6 +3184,8 @@ class ITLAPanel(QWidget):
         self._sweep_power_log = []
         self._power_sweep_logging = False
         self._power_sweep_log     = []
+        self._last_sweep_csv       = None
+        self._last_power_sweep_csv = None
 
         self._build_ui()
         self._set_state("disconnected")
@@ -3059,6 +3252,7 @@ class ITLAPanel(QWidget):
         self.spin_mw.setValue(5.0)
         self.spin_mw.setSingleStep(0.5)
         self.spin_mw.setDecimals(1)
+        persist_spinbox(self.spin_mw, "itla_power_mw")
         cg2.addWidget(self.spin_mw, 0, 1, 1, 3)
 
         cg2.addWidget(QLabel("Grid spacing:"), 1, 0)
@@ -3093,6 +3287,15 @@ class ITLAPanel(QWidget):
         self.chk_ftf.setChecked(False)
         self.chk_ftf.stateChanged.connect(lambda _: self._update_preview_from_nm())
         cg2.addWidget(self.chk_ftf, 4, 0, 1, 4)
+
+        # Restored here, not at creation — restoring immediately calls
+        # setValue(), which fires _on_nm_changed/_on_ch_changed synchronously,
+        # and those touch spin_ch/chk_ftf/lbl_ch_info, all of which must
+        # already exist. spin_ch restored last so it "wins" the sync (it's
+        # the laser's actual ITU-grid setting; wavelength is the derived
+        # display value).
+        persist_spinbox(self.spin_nm, "itla_wavelength_nm")
+        persist_spinbox(self.spin_ch, "itla_channel")
 
         live_row = QHBoxLayout()
         self.btn_retune = QPushButton("Apply Wavelength (live)")
@@ -3172,6 +3375,7 @@ class ITLAPanel(QWidget):
         self.spin_sw_start.setValue(1548.0)
         self.spin_sw_start.setDecimals(3)
         self.spin_sw_start.setSingleStep(1.0)
+        persist_spinbox(self.spin_sw_start, "itla_sweep_start_nm")
         sg.addWidget(self.spin_sw_start, 0, 1)
 
         sg.addWidget(QLabel("Stop (nm):"), 0, 2)
@@ -3180,6 +3384,7 @@ class ITLAPanel(QWidget):
         self.spin_sw_stop.setValue(1554.0)
         self.spin_sw_stop.setDecimals(3)
         self.spin_sw_stop.setSingleStep(1.0)
+        persist_spinbox(self.spin_sw_stop, "itla_sweep_stop_nm")
         sg.addWidget(self.spin_sw_stop, 0, 3)
 
         sg.addWidget(QLabel("Step (GHz):"), 1, 0)
@@ -3188,6 +3393,7 @@ class ITLAPanel(QWidget):
         self.spin_sw_step.setValue(100.0)
         self.spin_sw_step.setSingleStep(50.0)
         self.spin_sw_step.setDecimals(1)
+        persist_spinbox(self.spin_sw_step, "itla_sweep_step_ghz")
         sg.addWidget(self.spin_sw_step, 1, 1)
 
         sg.addWidget(QLabel("Dwell (s):"), 1, 2)
@@ -3195,6 +3401,7 @@ class ITLAPanel(QWidget):
         self.spin_dwell.setRange(0.1, 60.0)
         self.spin_dwell.setValue(1.0)
         self.spin_dwell.setSingleStep(0.5)
+        persist_spinbox(self.spin_dwell, "itla_sweep_dwell_s")
         sg.addWidget(self.spin_dwell, 1, 3)
 
         self.btn_sweep = QPushButton("Start Sweep")
@@ -3209,6 +3416,11 @@ class ITLAPanel(QWidget):
         self._sweep_export_btn.setEnabled(False)
         self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
         sg.addWidget(self._sweep_export_btn, 3, 3)
+        self._sweep_open_btn = QPushButton("📂 Open")
+        self._sweep_open_btn.setEnabled(False)
+        self._sweep_open_btn.setToolTip("Open the last-exported sweep CSV")
+        self._sweep_open_btn.clicked.connect(lambda: open_saved_file(self._last_sweep_csv))
+        sg.addWidget(self._sweep_open_btn, 3, 4)
 
         top.addWidget(sw_box)
 
@@ -3222,6 +3434,7 @@ class ITLAPanel(QWidget):
         self.spin_pw_start.setValue(1.0)
         self.spin_pw_start.setDecimals(2)
         self.spin_pw_start.setSingleStep(0.5)
+        persist_spinbox(self.spin_pw_start, "itla_power_sweep_start_mw")
         pwg.addWidget(self.spin_pw_start, 0, 1)
 
         pwg.addWidget(QLabel("Stop (mW):"), 0, 2)
@@ -3230,6 +3443,7 @@ class ITLAPanel(QWidget):
         self.spin_pw_stop.setValue(10.0)
         self.spin_pw_stop.setDecimals(2)
         self.spin_pw_stop.setSingleStep(0.5)
+        persist_spinbox(self.spin_pw_stop, "itla_power_sweep_stop_mw")
         pwg.addWidget(self.spin_pw_stop, 0, 3)
 
         pwg.addWidget(QLabel("Step (mW):"), 1, 0)
@@ -3238,6 +3452,7 @@ class ITLAPanel(QWidget):
         self.spin_pw_step.setValue(1.0)
         self.spin_pw_step.setSingleStep(0.5)
         self.spin_pw_step.setDecimals(2)
+        persist_spinbox(self.spin_pw_step, "itla_power_sweep_step_mw")
         pwg.addWidget(self.spin_pw_step, 1, 1)
 
         pwg.addWidget(QLabel("Dwell (s):"), 1, 2)
@@ -3245,6 +3460,7 @@ class ITLAPanel(QWidget):
         self.spin_pw_dwell.setRange(0.1, 60.0)
         self.spin_pw_dwell.setValue(1.0)
         self.spin_pw_dwell.setSingleStep(0.5)
+        persist_spinbox(self.spin_pw_dwell, "itla_power_sweep_dwell_s")
         pwg.addWidget(self.spin_pw_dwell, 1, 3)
 
         self.btn_power_sweep = QPushButton("Start Power Sweep")
@@ -3260,6 +3476,11 @@ class ITLAPanel(QWidget):
         self._power_sweep_export_btn.setEnabled(False)
         self._power_sweep_export_btn.clicked.connect(self._export_power_sweep_csv)
         pwg.addWidget(self._power_sweep_export_btn, 3, 3)
+        self._power_sweep_open_btn = QPushButton("📂 Open")
+        self._power_sweep_open_btn.setEnabled(False)
+        self._power_sweep_open_btn.setToolTip("Open the last-exported power-sweep CSV")
+        self._power_sweep_open_btn.clicked.connect(lambda: open_saved_file(self._last_power_sweep_csv))
+        pwg.addWidget(self._power_sweep_open_btn, 3, 4)
 
         top.addWidget(pw_box)
 
@@ -3272,6 +3493,7 @@ class ITLAPanel(QWidget):
         self.spin_dith_rate.setRange(10, 200)
         self.spin_dith_rate.setValue(100)
         self.spin_dith_rate.setSingleStep(10)
+        persist_spinbox(self.spin_dith_rate, "itla_dither_rate_khz")
         dg2.addWidget(self.spin_dith_rate, 0, 1, 1, 2)
 
         dg2.addWidget(QLabel("SBS FM deviation (0–4):"), 1, 0)
@@ -3285,6 +3507,7 @@ class ITLAPanel(QWidget):
         dg2.addWidget(self.lbl_dith_dev, 1, 2)
         self.spin_dith_dev.valueChanged.connect(
             lambda v: self.lbl_dith_dev.setText(f"= {v * 0.1:.1f} GHz p-p"))
+        persist_spinbox(self.spin_dith_dev, "itla_dither_deviation")
 
         dg2.addWidget(QLabel("TxTrace AM amplitude (0–50):"), 2, 0)
         self.spin_dith_amp = NoScrollSpinBox()
@@ -3297,6 +3520,7 @@ class ITLAPanel(QWidget):
         dg2.addWidget(self.lbl_dith_amp, 2, 2)
         self.spin_dith_amp.valueChanged.connect(
             lambda v: self.lbl_dith_amp.setText(f"= {v / 10:.1f}% modulation"))
+        persist_spinbox(self.spin_dith_amp, "itla_dither_amplitude")
 
         btn_row = QHBoxLayout()
         self.btn_dith_sbs      = QPushButton("Enable SBS only")
@@ -3569,7 +3793,8 @@ class ITLAPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[ITLA Sweep] Saved {len(rows)} rows → {fname}")
         self._status(f"Saved {len(rows)} sweep/power rows → {fname}")
-        open_saved_file(fname)
+        self._last_sweep_csv = fname
+        self._sweep_open_btn.setEnabled(True)
 
     def _show_power_sweep_plot(self):
         series = {}
@@ -3604,7 +3829,8 @@ class ITLAPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[ITLA Power Sweep] Saved {len(rows)} rows → {fname}")
         self._status(f"Saved {len(rows)} power-sweep rows → {fname}")
-        open_saved_file(fname)
+        self._last_power_sweep_csv = fname
+        self._power_sweep_open_btn.setEnabled(True)
 
     # ── Button handlers ───────────────────────────────────────────────────────
 
@@ -4117,8 +4343,8 @@ class ConexPanel(QWidget):
         self._jog_timer.setInterval(250)
         self._jog_timer.timeout.connect(lambda: self._sig_poll_pos.emit())
 
-        # auto-connect on launch using the saved COM port, same as SantecPanel
-        self._do_connect()
+        # Deliberately no auto-connect here (unlike CoreDAQ/Santec) — connect
+        # manually via the button.
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -4221,6 +4447,11 @@ class ConexPanel(QWidget):
         self._abs_spin.setRange(0.0, 12.0)
         self._abs_spin.setDecimals(4)
         self._abs_spin.setSingleStep(0.1)
+        # settings_key is e.g. "conex_x_com_port"/"conex_y_com_port" — reuse
+        # its axis prefix so X and Y each get their own saved distance/velocity
+        # instead of sharing one (this widget is instantiated once per axis).
+        axis_key = self._settings_key.replace("_com_port", "")
+        persist_spinbox(self._abs_spin, f"{axis_key}_abs_mm")
         move_lay.addWidget(self._abs_spin, 2, 1)
         # ◀  GO!  ▶ — GO! moves to the absolute position above; the arrows
         # nudge RELATIVE by that same distance in either direction.
@@ -4250,6 +4481,7 @@ class ConexPanel(QWidget):
         self._rel_spin.setRange(-12.0, 12.0)
         self._rel_spin.setDecimals(4)
         self._rel_spin.setSingleStep(0.1)
+        persist_spinbox(self._rel_spin, f"{axis_key}_rel_mm")
         move_lay.addWidget(self._rel_spin, 3, 1)
         self._rel_btn = QPushButton("GO!")
         self._rel_btn.setEnabled(False)
@@ -4283,6 +4515,7 @@ class ConexPanel(QWidget):
         self._vel_spin.setDecimals(4)
         self._vel_spin.setValue(0.1)
         self._vel_spin.setSingleStep(0.05)
+        persist_spinbox(self._vel_spin, f"{axis_key}_vel_mm_s")
         move_lay.addWidget(self._vel_spin, 5, 1)
         self._vel_btn = QPushButton("SET!")
         self._vel_btn.setEnabled(False)
@@ -4465,6 +4698,7 @@ class ConexDualPanel(QWidget):
             self._x_spin.setRange(0.0, 12.0)
             self._x_spin.setDecimals(4)
             self._x_spin.setSingleStep(0.1)
+            persist_spinbox(self._x_spin, "conex_sync_target_x_mm")
             sync_lay.addWidget(self._x_spin, 0, 1)
 
             sync_lay.addWidget(QLabel("Target Y (mm):"), 0, 2)
@@ -4472,6 +4706,7 @@ class ConexDualPanel(QWidget):
             self._y_spin.setRange(0.0, 12.0)
             self._y_spin.setDecimals(4)
             self._y_spin.setSingleStep(0.1)
+            persist_spinbox(self._y_spin, "conex_sync_target_y_mm")
             sync_lay.addWidget(self._y_spin, 0, 3)
 
             self._move_xy_btn = QPushButton("MOVE XY")
@@ -4687,6 +4922,17 @@ class HP8168FWorker(QObject):
     def do_disconnect(self):
         try:
             if self._laser is not None:
+                # Turn the laser output off BEFORE dropping the connection.
+                # Disconnecting — including on GUI close — must never leave the
+                # diode emitting with no software in control. Guarded on its own
+                # so a comms hiccup here can't block the actual close().
+                try:
+                    self._laser.on_or_off = False
+                    self.output_update.emit(False)
+                    self.log_message.emit("Laser output OFF (auto, before disconnect)")
+                except Exception as e:
+                    self.log_message.emit(
+                        f"Warning: could not turn laser off before disconnect: {e}")
                 self._laser.close()
                 self._laser = None
             self.status_changed.emit("DISCONNECTED")
@@ -4761,6 +5007,8 @@ class HP8168FPanel(QWidget):
         self._sweep_power_log   = []
         self._power_sweep_logging = False
         self._power_sweep_log     = []
+        self._last_sweep_csv       = None
+        self._last_power_sweep_csv = None
 
         self._build_ui()
 
@@ -4845,6 +5093,7 @@ class HP8168FPanel(QWidget):
         self._wl_spin.setDecimals(4)
         self._wl_spin.setRange(1400.0, 1600.0)   # narrowed to instrument range after connect
         self._wl_spin.setValue(1550.0)
+        persist_spinbox(self._wl_spin, "hp8168f_wavelength_nm")
         man_lay.addWidget(self._wl_spin, 2, 1)
         self._wl_btn = QPushButton("SET!")
         self._wl_btn.setEnabled(False)
@@ -4856,6 +5105,7 @@ class HP8168FPanel(QWidget):
         self._pow_spin.setDecimals(3)
         self._pow_spin.setRange(0.0, 20.0)       # narrowed to instrument range after connect
         self._pow_spin.setValue(1.0)
+        persist_spinbox(self._pow_spin, "hp8168f_power_mw")
         man_lay.addWidget(self._pow_spin, 3, 1)
         self._pow_btn = QPushButton("SET!")
         self._pow_btn.setEnabled(False)
@@ -4874,6 +5124,7 @@ class HP8168FPanel(QWidget):
         self._sw_start.setDecimals(4)
         self._sw_start.setRange(1400.0, 1600.0)
         self._sw_start.setValue(1545.0)
+        persist_spinbox(self._sw_start, "hp8168f_sweep_start_nm")
         sw_lay.addWidget(self._sw_start, 0, 1)
 
         sw_lay.addWidget(QLabel("Stop (nm):"), 1, 0)
@@ -4881,6 +5132,7 @@ class HP8168FPanel(QWidget):
         self._sw_stop.setDecimals(4)
         self._sw_stop.setRange(1400.0, 1600.0)
         self._sw_stop.setValue(1555.0)
+        persist_spinbox(self._sw_stop, "hp8168f_sweep_stop_nm")
         sw_lay.addWidget(self._sw_stop, 1, 1)
 
         sw_lay.addWidget(QLabel("Step (nm):"), 2, 0)
@@ -4888,6 +5140,7 @@ class HP8168FPanel(QWidget):
         self._sw_step.setDecimals(4)
         self._sw_step.setRange(0.0001, 100.0)
         self._sw_step.setValue(0.1)
+        persist_spinbox(self._sw_step, "hp8168f_sweep_step_nm")
         sw_lay.addWidget(self._sw_step, 2, 1)
 
         sw_lay.addWidget(QLabel("Dwell (s):"), 3, 0)
@@ -4895,6 +5148,7 @@ class HP8168FPanel(QWidget):
         self._sw_dwell.setDecimals(2)
         self._sw_dwell.setRange(0.0, 60.0)
         self._sw_dwell.setValue(0.5)
+        persist_spinbox(self._sw_dwell, "hp8168f_sweep_dwell_s")
         sw_lay.addWidget(self._sw_dwell, 3, 1)
 
         self._sw_info_lbl = QLabel("")
@@ -4921,7 +5175,12 @@ class HP8168FPanel(QWidget):
         self._sweep_export_btn = QPushButton("Export CSV…")
         self._sweep_export_btn.setEnabled(False)
         self._sweep_export_btn.clicked.connect(self._export_sweep_power_csv)
-        sw_lay.addWidget(self._sweep_export_btn, 9, 0, 1, 2)
+        sw_lay.addWidget(self._sweep_export_btn, 9, 0)
+        self._sweep_open_btn = QPushButton("📂 Open")
+        self._sweep_open_btn.setEnabled(False)
+        self._sweep_open_btn.setToolTip("Open the last-exported sweep CSV")
+        self._sweep_open_btn.clicked.connect(lambda: open_saved_file(self._last_sweep_csv))
+        sw_lay.addWidget(self._sweep_open_btn, 9, 1)
 
         sw_lay.setRowStretch(10, 1)
         root.addWidget(sweep_box, stretch=1)
@@ -4939,6 +5198,7 @@ class HP8168FPanel(QWidget):
         self._pw_start.setDecimals(3)
         self._pw_start.setRange(0.0, 20.0)
         self._pw_start.setValue(0.5)
+        persist_spinbox(self._pw_start, "hp8168f_power_sweep_start_mw")
         pwg.addWidget(self._pw_start, 0, 1)
 
         pwg.addWidget(QLabel("Stop (mW):"), 0, 2)
@@ -4946,6 +5206,7 @@ class HP8168FPanel(QWidget):
         self._pw_stop.setDecimals(3)
         self._pw_stop.setRange(0.0, 20.0)
         self._pw_stop.setValue(2.0)
+        persist_spinbox(self._pw_stop, "hp8168f_power_sweep_stop_mw")
         pwg.addWidget(self._pw_stop, 0, 3)
 
         pwg.addWidget(QLabel("Step (mW):"), 1, 0)
@@ -4953,6 +5214,7 @@ class HP8168FPanel(QWidget):
         self._pw_step.setDecimals(3)
         self._pw_step.setRange(0.001, 10.0)
         self._pw_step.setValue(0.1)
+        persist_spinbox(self._pw_step, "hp8168f_power_sweep_step_mw")
         pwg.addWidget(self._pw_step, 1, 1)
 
         pwg.addWidget(QLabel("Dwell (s):"), 1, 2)
@@ -4960,6 +5222,7 @@ class HP8168FPanel(QWidget):
         self._pw_dwell.setDecimals(2)
         self._pw_dwell.setRange(0.0, 60.0)
         self._pw_dwell.setValue(0.5)
+        persist_spinbox(self._pw_dwell, "hp8168f_power_sweep_dwell_s")
         pwg.addWidget(self._pw_dwell, 1, 3)
 
         self._pw_run_btn  = QPushButton("Run Power Sweep")
@@ -4983,6 +5246,11 @@ class HP8168FPanel(QWidget):
         self._power_sweep_export_btn.setEnabled(False)
         self._power_sweep_export_btn.clicked.connect(self._export_power_sweep_csv)
         pwg.addWidget(self._power_sweep_export_btn, 4, 3)
+        self._power_sweep_open_btn = QPushButton("📂 Open")
+        self._power_sweep_open_btn.setEnabled(False)
+        self._power_sweep_open_btn.setToolTip("Open the last-exported power-sweep CSV")
+        self._power_sweep_open_btn.clicked.connect(lambda: open_saved_file(self._last_power_sweep_csv))
+        pwg.addWidget(self._power_sweep_open_btn, 4, 4)
 
         final.addWidget(pw_box)
 
@@ -5121,7 +5389,8 @@ class HP8168FPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[HP-8168F Sweep] Saved {len(rows)} rows → {fname}")
         self._log.append(f"Saved {len(rows)} sweep/power rows → {fname}")
-        open_saved_file(fname)
+        self._last_sweep_csv = fname
+        self._sweep_open_btn.setEnabled(True)
 
     def _show_power_sweep_plot(self):
         series = {}
@@ -5156,7 +5425,8 @@ class HP8168FPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[HP-8168F Power Sweep] Saved {len(rows)} rows → {fname}")
         self._log.append(f"Saved {len(rows)} power-sweep rows → {fname}")
-        open_saved_file(fname)
+        self._last_power_sweep_csv = fname
+        self._power_sweep_open_btn.setEnabled(True)
 
     # ── Button actions ────────────────────────────────────────────────────────
 
@@ -5531,6 +5801,17 @@ class SantecWorker(QObject):
     def do_disconnect(self):
         try:
             if self._laser is not None:
+                # Close the shutter (output OFF) BEFORE dropping the connection.
+                # Disconnecting — including on GUI close — must never leave the
+                # laser emitting with no software in control. Guarded on its own
+                # so a comms hiccup here can't block the actual close().
+                try:
+                    self._laser.shutter = True
+                    self.output_update.emit(False)
+                    self.log_message.emit("Laser output OFF (auto, before disconnect)")
+                except Exception as e:
+                    self.log_message.emit(
+                        f"Warning: could not close shutter before disconnect: {e}")
                 self._laser.close()
                 self._laser = None
             self.status_changed.emit("DISCONNECTED")
@@ -5631,6 +5912,9 @@ class SantecPanel(QWidget):
         self._power_sweep_log     = []
         self._fast_sweep_running  = False
         self._fast_sweep_result   = None   # (wavelengths[], [ch1_W..ch4_W])
+        self._fast_sweep_plot_win = None
+        self._last_power_sweep_csv = None
+        self._last_fast_sweep_csv  = None
 
         self._build_ui()
 
@@ -5717,7 +6001,11 @@ class SantecPanel(QWidget):
         self._wl_spin = NoScrollDoubleSpinBox()
         self._wl_spin.setDecimals(4)
         self._wl_spin.setRange(1400.0, 1700.0)   # narrowed to instrument range after connect
-        self._wl_spin.setValue(load_connection_settings().get("santec_last_wavelength_nm", 1550.0))
+        self._wl_spin.setValue(1550.0)
+        # Same key _do_set_wl/_do_output_on already save on click — persist_spinbox
+        # additionally saves on every change, so the value survives a session even
+        # if SET!/Output ON was never clicked.
+        persist_spinbox(self._wl_spin, "santec_last_wavelength_nm")
         man_lay.addWidget(self._wl_spin, 2, 1)
         self._wl_btn = QPushButton("SET!")
         self._wl_btn.setEnabled(False)
@@ -5728,7 +6016,8 @@ class SantecPanel(QWidget):
         self._pow_spin = NoScrollDoubleSpinBox()
         self._pow_spin.setDecimals(3)
         self._pow_spin.setRange(0.0, 20.0)       # narrowed to instrument range after connect
-        self._pow_spin.setValue(load_connection_settings().get("santec_last_power_mw", 1.0))
+        self._pow_spin.setValue(1.0)
+        persist_spinbox(self._pow_spin, "santec_last_power_mw")
         man_lay.addWidget(self._pow_spin, 3, 1)
         self._pow_btn = QPushButton("SET!")
         self._pow_btn.setEnabled(False)
@@ -5747,6 +6036,7 @@ class SantecPanel(QWidget):
         self._pw_start.setDecimals(3)
         self._pw_start.setRange(0.0, 20.0)
         self._pw_start.setValue(0.5)
+        persist_spinbox(self._pw_start, "santec_power_sweep_start_mw")
         pwg.addWidget(self._pw_start, 0, 1)
 
         pwg.addWidget(QLabel("Stop (mW):"), 0, 2)
@@ -5754,6 +6044,7 @@ class SantecPanel(QWidget):
         self._pw_stop.setDecimals(3)
         self._pw_stop.setRange(0.0, 20.0)
         self._pw_stop.setValue(2.0)
+        persist_spinbox(self._pw_stop, "santec_power_sweep_stop_mw")
         pwg.addWidget(self._pw_stop, 0, 3)
 
         pwg.addWidget(QLabel("Step (mW):"), 1, 0)
@@ -5761,6 +6052,7 @@ class SantecPanel(QWidget):
         self._pw_step.setDecimals(3)
         self._pw_step.setRange(0.001, 10.0)
         self._pw_step.setValue(0.1)
+        persist_spinbox(self._pw_step, "santec_power_sweep_step_mw")
         pwg.addWidget(self._pw_step, 1, 1)
 
         pwg.addWidget(QLabel("Dwell (s):"), 1, 2)
@@ -5768,6 +6060,7 @@ class SantecPanel(QWidget):
         self._pw_dwell.setDecimals(2)
         self._pw_dwell.setRange(0.0, 60.0)
         self._pw_dwell.setValue(0.5)
+        persist_spinbox(self._pw_dwell, "santec_power_sweep_dwell_s")
         pwg.addWidget(self._pw_dwell, 1, 3)
 
         self._pw_run_btn  = QPushButton("Run Power Sweep")
@@ -5791,6 +6084,11 @@ class SantecPanel(QWidget):
         self._power_sweep_export_btn.setEnabled(False)
         self._power_sweep_export_btn.clicked.connect(self._export_power_sweep_csv)
         pwg.addWidget(self._power_sweep_export_btn, 4, 3)
+        self._power_sweep_open_btn = QPushButton("📂 Open")
+        self._power_sweep_open_btn.setEnabled(False)
+        self._power_sweep_open_btn.setToolTip("Open the last-exported power-sweep CSV")
+        self._power_sweep_open_btn.clicked.connect(lambda: open_saved_file(self._last_power_sweep_csv))
+        pwg.addWidget(self._power_sweep_open_btn, 4, 4)
 
         final.addWidget(pw_box)
 
@@ -5803,6 +6101,7 @@ class SantecPanel(QWidget):
         self._fs_start.setDecimals(4)
         self._fs_start.setRange(1400.0, 1700.0)
         self._fs_start.setValue(1545.0)
+        persist_spinbox(self._fs_start, "santec_fast_sweep_start_nm")
         fsg.addWidget(self._fs_start, 0, 1)
 
         fsg.addWidget(QLabel("Stop (nm):"), 0, 2)
@@ -5810,6 +6109,7 @@ class SantecPanel(QWidget):
         self._fs_stop.setDecimals(4)
         self._fs_stop.setRange(1400.0, 1700.0)
         self._fs_stop.setValue(1555.0)
+        persist_spinbox(self._fs_stop, "santec_fast_sweep_stop_nm")
         fsg.addWidget(self._fs_stop, 0, 3)
 
         fsg.addWidget(QLabel("Speed (nm/s):"), 1, 0)
@@ -5817,6 +6117,7 @@ class SantecPanel(QWidget):
         self._fs_speed.setDecimals(2)
         self._fs_speed.setRange(1.0, 100.0)
         self._fs_speed.setValue(50.0)
+        persist_spinbox(self._fs_speed, "santec_fast_sweep_speed_nm_s")
         fsg.addWidget(self._fs_speed, 1, 1)
 
         fsg.addWidget(QLabel("Power (mW):"), 1, 2)
@@ -5824,6 +6125,7 @@ class SantecPanel(QWidget):
         self._fs_power.setDecimals(3)
         self._fs_power.setRange(0.0, 20.0)
         self._fs_power.setValue(1.0)
+        persist_spinbox(self._fs_power, "santec_fast_sweep_power_mw")
         fsg.addWidget(self._fs_power, 1, 3)
 
         self._fs_info_lbl = QLabel("")
@@ -5842,7 +6144,12 @@ class SantecPanel(QWidget):
         self._fs_export_btn = QPushButton("Export CSV\u2026")
         self._fs_export_btn.setEnabled(False)
         self._fs_export_btn.clicked.connect(self._export_fast_sweep_csv)
-        fsg.addWidget(self._fs_export_btn, 5, 0, 1, 4)
+        fsg.addWidget(self._fs_export_btn, 5, 0, 1, 3)
+        self._fs_open_btn = QPushButton("📂 Open")
+        self._fs_open_btn.setEnabled(False)
+        self._fs_open_btn.setToolTip("Open the last-exported fast-sweep CSV")
+        self._fs_open_btn.clicked.connect(lambda: open_saved_file(self._last_fast_sweep_csv))
+        fsg.addWidget(self._fs_open_btn, 5, 3)
 
         for sb in (self._fs_start, self._fs_stop, self._fs_speed):
             sb.valueChanged.connect(self._update_fast_sweep_info)
@@ -5987,7 +6294,8 @@ class SantecPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[Santec Power Sweep] Saved {len(rows)} rows → {fname}")
         self._log.append(f"Saved {len(rows)} power-sweep rows → {fname}")
-        open_saved_file(fname)
+        self._last_power_sweep_csv = fname
+        self._power_sweep_open_btn.setEnabled(True)
 
     # ── Button actions ────────────────────────────────────────────────────────
 
@@ -6156,7 +6464,21 @@ class SantecPanel(QWidget):
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[Santec Fast Sweep] Saved {len(rows)} rows \u2192 {fname}")
         self._log.append(f"Saved {len(rows)} fast-sweep rows \u2192 {fname}")
-        open_saved_file(fname)
+        self._last_fast_sweep_csv = fname
+        self._fs_open_btn.setEnabled(True)
+
+        # Save the matplotlib results plot alongside the CSV \u2014 same basename,
+        # in data/images/ \u2014 so the picture and the data it came from stay
+        # paired. self._fast_sweep_plot_win survives even if the user closed
+        # that window (we still hold the Python reference), so this reuses
+        # the exact figure already rendered instead of re-plotting from scratch.
+        if HAS_MATPLOTLIB and self._fast_sweep_plot_win is not None:
+            os.makedirs(IMAGES_DIR, exist_ok=True)
+            img_name = os.path.splitext(os.path.basename(fname))[0] + ".png"
+            img_path = os.path.join(IMAGES_DIR, img_name)
+            self._fast_sweep_plot_win.save_png(img_path)
+            print(f"[Santec Fast Sweep] Saved plot image \u2192 {img_path}")
+            self._log.append(f"Saved plot image \u2192 {img_path}")
 
     def cleanup(self):
         if HAS_PYVISA and HAS_SANTEC:
@@ -6311,6 +6633,12 @@ class FastSweepMatplotlibWindow(QWidget):
         self.show()
         self.raise_()
 
+    def save_png(self, path: str) -> None:
+        """Saves the currently-rendered figure exactly as shown — works even
+        if this window has since been closed/hidden, since closing a QWidget
+        we still hold a Python reference to doesn't destroy its Figure."""
+        self._fig.savefig(path, facecolor="white")
+
 
 class CoreDAQWorker(QObject):
     """
@@ -6354,6 +6682,12 @@ class CoreDAQWorker(QObject):
     # the worker thread from pegging a core and starving the GUI thread of
     # the GIL, which is what made the whole app feel frozen while connected.
     POLL_INTERVAL_MS = 15
+
+    # Only used by do_connect() (see _call_with_timeout below) — NOT do_poll's
+    # hot path, which is exactly why this can't just reuse the old
+    # every-call-gets-a-thread pattern _call()'s docstring describes moving
+    # away from.
+    CONNECT_TIMEOUT_S = 5.0
 
     def __init__(self):
         super().__init__()
@@ -6399,6 +6733,35 @@ class CoreDAQWorker(QObject):
         the same direct-call model the reliable reference GUI uses."""
         return func(*args, **kwargs)
 
+    def _call_with_timeout(self, func, *args, **kwargs):
+        """Same bounded-timeout pattern as ConexWorker: runs `func` on a
+        throwaway daemon thread so a wedged call can't hang this worker
+        thread forever, and raises TimeoutError instead. Reserved for
+        do_connect() specifically — a one-time call, not the hot poll loop
+        — so it can't reintroduce the GIL-contention/thread-churn problem
+        that made _call() above stop doing this for every call. This is
+        what lets auto-connect-on-launch be safe: previously a wedged
+        serial-port open here froze the whole GUI unrecoverably; now it
+        times out and reports an error instead."""
+        result = {}
+        def _run():
+            try:
+                result['value'] = func(*args, **kwargs)
+            except Exception as e:
+                result['error'] = e
+            finally:
+                result['done'] = True
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(self.CONNECT_TIMEOUT_S)
+        if not result.get('done'):
+            raise TimeoutError(
+                f"CoreDAQ stopped responding (no reply within {self.CONNECT_TIMEOUT_S:.0f}s) "
+                "— the serial connection is likely wedged. Unplug/replug the device.")
+        if 'error' in result:
+            raise result['error']
+        return result['value']
+
     def do_connect(self, port: str):
         # Defensive: release any handle we're still holding from a prior
         # attempt before opening a new one, so we're never the reason a
@@ -6406,7 +6769,7 @@ class CoreDAQWorker(QObject):
         # hardware call — close() can itself block on a wedged port.
         if self._daq is not None:
             try:
-                self._call(self._daq.close)
+                self._call_with_timeout(self._daq.close)
             except Exception:
                 pass
             self._daq = None
@@ -6418,18 +6781,18 @@ class CoreDAQWorker(QObject):
             if port.isdigit():
                 port = f"COM{port}"
             if port:
-                daq = self._call(CoreDAQ, port)
+                daq = self._call_with_timeout(CoreDAQ, port)
             else:
-                ports = self._call(CoreDAQ.find)
+                ports = self._call_with_timeout(CoreDAQ.find)
                 if not ports:
                     self.error.emit("No CoreDAQ device found — check USB connection")
                     return
                 self.log_message.emit(f"Auto-detected CoreDAQ on {ports[0]}")
-                daq = self._call(CoreDAQ, ports[0])
+                daq = self._call_with_timeout(CoreDAQ, ports[0])
             self._daq = daq
-            idn       = self._call(self._daq.idn)
-            frontend  = self._call(self._daq.frontend_type)
-            detector  = self._call(self._daq.detector_type)
+            idn       = self._call_with_timeout(self._daq.idn)
+            frontend  = self._call_with_timeout(self._daq.frontend_type)
+            detector  = self._call_with_timeout(self._daq.detector_type)
             # Fresh connection: drop any stale samples from a previous device
             # so the plot window doesn't briefly show old data.
             self.plot_write_index   = 0
@@ -6635,9 +6998,14 @@ class CoreDAQPanel(QWidget):
 
         self._build_ui()
 
-        # Auto-connect on launch was removed: a wedged/blocking serial read
-        # here froze the whole GUI at startup, unrecoverable short of a
-        # reboot. Connect manually via the button instead.
+        # Auto-connect on launch. This used to be unsafe — a wedged/blocking
+        # serial open here froze the whole GUI at startup, unrecoverable
+        # short of a reboot — but do_connect() now runs its hardware calls
+        # through _call_with_timeout() (see CoreDAQWorker), which can't hang
+        # past CONNECT_TIMEOUT_S. Deferred via singleShot(0, ...) so it fires
+        # once the event loop is actually pumping rather than synchronously
+        # mid-construction.
+        QTimer.singleShot(0, self._do_connect)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -6697,6 +7065,7 @@ class CoreDAQPanel(QWidget):
         self._wl_spin.setDecimals(1)
         self._wl_spin.setRange(400.0, 1700.0)
         self._wl_spin.setValue(1550.0)
+        persist_spinbox(self._wl_spin, "coredaq_wavelength_nm")
         cfg_lay.addWidget(self._wl_spin, 0, 1)
         self._wl_btn = QPushButton("SET!")
         self._wl_btn.setEnabled(False)
@@ -7095,6 +7464,7 @@ class UnifiedMainWindow(QMainWindow):
         self._rec_t0       = 0.0
         self._rec_records  = []
         self._rec_plot_win = None
+        self._last_global_csv = None
         self._rec_timer = QTimer()
         self._rec_timer.setInterval(GLOBAL_REC_TICK_MS)
         self._rec_timer.timeout.connect(self._global_record_tick)
@@ -7122,6 +7492,11 @@ class UnifiedMainWindow(QMainWindow):
         lay.addWidget(self._rec_status_lbl)
         lay.addStretch()
         lay.addWidget(self._rec_save_btn)
+        self._rec_open_btn = QPushButton("📂 Open")
+        self._rec_open_btn.setEnabled(False)
+        self._rec_open_btn.setToolTip("Open the last-saved combined recording CSV")
+        self._rec_open_btn.clicked.connect(lambda: open_saved_file(self._last_global_csv))
+        lay.addWidget(self._rec_open_btn)
         return bar
 
     def _toggle_global_recording(self):
@@ -7232,7 +7607,8 @@ class UnifiedMainWindow(QMainWindow):
             header, rows)
         print(f"[Global Recording] Saved {len(rows)} rows → {fname}")
         self.status_bar.showMessage(f"Saved {len(rows)} rows → {fname}", 5000)
-        open_saved_file(fname)
+        self._last_global_csv = fname
+        self._rec_open_btn.setEnabled(True)
 
     # ── Pop-out ────────────────────────────────────────────────────────────────
 

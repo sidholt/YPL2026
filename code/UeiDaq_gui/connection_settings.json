@@ -8,5 +8,10 @@
   "santec_last_wavelength_nm": 1550.55,
   "conex_x_com_port": 13,
   "conex_y_com_port": 12,
-  "itla_com_port": 15
+  "itla_com_port": 15,
+  "itla_channel": 43,
+  "daq_sweep_stop": 10.0,
+  "itla_wavelength_nm": 1550.1161,
+  "santec_fast_sweep_start_nm": 1500.0,
+  "daq_wave_offset": 0.0
 }
