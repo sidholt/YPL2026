@@ -17,17 +17,26 @@ or its instrument isn't connected.
 - Per-card analog output control (Dev0/Dev1/Dev2 — current or voltage mode),
   up to 32 channels
 - Per-pin live control: value spinbox + slider, custom nicknames, ramped
-  (slew-rate-limited) or instant "Set", plus "Write All" / "Zero All"
-- Automatic pin sweep (by step count or step size, adjustable dwell time),
-  with optional CoreDAQ optical-power logging at each step and CSV export
-- Software waveform generator — sine/cosine output on any pin with
-  adjustable frequency, amplitude, offset, and update rate
+  (slew-rate-limited) or instant "Set", plus "Write All" / "Zero All" /
+  "Set All To" (write every active pin to one value at once)
+- Automatic pin sweep (by step count or step size, adjustable dwell time) —
+  pick any subset of pins to sweep the same Start→Stop range together in
+  lockstep, with optional CoreDAQ optical-power logging at each step, a
+  matplotlib results plot, and CSV export
+- Software waveform generator — sine/cosine on any subset of pins at once
+  (all playing the same waveform together), with adjustable frequency,
+  amplitude, offset, and update rate
 - Data recording (start/stop) with live commanded-vs-measured and V-I plots,
   saved to CSV
 - Live Guardian ADC readback for the AO-333 card (optional — needs the
   32-bit bridge, see below)
 - Embedded Moku:Go oscilloscope panel
 - Combined/global recording across multiple sources into one CSV
+- Physical pin remap (`PIN_REMAP` in `gui.py`) for AO-333 cards whose
+  connector/cabling doesn't wire in straight sequential order — every write
+  path (Set, Write All, Set All To, ramp, sweep, wave) goes through the same
+  correction, and readback follows it too. See `pin_identify_test.py` (below)
+  to work out a card's actual mapping.
 
 **CoreDAQ Power Meter**
 - Connects over USB-serial (auto-detect or manual COM port)
@@ -40,9 +49,11 @@ or its instrument isn't connected.
 - Connects via Prologix GPIB-to-USB
 - Manual wavelength/power set; "Output ON" also applies whatever
   wavelength/power is currently dialed in
-- Power sweep (Cal 2-DC) with CoreDAQ logging and CSV export
+- Power sweep (Cal 2-DC) with CoreDAQ logging, a matplotlib results plot, and
+  CSV export
 - Hardware-triggered Fast Sweep (continuous wavelength sweep, captured by
-  CoreDAQ in free-run) with a clean white-background matplotlib results plot
+  CoreDAQ in free-run) with a clean white-background matplotlib results plot,
+  saved as a PNG alongside its CSV export
 
 **CONEX Motor (Newport CONEX-CC / TRA12CC)**
 - Independent X/Y axis control, each on its own COM port
@@ -58,14 +69,15 @@ or its instrument isn't connected.
 - ITU-grid channel tuning or direct wavelength entry (with optional FTF
   sub-grid detuning)
 - Live wavelength/power retuning without an off/on power cycle
-- Wavelength sweep (grid-snapped) and power sweep, with CoreDAQ logging and
-  CSV export
+- Wavelength sweep (grid-snapped) and power sweep, with CoreDAQ logging, a
+  matplotlib results plot, and CSV export
 - Dither mode, plus diagnostics readback (temperature, fatal status, etc.)
 
 **HP-8168F Laser**
 - Connects via Prologix GPIB
 - Manual wavelength/power set, output on/off
-- Wavelength sweep and power sweep with CoreDAQ logging and CSV export
+- Wavelength sweep and power sweep with CoreDAQ logging, a matplotlib results
+  plot, and CSV export
 
 **Across every tab**
 - Pop any tab out into its own window (and reattach it later)
@@ -81,6 +93,12 @@ or its instrument isn't connected.
   - `ao333_bridge.py` — optional 32-bit helper process that streams Guardian
     ADC readback for the AO-333 card; `gui.py` auto-launches it if a 32-bit
     venv is set up (see [Optional: AO-333 Guardian ADC bridge](#optional-ao-333-guardian-adc-bridge)).
+  - `pin_identify_test.py` — standalone script (not launched by the GUI) that
+    walks an AO-333 card's pins one at a time so you can work out its real
+    `PIN_REMAP`. With Guardian ADC readback it auto-detects which physical
+    channel each logical pin lands on (pins 0–7); anything beyond that needs
+    a multimeter. Close the main GUI (or disconnect that card) before
+    running it — two processes on the same channels will fight each other.
   - `hardware/` — one module per instrument (`coredaq.py`, `itla.py`,
     `laser_hp_8168F.py`, `laser_tsl_550.py`, plus a shared `visa_module/` for
     GPIB-over-Prologix support).
@@ -208,7 +226,10 @@ instrument (see [Features](#features) above). A few things worth knowing:
   current tab into its own window — useful for watching two instruments side
   by side. A detached window has its own control to reattach it.
 - Closing the main window disconnects and cleans up every instrument, even
-  ones currently popped out into their own windows.
+  ones currently popped out into their own windows. Before disconnecting, it
+  zeros every DAQ output pin and turns off laser emission (ITLA, Santec,
+  HP-8168F) — a manual Disconnect click does the same for whichever
+  instrument you clicked it on.
 
 ## Configuration
 
@@ -219,6 +240,11 @@ need to match your actual setup:
 - `MOKU_IP` — IP address of the Moku:Go, if used
 - `CARDS` — which device slots exist, their mode (`voltage`/`current`), and
   channel counts
+- `PIN_REMAP` — GUI/logical pin → actual physical output channel, per card
+  `dev`. Only populate entries you've directly confirmed (see
+  `pin_identify_test.py`); an unconfirmed entry is more dangerous than none,
+  since it would silently send commanded voltage to a physical pin you don't
+  think you're touching.
 - `MODE_RANGES` — output voltage/current limits per mode
 - `RAMP_TICK_MS` / `SLEW_RATE_V` / `SLEW_RATE_MA` — ramping behavior for
   analog output changes
@@ -248,3 +274,8 @@ hunting for the file afterward.
 - **A laser/motor tab can't connect** — check the COM port and (for GPIB
   instruments) the GPIB address match what's set in that tab; these are
   editable directly in the GUI and get saved for next time.
+- **Commanding pin N on the AO-333 (Dev2) card outputs on the wrong physical
+  channel** — the card's connector/cabling doesn't necessarily wire straight
+  through. Don't guess a fix by trial and error; run `pin_identify_test.py`
+  to find the actual mapping for the pins you care about, then encode the
+  confirmed pairs into `PIN_REMAP` (see [Configuration](#configuration)).

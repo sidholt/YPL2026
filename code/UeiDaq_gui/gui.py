@@ -28,9 +28,9 @@ from PyQt6.QtWidgets import (
     QGridLayout, QLabel, QPushButton, QScrollArea, QFrame, QSizePolicy,
     QDoubleSpinBox, QSlider, QStackedWidget, QStatusBar, QGroupBox,
     QSpinBox, QComboBox, QLineEdit, QCheckBox, QTabWidget, QTextEdit,
-    QMessageBox
+    QMessageBox, QListWidget, QListWidgetItem
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QObject, QEventLoop
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QObject, QEventLoop, QEvent
 from PyQt6.QtGui import QPalette, QColor
 
 # ── Optional hardware libraries (each tab degrades gracefully) ────────────────
@@ -212,6 +212,113 @@ class NoScrollDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MULTI-SELECT PIN PICKER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MultiPinSelector(QPushButton):
+    """Button that drops down a checklist popup for picking any subset of
+    pins — used for DAQ Control's Sweep/Waveform pin pickers. The button
+    label shows "N pins selected" (or the one item's own text, or a
+    placeholder) once the popup closes.
+
+    Deliberately NOT a QComboBox with checkable items: that first version
+    toggled unreliably because Qt's own item delegate ALSO toggles the
+    checkbox when a click lands in its small indicator rect — racing against
+    a manual "toggle on any click" handler and canceling it out on roughly
+    half of clicks on the checkbox itself, which is exactly where users
+    click. A plain QListWidget shown as its own Qt.WindowType.Popup window
+    fixes the "closed box doesn't show what's selected" half of that bug
+    (this button's text is the only place a "selected" summary gets
+    written, so nothing else can silently overwrite it) — but toggling still
+    isn't left to Qt's normal item-click signals: measured directly, clicks
+    landing inside the checkbox glyph's own small rect (a few pixels wide,
+    right where users naturally aim) never reach itemPressed/itemClicked at
+    all — something in the view/delegate's own checkbox hit-testing consumes
+    them first, even with the item's ItemIsUserCheckable flag left unset.
+    So toggling is done via a viewport event filter instead (see
+    eventFilter), which sees every raw mouse release before any of that
+    view-internal handling gets a chance to swallow it.
+    """
+
+    def __init__(self, placeholder: str = "No pins selected", parent=None):
+        super().__init__(placeholder, parent)
+        self._placeholder = placeholder
+        self.clicked.connect(self._toggle_popup)
+
+        self._popup = QListWidget(self)
+        self._popup.setWindowFlags(Qt.WindowType.Popup)
+        self._popup.viewport().installEventFilter(self)
+        self._popup.itemChanged.connect(lambda _item: self._refresh_text())
+        self._items: dict = {}   # data -> QListWidgetItem
+
+    def eventFilter(self, obj, event) -> bool:
+        if (obj is self._popup.viewport()
+                and event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton):
+            item = self._popup.itemAt(event.pos())
+            if item is not None:
+                item.setCheckState(
+                    Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked
+                    else Qt.CheckState.Checked)
+            return True   # consume — don't let the view's own click handling run too
+        return super().eventFilter(obj, event)
+
+    def addCheckableItem(self, text: str, data=None) -> None:
+        item = QListWidgetItem(text)
+        item.setCheckState(Qt.CheckState.Unchecked)
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        self._popup.addItem(item)
+        self._items[data] = item
+        self._refresh_text()
+
+    def clear(self) -> None:
+        self._popup.clear()
+        self._items.clear()
+        self._refresh_text()
+
+    def checked_data(self) -> list:
+        return [data for data, item in self._items.items()
+                if item.checkState() == Qt.CheckState.Checked]
+
+    def set_checked_data(self, values) -> None:
+        values = set(values)
+        for data, item in self._items.items():
+            item.setCheckState(Qt.CheckState.Checked if data in values
+                                else Qt.CheckState.Unchecked)
+        self._refresh_text()
+
+    def select_all(self) -> None:
+        for item in self._items.values():
+            item.setCheckState(Qt.CheckState.Checked)
+        self._refresh_text()
+
+    def set_item_text_for_data(self, data, text: str) -> None:
+        item = self._items.get(data)
+        if item is not None:
+            item.setText(text)
+            self._refresh_text()
+
+    def _toggle_popup(self) -> None:
+        if self._popup.isVisible():
+            self._popup.hide()
+            return
+        self._popup.setFixedWidth(max(self.width(), 160))
+        row_h = self._popup.sizeHintForRow(0) if self._popup.count() else 22
+        self._popup.setFixedHeight(min(320, row_h * self._popup.count() + 6))
+        self._popup.move(self.mapToGlobal(self.rect().bottomLeft()))
+        self._popup.show()
+
+    def _refresh_text(self) -> None:
+        checked = self.checked_data()
+        if not checked:
+            text = self._placeholder
+        elif len(checked) == 1:
+            text = self._items[checked[0]].text()
+        else:
+            text = f"{len(checked)} pins selected"
+        self.setText(text)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DAQ CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -378,7 +485,6 @@ BRIDGE_SCRIPT     = r"code\UeiDaq_gui\ao333_bridge.py"
 READBACK_DECIMALS      = 6
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
-PROMICRO_PLOT_WINDOW_S = 10.0
 COREDAQ_PLOT_WINDOW_S  = 30.0
 
 PROMICRO_PORT = "COM11"
@@ -834,7 +940,7 @@ class CardSession:
         self._timer.timeout.connect(self._ramp_tick)
 
         self._sweep_steps         = []
-        self._sweep_pin           = 0
+        self._sweep_pins          = []
         self._sweep_step_idx      = 0
         self._sweep_callback      = None
         self._sweep_done_callback = None
@@ -914,11 +1020,11 @@ class CardSession:
         self.writer.WriteSingleScan(scaled)
         self.values = list(values)
 
-    def start_wave(self, pin: int, waveform: str, freq: float,
+    def start_wave(self, pins: list, waveform: str, freq: float,
                    amplitude: float, offset: float, tick_ms: int,
                    callback=None):
         self.stop_wave()
-        self._wave_pin       = pin
+        self._wave_pins      = list(pins)
         self._wave_form      = waveform
         self._wave_freq      = freq
         self._wave_amplitude = amplitude
@@ -937,7 +1043,8 @@ class CardSession:
             2 * math.pi * self._wave_freq * self._wave_t)
         val = max(self.min_val, min(self.max_val, val))
         targets = list(self.values)
-        targets[self._wave_pin] = val
+        for p in self._wave_pins:
+            targets[p] = val
         try:
             self.write(targets)
         except Exception:
@@ -945,17 +1052,17 @@ class CardSession:
             return
         self._wave_t += self._wave_tick_ms / 1000.0
         if self._wave_callback:
-            self._wave_callback(self._wave_pin, val)
+            self._wave_callback(list(self._wave_pins), val)
 
     def stop_wave(self):
         if hasattr(self, '_wave_timer') and self._wave_timer.isActive():
             self._wave_timer.stop()
         self._wave_callback = None
 
-    def start_sweep(self, pin: int, start: float, stop: float,
+    def start_sweep(self, pins: list, start: float, stop: float,
                     steps: int, dwell_ms: int, callback, done_callback=None):
         self.stop_sweep()
-        self._sweep_pin           = pin
+        self._sweep_pins          = list(pins)
         self._sweep_dwell_ms      = dwell_ms
         self._sweep_callback      = callback
         self._sweep_done_callback = done_callback
@@ -981,7 +1088,8 @@ class CardSession:
             return
         target_val = self._sweep_steps[self._sweep_step_idx]
         targets    = list(self.values)
-        targets[self._sweep_pin]   = target_val
+        for p in self._sweep_pins:
+            targets[p] = target_val
         self._sweep_pending_target = target_val
         self.ramp_to(targets)
         self._sweep_poll = QTimer()
@@ -990,13 +1098,17 @@ class CardSession:
         self._sweep_poll.start()
 
     def _sweep_check_arrived(self):
-        if abs(self.values[self._sweep_pin] - self._sweep_pending_target) <= self._step:
+        # All swept pins share one target and the same slew rate, so they
+        # converge together — only advance once every one of them has
+        # actually arrived within tolerance, not just the first.
+        if all(abs(self.values[p] - self._sweep_pending_target) <= self._step
+               for p in self._sweep_pins):
             self._sweep_poll.stop()
             total = len(self._sweep_steps)
             idx   = self._sweep_step_idx
             if self._sweep_callback:
                 self._sweep_callback(
-                    self._sweep_pin, self.values[self._sweep_pin], idx + 1, total)
+                    list(self._sweep_pins), self._sweep_pending_target, idx + 1, total)
             self._sweep_step_idx += 1
             self._sweep_timer.start(self._sweep_dwell_ms)
 
@@ -1485,12 +1597,20 @@ class PinConfigView(QWidget):
         sg.setSpacing(6)
 
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Pin:"))
-        self.sweep_pin_combo = QComboBox()
+        row1.addWidget(QLabel("Pins:"))
+        self.sweep_pin_combo = MultiPinSelector("No pins selected")
         for i in range(NUM_PINS):
-            self.sweep_pin_combo.addItem(f"Pin {i:02d}", i)
-        self.sweep_pin_combo.setFixedWidth(80)
+            self.sweep_pin_combo.addCheckableItem(f"Pin {i:02d}", i)
+        self.sweep_pin_combo.setFixedWidth(140)
+        self.sweep_pin_combo.setToolTip(
+            "Every checked pin sweeps the same Start→Stop range together, "
+            "in lockstep")
         row1.addWidget(self.sweep_pin_combo)
+        self.sweep_select_all_btn = QPushButton("All")
+        self.sweep_select_all_btn.setFixedWidth(36)
+        self.sweep_select_all_btn.setToolTip("Check every pin for the sweep")
+        self.sweep_select_all_btn.clicked.connect(self.sweep_pin_combo.select_all)
+        row1.addWidget(self.sweep_select_all_btn)
         row1.addSpacing(10)
         row1.addWidget(QLabel("Start:"))
         self.sweep_start = NoScrollDoubleSpinBox()
@@ -1556,15 +1676,18 @@ class PinConfigView(QWidget):
         sg.addLayout(row3)
 
         row4 = QHBoxLayout()
-        self._sweep_log_chk = QCheckBox("Log CoreDAQ power")
+        self._sweep_log_chk = QCheckBox("Log CoreDAQ power (all 4 MZIs)")
+        self._sweep_log_chk.setChecked(True)
         self._sweep_log_chk.setToolTip(
-            "Records the CoreDAQ optical power meter reading at each sweep step")
+            "Records all 4 CoreDAQ MZI power readings at each sweep step.\n"
+            "On by default so sweep data is never silently missing this — "
+            "uncheck only if CoreDAQ isn't part of this run.")
         row4.addWidget(self._sweep_log_chk)
         row4.addSpacing(8)
-        row4.addWidget(QLabel("Head:"))
+        row4.addWidget(QLabel("Show:"))
         self._sweep_coredaq_head_combo = QComboBox()
         for h in range(1, 5):
-            self._sweep_coredaq_head_combo.addItem(f"Head {h}", h)
+            self._sweep_coredaq_head_combo.addItem(f"MZI {h}", h)
         self._sweep_coredaq_head_combo.setFixedWidth(80)
         row4.addWidget(self._sweep_coredaq_head_combo)
         row4.addSpacing(10)
@@ -1598,12 +1721,19 @@ class PinConfigView(QWidget):
         wg.setSpacing(6)
 
         wrow1 = QHBoxLayout()
-        wrow1.addWidget(QLabel("Pin:"))
-        self.wave_pin_combo = QComboBox()
+        wrow1.addWidget(QLabel("Pins:"))
+        self.wave_pin_combo = MultiPinSelector("No pins selected")
         for i in range(NUM_PINS):
-            self.wave_pin_combo.addItem(f"Pin {i:02d}", i)
-        self.wave_pin_combo.setFixedWidth(80)
+            self.wave_pin_combo.addCheckableItem(f"Pin {i:02d}", i)
+        self.wave_pin_combo.setFixedWidth(140)
+        self.wave_pin_combo.setToolTip(
+            "Every checked pin plays the same waveform together, in lockstep")
         wrow1.addWidget(self.wave_pin_combo)
+        self.wave_select_all_btn = QPushButton("All")
+        self.wave_select_all_btn.setFixedWidth(36)
+        self.wave_select_all_btn.setToolTip("Check every pin for the waveform")
+        self.wave_select_all_btn.clicked.connect(self.wave_pin_combo.select_all)
+        wrow1.addWidget(self.wave_select_all_btn)
         wrow1.addSpacing(10)
         wrow1.addWidget(QLabel("Wave:"))
         self.wave_type_combo = QComboBox()
@@ -1791,38 +1921,8 @@ class PinConfigView(QWidget):
         pm_ctrl.addStretch()
         pg2.addLayout(pm_ctrl)
 
-        if HAS_PYQTGRAPH:
-            self._pm_plot = pg.PlotWidget()
-            self._pm_plot.setLabel('left',   'Voltage', units='V')
-            self._pm_plot.setLabel('bottom', 'Time',    units='s')
-            self._pm_plot.getAxis('left').enableAutoSIPrefix(False)
-            self._pm_plot.setMinimumHeight(140)
-            self._pm_curve = self._pm_plot.plot(
-                [], [], pen=pg.mkPen('#00FF88', width=2))
-            pg2.addWidget(self._pm_plot)
-
-            self._pm_ma_plot = pg.PlotWidget()
-            self._pm_ma_plot.setLabel('left',   'Current', units='mA')
-            self._pm_ma_plot.setLabel('bottom', 'Time',    units='s')
-            self._pm_ma_plot.getAxis('left').enableAutoSIPrefix(False)
-            self._pm_ma_plot.setMinimumHeight(140)
-            self._pm_ma_curve = self._pm_ma_plot.plot(
-                [], [], pen=pg.mkPen(C_RED, width=2))
-            pg2.addWidget(self._pm_ma_plot)
-        else:
-            self._pm_plot     = None
-            self._pm_curve    = None
-            self._pm_ma_plot  = None
-            self._pm_ma_curve = None
-
         self._pm_plot_group.setVisible(False)
         root.addWidget(self._pm_plot_group)
-
-        self._pm_t   = 0.0
-        self._pm_ts  = []
-        self._pm_vs  = []
-        self._pm_ma_ts = []
-        self._pm_ma_vs = []
 
         # Pro Micro worker + thread
         self._pm_thread = QThread()
@@ -1848,18 +1948,6 @@ class PinConfigView(QWidget):
         if not self._plot_dirty or not HAS_PYQTGRAPH:
             return
         self._plot_dirty = False
-
-        if self._pm_curve and self._pm_ts:
-            self._pm_curve.setData(self._pm_ts, self._pm_vs)
-            x_max = self._pm_ts[-1]
-            self._pm_plot.setXRange(
-                x_max - PROMICRO_PLOT_WINDOW_S, x_max, padding=0)
-
-        if self._pm_ma_curve and self._pm_ma_ts:
-            self._pm_ma_curve.setData(self._pm_ma_ts, self._pm_ma_vs)
-            x_max = self._pm_ma_ts[-1]
-            self._pm_ma_plot.setXRange(
-                x_max - PROMICRO_PLOT_WINDOW_S, x_max, padding=0)
 
         if self._cmp_win and self._cmp_win.isVisible() and HAS_PYQTGRAPH:
             if self._cmp_win._cmd_ts:
@@ -1926,12 +2014,6 @@ class PinConfigView(QWidget):
         save_connection_setting("promicro_port", port)
         self._pm_connect_btn.setEnabled(False)
         self._pm_connect_btn.setText("…")
-        self._pm_t = 0.0
-        self._pm_ts = []; self._pm_vs = []
-        self._pm_ma_ts = []; self._pm_ma_vs = []
-        if HAS_PYQTGRAPH:
-            if self._pm_curve:    self._pm_curve.setData([], [])
-            if self._pm_ma_curve: self._pm_ma_curve.setData([], [])
         QTimer.singleShot(0, lambda: self._pm_worker.start(port))
 
     def _pm_disconnect(self):
@@ -1968,16 +2050,6 @@ class PinConfigView(QWidget):
                 and self._rec_src_combo.currentData() == "promicro"):
             self._append_record(v, dt=0.2)
 
-        if not HAS_PYQTGRAPH or self._pm_curve is None:
-            return
-        self._pm_t += 0.2
-        self._pm_ts.append(self._pm_t)
-        self._pm_vs.append(v)
-        cutoff = self._pm_t - PROMICRO_PLOT_WINDOW_S
-        while self._pm_ts and self._pm_ts[0] < cutoff:
-            self._pm_ts.pop(0); self._pm_vs.pop(0)
-        self._plot_dirty = True
-
     def _on_pm_current(self, ma: float):
         self._pm_ma_lbl.setText(f"{ma:.3f} mA")
 
@@ -1986,15 +2058,6 @@ class PinConfigView(QWidget):
                 and self.card_session
                 and self.card_session.mode == "current"):
             self._push_comparison(ma, dt=0.2)
-
-        if not HAS_PYQTGRAPH or self._pm_ma_curve is None:
-            return
-        self._pm_ma_ts.append(self._pm_t)
-        self._pm_ma_vs.append(ma)
-        cutoff = self._pm_t - PROMICRO_PLOT_WINDOW_S
-        while self._pm_ma_ts and self._pm_ma_ts[0] < cutoff:
-            self._pm_ma_ts.pop(0); self._pm_ma_vs.pop(0)
-        self._plot_dirty = True
 
     def _on_sweep_mode_toggled(self):
         steps_mode = self._sweep_mode_combo.currentData() == "steps"
@@ -2055,9 +2118,7 @@ class PinConfigView(QWidget):
         if self.card_session and idx < self.card_session.num_pins:
             text = self._pin_display_name(idx)
             for combo in (self.sweep_pin_combo, self.wave_pin_combo):
-                pos = combo.findData(idx)
-                if pos >= 0:
-                    combo.setItemText(pos, text)
+                combo.set_item_text_for_data(idx, text)
 
     def _pin_display_name(self, idx: int) -> str:
         name = self._channel_names.get(str(idx), "")
@@ -2101,8 +2162,13 @@ class PinConfigView(QWidget):
         self.wave_pin_combo.clear()
         for i in range(cs.num_pins):
             text = self._pin_display_name(i)
-            self.sweep_pin_combo.addItem(text, i)
-            self.wave_pin_combo.addItem(text, i)
+            self.sweep_pin_combo.addCheckableItem(text, i)
+            self.wave_pin_combo.addCheckableItem(text, i)
+        # Default to Pin 0 checked in both, so Run Sweep/Run Wave has
+        # something to act on immediately after connecting instead of
+        # silently doing nothing until the user opens the dropdown.
+        self.sweep_pin_combo.set_checked_data([0])
+        self.wave_pin_combo.set_checked_data([0])
 
         self.sweep_start.setMinimum(cs.min_val)
         self.sweep_start.setMaximum(cs.max_val)
@@ -2141,9 +2207,6 @@ class PinConfigView(QWidget):
             lbl.setText("—")
         self._guardian_values = [0.0] * NUM_PINS
         self._pm_plot_group.setVisible(True)
-        if HAS_PYQTGRAPH:
-            if self._pm_plot:    self._pm_plot.setVisible(is_voltage)
-            if self._pm_ma_plot: self._pm_ma_plot.setVisible(not is_voltage)
         self._rec_src_row_widget.setVisible(is_voltage)
 
         self._cmp_src_combo.blockSignals(True)
@@ -2313,7 +2376,10 @@ class PinConfigView(QWidget):
         if cs is None: return
         try:
             if not cs.connected: cs.connect()
-            pin      = self.sweep_pin_combo.currentData()
+            pins = self.sweep_pin_combo.checked_data()
+            if not pins:
+                self._status("Sweep error: no pins selected")
+                return
             start    = self.sweep_start.value()
             stop     = self.sweep_stop.value()
             steps    = self._compute_steps()
@@ -2321,11 +2387,12 @@ class PinConfigView(QWidget):
             self._sweep_power_log = []
             self._sweep_export_btn.setEnabled(False)
             self._sweep_power_lbl.setText("")
-            cs.start_sweep(pin, start, stop, steps, dwell_ms,
+            cs.start_sweep(pins, start, stop, steps, dwell_ms,
                            self._on_sweep_step, self._on_sweep_done)
             self.sweep_run_btn.setEnabled(False)
             self.sweep_stop_btn.setEnabled(True)
-            self._status(f"Sweep running — Pin {pin:02d}  {start:.3f} → "
+            pin_desc = f"Pin {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} pins"
+            self._status(f"Sweep running — {pin_desc}  {start:.3f} → "
                          f"{stop:.3f} {cs.unit}  {steps} steps")
         except Exception as e:
             self._status(f"Sweep error: {e}")
@@ -2336,13 +2403,15 @@ class PinConfigView(QWidget):
         self.sweep_stop_btn.setEnabled(False)
         self._status("Sweep stopped")
 
-    def _on_sweep_step(self, pin, value, step, total):
+    def _on_sweep_step(self, pins, value, step, total):
         self._syncing = True
-        self.spinboxes[pin].setValue(value)
-        self.sliders[pin].setValue(int(value * 100))
+        for pin in pins:
+            self.spinboxes[pin].setValue(value)
+            self.sliders[pin].setValue(int(value * 100))
         self._syncing = False
         cs = self.card_session
-        self._status(f"Sweep — Pin {pin:02d} at {value:.3f} "
+        pin_desc = f"Pin {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} pins"
+        self._status(f"Sweep — {pin_desc} at {value:.3f} "
                      f"{cs.unit if cs else ''}  (step {step}/{total})")
 
         if self._sweep_log_chk.isChecked() and self._coredaq_panel is not None:
@@ -2351,7 +2420,7 @@ class PinConfigView(QWidget):
                 self._sweep_power_log.append((value, *powers))
                 head = self._sweep_coredaq_head_combo.currentData()
                 self._sweep_power_lbl.setText(
-                    f"Step {step}/{total} — Head {head}: {_fmt_power_w(powers[head - 1])}")
+                    f"Step {step}/{total} — MZI {head}: {_fmt_power_w(powers[head - 1])}")
             else:
                 self._sweep_power_lbl.setText(
                     "CoreDAQ not connected — power not logged for this step")
@@ -2371,8 +2440,8 @@ class PinConfigView(QWidget):
         for ch in range(4):
             xs = [row[0] for row in self._sweep_power_log]
             ys = [row[1 + ch] for row in self._sweep_power_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
-        win = MultiSeriesPlotWindow("AO Sweep — CoreDAQ Power", "AO value", unit)
+            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+        win = MatplotlibPlotWindow("AO Sweep — CoreDAQ Power", "AO value", unit)
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -2395,9 +2464,22 @@ class PinConfigView(QWidget):
                 for v, *powers in self._sweep_power_log]
         write_csv_with_metadata(fname, comments, header, rows)
         print(f"[Sweep] Saved {len(rows)} rows → {fname}")
-        self._status(f"Saved {len(rows)} sweep/power rows → {fname}")
         self._last_sweep_csv = fname
         self._sweep_open_btn.setEnabled(True)
+
+        # Save the matplotlib results plot alongside the CSV — same basename,
+        # in data/images/ — same pairing convention as Santec Fast Sweep.
+        img_saved = False
+        if HAS_MATPLOTLIB and self._sweep_plot_win is not None:
+            os.makedirs(IMAGES_DIR, exist_ok=True)
+            img_name = os.path.splitext(os.path.basename(fname))[0] + ".png"
+            img_path = os.path.join(IMAGES_DIR, img_name)
+            self._sweep_plot_win.save_png(img_path)
+            print(f"[Sweep] Saved plot image → {img_path}")
+            img_saved = True
+
+        self._status(f"Saved {len(rows)} sweep/power rows → {fname}"
+                      + ("  (+ image)" if img_saved else ""))
 
     def _sb_changed(self, idx, val):
         if self._syncing: return
@@ -2524,17 +2606,21 @@ class PinConfigView(QWidget):
         if cs is None: return
         try:
             if not cs.connected: cs.connect()
-            pin       = self.wave_pin_combo.currentData()
+            pins = self.wave_pin_combo.checked_data()
+            if not pins:
+                self._status("Wave error: no pins selected")
+                return
             waveform  = self.wave_type_combo.currentData()
             freq      = self.wave_freq_sb.value()
             amplitude = self.wave_amp_sb.value()
             offset    = self.wave_offset_sb.value()
             tick_ms   = self.wave_tick_sb.value()
-            cs.start_wave(pin, waveform, freq, amplitude, offset, tick_ms,
+            cs.start_wave(pins, waveform, freq, amplitude, offset, tick_ms,
                           self._on_wave_tick)
             self.wave_run_btn.setEnabled(False)
             self.wave_stop_btn.setEnabled(True)
-            self._status(f"Wave running — Pin {pin:02d}  {waveform}  {freq}Hz  "
+            pin_desc = f"Pin {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} pins"
+            self._status(f"Wave running — {pin_desc}  {waveform}  {freq}Hz  "
                          f"amp={amplitude} {cs.unit}  offset={offset} {cs.unit}")
         except Exception as e:
             self._status(f"Wave error: {e}")
@@ -2545,10 +2631,11 @@ class PinConfigView(QWidget):
         self.wave_stop_btn.setEnabled(False)
         self._status("Wave stopped")
 
-    def _on_wave_tick(self, pin, value):
+    def _on_wave_tick(self, pins, value):
         self._syncing = True
-        self.spinboxes[pin].setValue(value)
-        self.sliders[pin].setValue(int(value * 100))
+        for pin in pins:
+            self.spinboxes[pin].setValue(value)
+            self.sliders[pin].setValue(int(value * 100))
         self._syncing = False
 
     def _status(self, msg):
@@ -3409,8 +3496,10 @@ class ITLAPanel(QWidget):
         sg.addWidget(self.btn_sweep, 2, 0, 1, 4)
 
         self._sweep_log_chk = QCheckBox("Log CoreDAQ power (all 4 channels)")
+        self._sweep_log_chk.setChecked(True)
         self._sweep_log_chk.setToolTip(
-            "Records the CoreDAQ optical power meter at each sweep step")
+            "Records the CoreDAQ optical power meter at each sweep step. "
+            "On by default so sweep data is never silently missing this.")
         sg.addWidget(self._sweep_log_chk, 3, 0, 1, 3)
         self._sweep_export_btn = QPushButton("Export CSV…")
         self._sweep_export_btn.setEnabled(False)
@@ -3469,8 +3558,10 @@ class ITLAPanel(QWidget):
         pwg.addWidget(self.btn_power_sweep, 2, 0, 1, 4)
 
         self._power_sweep_log_chk = QCheckBox("Log CoreDAQ power (all 4 channels)")
+        self._power_sweep_log_chk.setChecked(True)
         self._power_sweep_log_chk.setToolTip(
-            "Records the CoreDAQ optical power meter at each power-sweep step")
+            "Records the CoreDAQ optical power meter at each power-sweep step. "
+            "On by default so sweep data is never silently missing this.")
         pwg.addWidget(self._power_sweep_log_chk, 3, 0, 1, 3)
         self._power_sweep_export_btn = QPushButton("Export CSV…")
         self._power_sweep_export_btn.setEnabled(False)
@@ -3765,8 +3856,8 @@ class ITLAPanel(QWidget):
         for ch in range(4):
             xs = [row[0] for row in self._sweep_power_log]
             ys = [row[3 + ch] for row in self._sweep_power_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
-        win = MultiSeriesPlotWindow("ITLA Sweep — CoreDAQ Power", "Wavelength", "nm")
+            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+        win = MatplotlibPlotWindow("ITLA Sweep — CoreDAQ Power", "Wavelength", "nm")
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -3801,8 +3892,8 @@ class ITLAPanel(QWidget):
         for ch in range(4):
             xs = [row[0] for row in self._power_sweep_log]
             ys = [row[3 + ch] for row in self._power_sweep_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
-        win = MultiSeriesPlotWindow("ITLA Power Sweep — CoreDAQ Power", "Laser power", "mW")
+            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+        win = MatplotlibPlotWindow("ITLA Power Sweep — CoreDAQ Power", "Laser power", "mW")
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -5169,8 +5260,10 @@ class HP8168FPanel(QWidget):
         sw_lay.addWidget(self._sw_progress_lbl, 7, 0, 1, 2)
 
         self._sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
+        self._sweep_log_chk.setChecked(True)
         self._sweep_log_chk.setToolTip(
-            "Records the CoreDAQ optical power meter at each sweep step")
+            "Records the CoreDAQ optical power meter at each sweep step. "
+            "On by default so sweep data is never silently missing this.")
         sw_lay.addWidget(self._sweep_log_chk, 8, 0, 1, 2)
         self._sweep_export_btn = QPushButton("Export CSV…")
         self._sweep_export_btn.setEnabled(False)
@@ -5239,8 +5332,10 @@ class HP8168FPanel(QWidget):
         pwg.addWidget(self._pw_progress_lbl, 3, 0, 1, 4)
 
         self._power_sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
+        self._power_sweep_log_chk.setChecked(True)
         self._power_sweep_log_chk.setToolTip(
-            "Records the CoreDAQ optical power meter at each power-sweep step")
+            "Records the CoreDAQ optical power meter at each power-sweep step. "
+            "On by default so sweep data is never silently missing this.")
         pwg.addWidget(self._power_sweep_log_chk, 4, 0, 1, 3)
         self._power_sweep_export_btn = QPushButton("Export CSV…")
         self._power_sweep_export_btn.setEnabled(False)
@@ -5361,8 +5456,8 @@ class HP8168FPanel(QWidget):
         for ch in range(4):
             xs = [row[0] for row in self._sweep_power_log]
             ys = [row[1 + ch] for row in self._sweep_power_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
-        win = MultiSeriesPlotWindow("HP-8168F Sweep — CoreDAQ Power", "Wavelength", "nm")
+            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+        win = MatplotlibPlotWindow("HP-8168F Sweep — CoreDAQ Power", "Wavelength", "nm")
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -5397,8 +5492,8 @@ class HP8168FPanel(QWidget):
         for ch in range(4):
             xs = [row[0] for row in self._power_sweep_log]
             ys = [row[1 + ch] for row in self._power_sweep_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "W")
-        win = MultiSeriesPlotWindow("HP-8168F Power Sweep — CoreDAQ Power", "Laser power", "mW")
+            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+        win = MatplotlibPlotWindow("HP-8168F Power Sweep — CoreDAQ Power", "Laser power", "mW")
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -6077,8 +6172,10 @@ class SantecPanel(QWidget):
         pwg.addWidget(self._pw_progress_lbl, 3, 0, 1, 4)
 
         self._power_sweep_log_chk = QCheckBox("Log CoreDAQ power (4 ch)")
+        self._power_sweep_log_chk.setChecked(True)
         self._power_sweep_log_chk.setToolTip(
-            "Records the CoreDAQ optical power meter at each power-sweep step")
+            "Records the CoreDAQ optical power meter at each power-sweep step. "
+            "On by default so sweep data is never silently missing this.")
         pwg.addWidget(self._power_sweep_log_chk, 4, 0, 1, 3)
         self._power_sweep_export_btn = QPushButton("Export CSV…")
         self._power_sweep_export_btn.setEnabled(False)
@@ -6266,8 +6363,8 @@ class SantecPanel(QWidget):
         for ch in range(4):
             xs = [row[0] for row in self._power_sweep_log]
             ys = [row[1 + ch] * 1e9 for row in self._power_sweep_log]
-            series[f"CoreDAQ Head {ch + 1}"] = (xs, ys, "nW")
-        win = MultiSeriesPlotWindow("Santec Power Sweep — CoreDAQ Power", "Laser power", "mW")
+            series[f"MZI {ch + 1}"] = (xs, ys, "nW")
+        win = MatplotlibPlotWindow("Santec Power Sweep — CoreDAQ Power", "Laser power", "mW")
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -6435,8 +6532,8 @@ class SantecPanel(QWidget):
         series = {}
         for ch in range(min(4, len(power_ch))):
             ys_nw = [w * 1e9 for w in power_ch[ch]]
-            series[f"CoreDAQ Head {ch + 1}"] = (wavelengths, ys_nw, "nW")
-        win = FastSweepMatplotlibWindow("Santec Fast Sweep \u2014 CoreDAQ Power", "Wavelength", "nm")
+            series[f"MZI {ch + 1}"] = (wavelengths, ys_nw, "nW")
+        win = MatplotlibPlotWindow("Santec Fast Sweep \u2014 CoreDAQ Power", "Wavelength", "nm")
         win.show_data(series)
         mw = self.window()
         win.move(mw.x() + mw.width() + 16, mw.y() + 40)
@@ -6578,14 +6675,18 @@ class MultiSeriesPlotWindow(QWidget):
         self.raise_()
 
 
-class FastSweepMatplotlibWindow(QWidget):
+class MatplotlibPlotWindow(QWidget):
     """
-    Matplotlib results window for the Santec Fast Sweep — all CoreDAQ heads
+    Matplotlib results window for sweep/run results across every device tab
+    (DAQ Control, ITLA, HP-8168F, Santec regular + fast sweep) — all series
     overlaid on one white-background axes with a legend you can click to
-    toggle each head, plus the standard Matplotlib pan/zoom/save toolbar.
+    toggle each one, plus the standard Matplotlib pan/zoom/save toolbar. A
+    print/report-friendly look, and the PNG this saves (see save_png) is what
+    ends up paired with each sweep's exported CSV.
     Deliberately separate from MultiSeriesPlotWindow (pyqtgraph, dark theme,
-    one-subplot-per-series grid) used by the other sweep tabs — this is a
-    print/report-friendly look for fast-sweep results specifically.
+    one-subplot-per-series grid), which stays in use for the live/continuous
+    recording plots — those redraw at high frequency, where matplotlib's
+    full-redraw-per-frame cost doesn't fit the way a single sweep-end plot does.
     """
 
     _COLORS = ("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e",
@@ -6594,13 +6695,23 @@ class FastSweepMatplotlibWindow(QWidget):
     def __init__(self, title: str, x_label: str, x_unit: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(900, 650)
-        self.setStyleSheet("background-color: white;")
+        self.resize(1400, 900)
         self._x_label = x_label
         self._x_unit  = x_unit
 
         layout = QVBoxLayout(self)
-        self._fig = Figure(figsize=(9, 6), dpi=100, facecolor="white")
+        if not HAS_MATPLOTLIB:
+            layout.addWidget(QLabel("matplotlib required for plots — "
+                                     "run: uv pip install matplotlib"))
+            self._fig = self._canvas = self._ax = None
+            return
+
+        self.setStyleSheet("background-color: white;")
+        # Bigger figure + higher on-screen DPI than matplotlib's default so
+        # sweep lines are easier to read at a glance; save_png() renders the
+        # exported PNG at an even higher DPI on top of this for print-quality
+        # output.
+        self._fig = Figure(figsize=(13, 8), dpi=120, facecolor="white")
         self._canvas = FigureCanvasQTAgg(self._fig)
         self._ax = self._fig.add_subplot(111, facecolor="white")
         layout.addWidget(self._canvas)
@@ -6612,20 +6723,25 @@ class FastSweepMatplotlibWindow(QWidget):
 
     def show_data(self, series_data: dict):
         """series_data: {name: (xs, ys, y_unit)}"""
+        if not HAS_MATPLOTLIB:
+            self.show()
+            self.raise_()
+            return
         self._ax.clear()
         self._ax.set_facecolor("white")
         y_unit = ""
         for i, (name, (xs, ys, unit)) in enumerate(series_data.items()):
             y_unit = unit or y_unit
             self._ax.plot(xs, ys, label=name, color=self._COLORS[i % len(self._COLORS)],
-                           linewidth=1.6)
+                           linewidth=2.2)
         x_label = f"{self._x_label} ({self._x_unit})" if self._x_unit else self._x_label
         y_label = f"Power ({y_unit})" if y_unit else "Power"
-        self._ax.set_xlabel(x_label)
-        self._ax.set_ylabel(y_label)
-        self._ax.set_title(self.windowTitle())
+        self._ax.set_xlabel(x_label, fontsize=12)
+        self._ax.set_ylabel(y_label, fontsize=12)
+        self._ax.set_title(self.windowTitle(), fontsize=14)
+        self._ax.tick_params(axis="both", labelsize=11)
         self._ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.5, color="#cccccc")
-        self._ax.legend(loc="best", frameon=True, fontsize=9)
+        self._ax.legend(loc="best", frameon=True, fontsize=11)
         for side in ("top", "right"):
             self._ax.spines[side].set_visible(False)
         self._fig.tight_layout()
@@ -6636,8 +6752,10 @@ class FastSweepMatplotlibWindow(QWidget):
     def save_png(self, path: str) -> None:
         """Saves the currently-rendered figure exactly as shown — works even
         if this window has since been closed/hidden, since closing a QWidget
-        we still hold a Python reference to doesn't destroy its Figure."""
-        self._fig.savefig(path, facecolor="white")
+        we still hold a Python reference to doesn't destroy its Figure.
+        Rendered at a higher DPI than the on-screen figure so the exported
+        PNG stays sharp when zoomed in or printed."""
+        self._fig.savefig(path, facecolor="white", dpi=200)
 
 
 class CoreDAQWorker(QObject):
@@ -6671,6 +6789,7 @@ class CoreDAQWorker(QObject):
     error           = pyqtSignal(str)
     op_done         = pyqtSignal(str)
     poll_paused     = pyqtSignal()
+    autogain_done   = pyqtSignal(list)   # gains(4), after an autogain pass
 
     LABEL_HZ = 10.0   # wall-clock throttle for numeric-label refresh + extra snapshot_mV() call
 
@@ -6900,6 +7019,25 @@ class CoreDAQWorker(QObject):
         except Exception as e:
             self.error.emit(f"Set gain error: {e}")
 
+    def do_autogain(self):
+        """Runs on this worker thread, same as do_poll — no need to pause
+        polling here (unlike the older reference GUI) since both share one
+        QThread event loop and Qt serializes queued calls onto it, so a poll
+        tick can never interleave with autogain's own SNAP reads."""
+        try:
+            _watts, _mv, gains = self._call(
+                self._daq.snapshot_W, autogain=True, return_debug=True,
+                n_frames=4, timeout_s=1.0,
+                min_mv=100.0, max_mv=3000.0,
+                max_iters=10, settle_s=0.05,
+            )
+            gains_int = [int(g) for g in gains]
+            self.log_message.emit(f"Autogain complete — gains={gains_int}")
+            self.autogain_done.emit(gains_int)
+            self.op_done.emit("autogain")
+        except Exception as e:
+            self.error.emit(f"Autogain error: {e}")
+
     def do_set_wavelength(self, nm: float):
         try:
             self._call(self._daq.set_wavelength_nm, nm)
@@ -6936,6 +7074,7 @@ class CoreDAQPanel(QWidget):
     _sig_pause_poll    = pyqtSignal()
     _sig_resume_poll   = pyqtSignal()
     _sig_set_gain      = pyqtSignal(int, int)
+    _sig_autogain      = pyqtSignal()
     _sig_set_wl        = pyqtSignal(float)
     _sig_disconnect    = pyqtSignal()
 
@@ -6975,6 +7114,7 @@ class CoreDAQPanel(QWidget):
         self._sig_pause_poll.connect(self._worker.do_pause_poll)
         self._sig_resume_poll.connect(self._worker.do_resume_poll)
         self._sig_set_gain.connect(self._worker.do_set_gain)
+        self._sig_autogain.connect(self._worker.do_autogain)
         self._sig_set_wl.connect(self._worker.do_set_wavelength)
         self._sig_disconnect.connect(self._worker.do_disconnect)
 
@@ -6984,6 +7124,7 @@ class CoreDAQPanel(QWidget):
         self._worker.log_message.connect(self._on_log)
         self._worker.error.connect(self._on_error)
         self._worker.op_done.connect(self._on_op_done)
+        self._worker.autogain_done.connect(self._on_autogain_done)
 
         # Independent redraw timer — reads the worker's ring buffer directly
         # (get_display_data() is a plain, allocation-free method call, not a
@@ -7093,7 +7234,26 @@ class CoreDAQPanel(QWidget):
             self._gain_combos.append(combo)
             self._gain_btns.append(btn)
 
-        cfg_lay.setRowStretch(7, 1)
+        cfg_lay.addWidget(QLabel("Set All To:"), 7, 0)
+        self._gain_set_all_combo = QComboBox()
+        for g, label in enumerate(CoreDAQ.GAIN_LABELS):
+            self._gain_set_all_combo.addItem(f"G{g} ({label})", g)
+        self._gain_set_all_combo.setEnabled(False)
+        cfg_lay.addWidget(self._gain_set_all_combo, 7, 1)
+        self._gain_set_all_btn = QPushButton("Set All")
+        self._gain_set_all_btn.setEnabled(False)
+        self._gain_set_all_btn.clicked.connect(self._set_all_gains)
+        cfg_lay.addWidget(self._gain_set_all_btn, 7, 2)
+
+        self._autogain_btn = QPushButton("Autogain")
+        self._autogain_btn.setEnabled(False)
+        self._autogain_btn.setToolTip(
+            "Automatically steps each head's gain so its reading lands\n"
+            "within a safe mid-range window, then reads back the result")
+        self._autogain_btn.clicked.connect(self._do_autogain)
+        cfg_lay.addWidget(self._autogain_btn, 8, 0, 1, 3)
+
+        cfg_lay.setRowStretch(9, 1)
         root.addWidget(cfg_box)
 
         # ── Right: Channel readouts ──────────────────────────────────────────
@@ -7159,7 +7319,7 @@ class CoreDAQPanel(QWidget):
             legend = pw.addLegend(offset=(10, 10))
             for ch in range(4):
                 curve = pw.plot([], [], pen=pg.mkPen(colors[ch], width=2),
-                                 name=f'Head {ch + 1}', skipFiniteCheck=True)
+                                 name=f'MZI {ch + 1}', skipFiniteCheck=True)
                 self._live_curves.append(curve)
             plot_lay.addWidget(pw)
         else:
@@ -7199,6 +7359,9 @@ class CoreDAQPanel(QWidget):
             for lbl in self._raw_lbls:   lbl.setText("—")
             for combo, btn in zip(self._gain_combos, self._gain_btns):
                 combo.setEnabled(False); btn.setEnabled(False)
+            self._gain_set_all_combo.setEnabled(False)
+            self._gain_set_all_btn.setEnabled(False)
+            self._autogain_btn.setEnabled(False)
 
     def _on_info(self, idn: str, frontend: str, detector: str):
         self._idn_lbl.setText(idn)
@@ -7208,6 +7371,28 @@ class CoreDAQPanel(QWidget):
         is_linear = frontend == CoreDAQ.FRONTEND_LINEAR
         for combo, btn in zip(self._gain_combos, self._gain_btns):
             combo.setEnabled(is_linear); btn.setEnabled(is_linear)
+        self._gain_set_all_combo.setEnabled(is_linear)
+        self._gain_set_all_btn.setEnabled(is_linear)
+        self._autogain_btn.setEnabled(is_linear)
+
+    def _set_all_gains(self):
+        value = self._gain_set_all_combo.currentData()
+        for h, combo in enumerate(self._gain_combos, start=1):
+            combo.setCurrentIndex(combo.findData(value))
+            self._sig_set_gain.emit(h, value)
+
+    def _do_autogain(self):
+        self._autogain_btn.setEnabled(False)
+        self._autogain_btn.setText("Autogain…")
+        self._sig_autogain.emit()
+
+    def _on_autogain_done(self, gains: list):
+        self._autogain_btn.setText("Autogain")
+        self._autogain_btn.setEnabled(self._frontend_type == CoreDAQ.FRONTEND_LINEAR)
+        for combo, g in zip(self._gain_combos, gains):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(combo.findData(g))
+            combo.blockSignals(False)
 
     def _on_raw(self, power_w: list, mv: list, gains: list):
         """Throttled (~CoreDAQWorker.LABEL_HZ) numeric-label refresh — the fast
@@ -7279,6 +7464,9 @@ class CoreDAQPanel(QWidget):
         self._log.append(f"<span style='color:{C_RED};'>ERROR: {msg}</span>")
         print(f"[CoreDAQ] FAILED to connect: {msg}" if not self._connected
               else f"[CoreDAQ] ERROR: {msg}")
+        if self._autogain_btn.text() == "Autogain…":
+            self._autogain_btn.setText("Autogain")
+            self._autogain_btn.setEnabled(self._frontend_type == CoreDAQ.FRONTEND_LINEAR)
 
     def _on_op_done(self, op: str):
         if op == "connect":
