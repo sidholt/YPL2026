@@ -41,7 +41,6 @@ Edit the CONFIG block below to match what you want to test, then run:
 
 import ctypes
 import csv
-import datetime
 import os
 import time
 import UeiDaq
@@ -225,16 +224,33 @@ def main():
             print(f"    (already-correct/identity pins seen: {identity})")
 
     if notes or discovered:
-        stamp   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = os.path.dirname(os.path.abspath(__file__))
-        out_path = os.path.join(out_dir, f"pin_map_{DEV}_{stamp}.csv")
+        out_dir  = os.path.dirname(os.path.abspath(__file__))
+        out_path = os.path.join(out_dir, f"pin_map_{DEV}.csv")
+
+        # Merge onto whatever this file already has, so a partial/resumed
+        # walk doesn't blow away notes recorded in an earlier run.
+        prior = {}   # logical_pin (str) -> {"physical_channel": ..., "note": ...}
+        if os.path.exists(out_path):
+            with open(out_path, newline="") as f:
+                for row in csv.DictReader(f):
+                    prior[row["logical_pin"]] = row
+
+        for i in range(START_PIN, END_PIN + 1):
+            phys = discovered.get(i)
+            row = prior.get(str(i), {"physical_channel": "", "note": ""})
+            if phys is not None:
+                row["physical_channel"] = phys
+            if i in notes:
+                row["note"] = notes[i]
+            prior[str(i)] = row
+
         with open(out_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["logical_pin", "physical_channel", "note"])
-            for i in range(START_PIN, END_PIN + 1):
-                phys = discovered.get(i)
-                w.writerow([i, "" if phys is None else phys, notes.get(i, "")])
-        print(f"\nSaved diagram to {out_path}")
+            for i in sorted(prior, key=int):
+                row = prior[i]
+                w.writerow([i, row.get("physical_channel", ""), row.get("note", "")])
+        print(f"\nSaved diagram to {out_path} (merged with any existing entries)")
     if stopped_early:
         print("(Stopped before reaching the last pin — re-run with START_PIN "
               "set to where you left off to continue.)")

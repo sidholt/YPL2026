@@ -1,7 +1,7 @@
 """
 unified_lab_gui.py — YPL Lab Control
 One window, multiple tabs:
-  • DAQ Control    — UEI PowerDNA cards + Moku:Go + Guardian + Pro Micro
+  • DAQ Control    — UEI PowerDNA cards + Moku:Go + Guardian
   • ITLA Laser     — Emcore TTX ITLA controller
   • CONEX Motor    — Newport CONEX-CC / TRA12CC controller
   • HP-8168F Laser — HP/Agilent 8168F tunable laser source (GPIB)
@@ -71,7 +71,7 @@ try:
     HAS_SERIAL = True
 except ImportError:
     HAS_SERIAL = False
-    print("[WARNING] pyserial not found — Pro Micro disabled. Run: uv pip install pyserial")
+    print("[WARNING] pyserial not found — CoreDAQ optical power meter disabled. Run: uv pip install pyserial")
 
 try:
     from hardware.itla import ITLA, REG
@@ -487,9 +487,6 @@ PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 COREDAQ_PLOT_WINDOW_S  = 30.0
 
-PROMICRO_PORT = "COM11"
-PROMICRO_BAUD = 9600
-
 # ══════════════════════════════════════════════════════════════════════════════
 # DAQ — WORKERS & SESSIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -683,68 +680,6 @@ class AO333ReadbackWorker(QObject):
         except Exception:
             pass
         self._sock = None
-
-
-class ProMicroWorker(QObject):
-    sample_ready    = pyqtSignal(float)         # A0 voltage (V)
-    current_ready   = pyqtSignal(float)         # A1 current (mA)
-    error           = pyqtSignal(str)
-    connected       = pyqtSignal()
-    disconnected    = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self._port    = None
-        self._running = False
-
-    def start(self, port: str = PROMICRO_PORT):
-        self.stop()
-        if not HAS_SERIAL:
-            self.error.emit("pyserial not installed")
-            return
-        try:
-            self._port = serial.Serial(port, PROMICRO_BAUD, timeout=1.0)
-            self._port.reset_input_buffer()
-            self._running = True
-            self.connected.emit()
-            print(f"[ProMicro] Connected on {port}")
-        except Exception as e:
-            self.error.emit(f"Cannot open {port}: {e}")
-            self._port = None
-            return
-        import threading
-        threading.Thread(target=self._read_loop, daemon=True).start()
-
-    def _read_loop(self):
-        """Parse lines like: 'A0: 1.2345 V  A1: 8.7654 mA'"""
-        while self._running and self._port:
-            try:
-                line = self._port.readline().decode("utf-8", errors="ignore").strip()
-                if not line.startswith("A0:"):
-                    continue
-                parts = line.split()
-                try:
-                    self.sample_ready.emit(float(parts[1]))
-                except (ValueError, IndexError):
-                    pass
-                try:
-                    a1_idx = parts.index("A1:")
-                    self.current_ready.emit(float(parts[a1_idx + 1]))
-                except (ValueError, IndexError):
-                    pass
-            except Exception as e:
-                if self._running:
-                    self.error.emit(str(e))
-                break
-        self.disconnected.emit()
-
-    def stop(self):
-        self._running = False
-        try:
-            if self._port: self._port.close()
-        except Exception:
-            pass
-        self._port = None
 
 
 # ── Moku live plot widget ──────────────────────────────────────────────────────
@@ -1832,7 +1767,6 @@ class PinConfigView(QWidget):
         self._rec_src_combo = QComboBox()
         self._rec_src_combo.addItem("Moku",      "moku")
         self._rec_src_combo.addItem("Guardian",  "guardian")
-        self._rec_src_combo.addItem("Pro Micro", "promicro")
         self._rec_src_combo.setFixedWidth(110)
         self._rec_src_lbl = QLabel("Readback source:")
         rec_row3.addWidget(self._rec_src_combo)
@@ -1877,7 +1811,6 @@ class PinConfigView(QWidget):
         self._cmp_win: LiveComparisonPlot = None
         self._last_moku_v = 0.0
         self._last_guardian_v = 0.0
-        self._last_pm_v = 0.0
 
         # AO-333 Guardian readback worker (Dev2 only)
         self._guardian_thread = QThread()
@@ -1888,53 +1821,6 @@ class PinConfigView(QWidget):
         self._guardian_worker.error.connect(
             lambda msg: print(f"[AO333] {msg}"))
         self._guardian_values: list = [0.0] * NUM_PINS
-
-        # ── Pro Micro live plot ──
-        self._pm_plot_group = QGroupBox("Pro Micro — Live Readback")
-        pg2 = QVBoxLayout(self._pm_plot_group)
-        pg2.setContentsMargins(4, 4, 4, 4)
-
-        pm_ctrl = QHBoxLayout()
-        pm_ctrl.addWidget(QLabel("Port:"))
-        self._pm_port_edit = QLineEdit(load_connection_settings().get("promicro_port", PROMICRO_PORT))
-        self._pm_port_edit.setFixedWidth(80)
-        pm_ctrl.addWidget(self._pm_port_edit)
-        self._pm_connect_btn    = QPushButton("Connect")
-        self._pm_disconnect_btn = QPushButton("✕")
-        self._pm_connect_btn.setFixedWidth(80)
-        self._pm_disconnect_btn.setFixedSize(24, 24)
-        self._pm_disconnect_btn.setVisible(False)
-        self._pm_status_lbl = QLabel("○")
-        self._pm_status_lbl.setFixedWidth(14)
-        self._pm_val_lbl = QLabel("— V")
-        self._pm_val_lbl.setMinimumWidth(80)
-        self._pm_ma_lbl = QLabel("— mA")
-        self._pm_ma_lbl.setMinimumWidth(80)
-        self._pm_connect_btn.clicked.connect(self._pm_connect)
-        self._pm_disconnect_btn.clicked.connect(self._pm_disconnect)
-        pm_ctrl.addWidget(self._pm_status_lbl)
-        pm_ctrl.addWidget(self._pm_connect_btn)
-        pm_ctrl.addWidget(self._pm_disconnect_btn)
-        pm_ctrl.addSpacing(10)
-        pm_ctrl.addWidget(self._pm_val_lbl)
-        pm_ctrl.addWidget(self._pm_ma_lbl)
-        pm_ctrl.addStretch()
-        pg2.addLayout(pm_ctrl)
-
-        self._pm_plot_group.setVisible(False)
-        root.addWidget(self._pm_plot_group)
-
-        # Pro Micro worker + thread
-        self._pm_thread = QThread()
-        self._pm_worker = ProMicroWorker()
-        self._pm_worker.moveToThread(self._pm_thread)
-        self._pm_thread.start()
-        self._pm_worker.sample_ready.connect(self._on_pm_sample)
-        self._pm_worker.current_ready.connect(self._on_pm_current)
-        self._pm_worker.connected.connect(self._pm_on_connected)
-        self._pm_worker.disconnected.connect(self._pm_on_disconnected)
-        self._pm_worker.error.connect(
-            lambda msg: print(f"[ProMicro] {msg}"))
 
         # ── batch plot repaint timer ──
         self._plot_dirty = False
@@ -1970,8 +1856,7 @@ class PinConfigView(QWidget):
         self._cmp_win = LiveComparisonPlot(label, cs.mode, cs.num_pins)
 
         src = self._cmp_src_combo.currentData()
-        src_names = {"moku": "Moku Ch1", "guardian": "Guardian ADC",
-                     "promicro": "Pro Micro"}
+        src_names = {"moku": "Moku Ch1", "guardian": "Guardian ADC"}
         src_name = src_names.get(src, src)
         if cs.mode == "current":
             unit_note = "→ mA via shunt" if src == "moku" else "→ mA via A1"
@@ -2008,56 +1893,6 @@ class PinConfigView(QWidget):
             dt = MOKU_POLL_MS / 1000.0
         self._cmp_win.push(commanded, measured, dt=dt)
         self._plot_dirty = True
-
-    def _pm_connect(self):
-        port = self._pm_port_edit.text().strip()
-        save_connection_setting("promicro_port", port)
-        self._pm_connect_btn.setEnabled(False)
-        self._pm_connect_btn.setText("…")
-        QTimer.singleShot(0, lambda: self._pm_worker.start(port))
-
-    def _pm_disconnect(self):
-        QTimer.singleShot(0, self._pm_worker.stop)
-
-    def _pm_on_connected(self):
-        self._pm_status_lbl.setText("●")
-        self._pm_status_lbl.setStyleSheet(f"color: {C_GREEN};")
-        self._pm_connect_btn.setVisible(False)
-        self._pm_disconnect_btn.setVisible(True)
-        self._pm_port_edit.setEnabled(False)
-        self._pm_connect_btn.setEnabled(True)
-        self._pm_connect_btn.setText("Connect")
-
-    def _pm_on_disconnected(self):
-        self._pm_status_lbl.setText("○")
-        self._pm_status_lbl.setStyleSheet("")
-        self._pm_connect_btn.setVisible(True)
-        self._pm_disconnect_btn.setVisible(False)
-        self._pm_port_edit.setEnabled(True)
-        self._pm_val_lbl.setText("— V")
-
-    def _on_pm_sample(self, v: float):
-        self._last_pm_v = v
-        self._pm_val_lbl.setText(f"{v:.4f} V")
-
-        if (self._cmp_src_combo.currentData() == "promicro"
-                and self._cmp_win and self._cmp_win.isVisible()
-                and self.card_session
-                and self.card_session.mode == "voltage"):
-            self._push_comparison(v, dt=0.2)
-
-        if (self._recording and self.card_session
-                and self._rec_src_combo.currentData() == "promicro"):
-            self._append_record(v, dt=0.2)
-
-    def _on_pm_current(self, ma: float):
-        self._pm_ma_lbl.setText(f"{ma:.3f} mA")
-
-        if (self._cmp_src_combo.currentData() == "promicro"
-                and self._cmp_win and self._cmp_win.isVisible()
-                and self.card_session
-                and self.card_session.mode == "current"):
-            self._push_comparison(ma, dt=0.2)
 
     def _on_sweep_mode_toggled(self):
         steps_mode = self._sweep_mode_combo.currentData() == "steps"
@@ -2206,7 +2041,6 @@ class PinConfigView(QWidget):
             lbl.setVisible(is_voltage and remap_pin(cs.dev, i) < NUM_PINS)
             lbl.setText("—")
         self._guardian_values = [0.0] * NUM_PINS
-        self._pm_plot_group.setVisible(True)
         self._rec_src_row_widget.setVisible(is_voltage)
 
         self._cmp_src_combo.blockSignals(True)
@@ -2214,7 +2048,6 @@ class PinConfigView(QWidget):
         self._cmp_src_combo.addItem("Moku",      "moku")
         if is_voltage:
             self._cmp_src_combo.addItem("Guardian",  "guardian")
-        self._cmp_src_combo.addItem("Pro Micro", "promicro")
         self._cmp_src_combo.blockSignals(False)
 
         if self._cmp_win and self._cmp_win.isVisible():
@@ -2222,7 +2055,6 @@ class PinConfigView(QWidget):
         self._cmp_win = None
         self._last_moku_v = 0.0
         self._last_guardian_v = 0.0
-        self._last_pm_v = 0.0
 
         if is_voltage:
             QTimer.singleShot(0, self._guardian_worker.start)
@@ -2324,7 +2156,6 @@ class PinConfigView(QWidget):
             readback_col = {
                 "moku":      "moku_V",
                 "guardian":  "guardian_V",
-                "promicro":  "promicro_V",
             }.get(src, "readback_V")
 
         fname    = os.path.join(data_dir, f"{dev}_{mode}_{src}_{stamp}.csv")
@@ -2811,9 +2642,6 @@ class DAQPanel(QWidget):
         self.pin_view._guardian_worker.stop()
         self.pin_view._guardian_thread.quit()
         self.pin_view._guardian_thread.wait(2000)
-        self.pin_view._pm_worker.stop()
-        self.pin_view._pm_thread.quit()
-        self.pin_view._pm_thread.wait(2000)
         if self._bridge_proc and self._bridge_proc.poll() is None:
             self._bridge_proc.terminate()
             print("[Bridge] Terminated")

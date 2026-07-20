@@ -32,7 +32,6 @@ Run with the 32-bit venv (PDNALib.dll is 32-bit):
 
 import ctypes
 import csv
-import datetime
 import os
 import time
 import UeiDaq
@@ -170,9 +169,8 @@ def main():
         pairs = ", ".join(f"{i}: {p}" for i, p in nontrivial.items())
         print(f'\nConfirmed non-identity pairs for gui.py:  "{DEV}": {{{pairs}}}')
 
-    stamp    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            f"auto_pin_scan_{DEV}_{stamp}.csv")
+                            f"auto_pin_scan_{DEV}.csv")
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["logical_pin", "physical_channel", "status"])
