@@ -2439,8 +2439,8 @@ class PinConfigView(QWidget):
         series = {}
         for ch in range(4):
             xs = [row[0] for row in self._sweep_power_log]
-            ys = [row[1 + ch] for row in self._sweep_power_log]
-            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+            ys = [row[1 + ch] * 1e9 for row in self._sweep_power_log]
+            series[f"MZI {ch + 1}"] = (xs, ys, "nW")
         win = MatplotlibPlotWindow("AO Sweep — CoreDAQ Power", "AO value", unit)
         win.show_data(series)
         mw = self.window()
@@ -3855,8 +3855,8 @@ class ITLAPanel(QWidget):
         series = {}
         for ch in range(4):
             xs = [row[0] for row in self._sweep_power_log]
-            ys = [row[3 + ch] for row in self._sweep_power_log]
-            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+            ys = [row[3 + ch] * 1e9 for row in self._sweep_power_log]
+            series[f"MZI {ch + 1}"] = (xs, ys, "nW")
         win = MatplotlibPlotWindow("ITLA Sweep — CoreDAQ Power", "Wavelength", "nm")
         win.show_data(series)
         mw = self.window()
@@ -3891,8 +3891,8 @@ class ITLAPanel(QWidget):
         series = {}
         for ch in range(4):
             xs = [row[0] for row in self._power_sweep_log]
-            ys = [row[3 + ch] for row in self._power_sweep_log]
-            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+            ys = [row[3 + ch] * 1e9 for row in self._power_sweep_log]
+            series[f"MZI {ch + 1}"] = (xs, ys, "nW")
         win = MatplotlibPlotWindow("ITLA Power Sweep — CoreDAQ Power", "Laser power", "mW")
         win.show_data(series)
         mw = self.window()
@@ -5455,8 +5455,8 @@ class HP8168FPanel(QWidget):
         series = {}
         for ch in range(4):
             xs = [row[0] for row in self._sweep_power_log]
-            ys = [row[1 + ch] for row in self._sweep_power_log]
-            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+            ys = [row[1 + ch] * 1e9 for row in self._sweep_power_log]
+            series[f"MZI {ch + 1}"] = (xs, ys, "nW")
         win = MatplotlibPlotWindow("HP-8168F Sweep — CoreDAQ Power", "Wavelength", "nm")
         win.show_data(series)
         mw = self.window()
@@ -5491,8 +5491,8 @@ class HP8168FPanel(QWidget):
         series = {}
         for ch in range(4):
             xs = [row[0] for row in self._power_sweep_log]
-            ys = [row[1 + ch] for row in self._power_sweep_log]
-            series[f"MZI {ch + 1}"] = (xs, ys, "W")
+            ys = [row[1 + ch] * 1e9 for row in self._power_sweep_log]
+            series[f"MZI {ch + 1}"] = (xs, ys, "nW")
         win = MatplotlibPlotWindow("HP-8168F Power Sweep — CoreDAQ Power", "Laser power", "mW")
         win.show_data(series)
         mw = self.window()
@@ -6740,6 +6740,12 @@ class MatplotlibPlotWindow(QWidget):
         self._ax.set_ylabel(y_label, fontsize=12)
         self._ax.set_title(self.windowTitle(), fontsize=14)
         self._ax.tick_params(axis="both", labelsize=11)
+        # Data is pre-scaled into a sane unit (e.g. nW) by the caller, so the
+        # axis should show plain numbers in that unit — not matplotlib's own
+        # sci-notation/offset rescaling on top of it, which would just make
+        # the axis unit ambiguous again (e.g. "1e-9" next to a "nW" label).
+        self._ax.ticklabel_format(style="plain", axis="y")
+        self._ax.yaxis.get_major_formatter().set_useOffset(False)
         self._ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.5, color="#cccccc")
         self._ax.legend(loc="best", frameon=True, fontsize=11)
         for side in ("top", "right"):
