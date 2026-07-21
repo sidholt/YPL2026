@@ -99,9 +99,10 @@ or its instrument isn't connected.
   - `pin_identify_test.py` — standalone script (not launched by the GUI) that
     walks an AO-333 card's pins one at a time so you can work out its real
     `PIN_REMAP`. With Guardian ADC readback it auto-detects which physical
-    channel each logical pin lands on (pins 0–7); anything beyond that needs
-    a multimeter. Close the main GUI (or disconnect that card) before
-    running it — two processes on the same channels will fight each other.
+    channel each logical pin lands on (all 32 channels as of 2026-07-21); the
+    multimeter is now only a fallback if the bridge/DLL is unreachable.
+    Close the main GUI (or disconnect that card) before running it — two
+    processes on the same channels will fight each other.
   - `hardware/` — one module per instrument (`coredaq.py`, `itla.py`,
     `laser_hp_8168F.py`, `laser_tsl_550.py`, plus a shared `visa_module/` for
     GPIB-over-Prologix support).
@@ -200,6 +201,13 @@ The DAQ Control tab's live Guardian ADC readback for the AO-333 card
 that particular DLL path is 32-bit only. This is optional: without it, the
 GUI still runs and controls outputs normally, it just won't show live
 readback for that card.
+
+As of 2026-07-21 the bridge requests all 32 channels (previously just the
+first 8) — `ao333_bridge.py`'s `NUM_CH` constant. Per-read timing at this
+size hasn't been characterized on real hardware yet; the bridge logs its
+sustained reads/sec to the console every couple seconds so you can judge
+whether it's keeping up. Drop `NUM_CH` back to 8 there (and `NUM_PINS` in
+`gui.py`) if it proves too slow for live feedback.
 
 ```powershell
 uv venv --python cpython-3.12.13-windows-x86-none .venv32
