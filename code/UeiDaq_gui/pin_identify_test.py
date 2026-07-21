@@ -138,6 +138,18 @@ def main():
     notes = {}       # logical pin -> whatever the user typed about where they found it
     discovered = {}  # logical pin -> physical channel the Guardian auto-scan saw it on
 
+    # Load whatever this pin was already noted as from a prior run, so the
+    # walk can show it instead of starting blind each time.
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"pin_map_{DEV}.csv")
+    prior = {}   # logical_pin (str) -> {"physical_channel": ..., "note": ...}
+    if os.path.exists(out_path):
+        with open(out_path, newline="") as f:
+            for row in csv.DictReader(f):
+                prior[row["logical_pin"]] = row
+        n_notes = sum(1 for row in prior.values() if row.get("note"))
+        if n_notes:
+            print(f"Loaded {n_notes} existing note(s) from {out_path}.")
+
     def write(values):
         if PIN_REMAP:
             physical = list(values)
@@ -162,7 +174,10 @@ def main():
             values[i] = TEST_VAL
             write(values)
             expected = PIN_REMAP.get(i, i)   # where this logical pin SHOULD land
+            prev_note = prior.get(str(i), {}).get("note", "")
             msg = f"  >>> Pin {i:02d} -> {TEST_VAL:g} {unit}  — probe it now"
+            if prev_note:
+                msg += f'   [previous note: "{prev_note}"]'
             if guardian is not None:
                 time.sleep(0.3)   # let the ADC settle before reading
                 vals = read_guardian(*guardian)   # 8 physical readback channels
@@ -185,7 +200,10 @@ def main():
                     msg += (f"   [Guardian: MULTIPLE channels responded {hits} "
                             f"— possible short/crosstalk, investigate]")
             print(msg)
-            note = input(f"      note for Pin {i:02d} (Enter to skip, 'q' to stop): ").strip()
+            prompt = f"      note for Pin {i:02d} "
+            prompt += f'(Enter to keep "{prev_note}", ' if prev_note else "(Enter to skip, "
+            prompt += "'q' to stop): "
+            note = input(prompt).strip()
             write(zeros)
             if note.lower() == "q":
                 stopped_early = True
@@ -206,9 +224,13 @@ def main():
     print(f"\n{'Pin':>5}  {'PhysCh':>6}  Note")
     print(f"{'---':>5}  {'------':>6}  ----")
     for i in range(START_PIN, END_PIN + 1):
+        prior_row = prior.get(str(i), {})
         phys = discovered.get(i)
+        if phys is None and prior_row.get("physical_channel"):
+            phys = int(prior_row["physical_channel"])
         phys_s = f"{phys:6d}" if phys is not None else "     ?"
-        print(f"{i:5d}  {phys_s}  {notes.get(i, '(not recorded)')}")
+        note = notes.get(i) or prior_row.get("note") or "(not recorded)"
+        print(f"{i:5d}  {phys_s}  {note}")
 
     # Auto-discovered pairs, ready to paste into gui.py's PIN_REMAP. Only the
     # non-identity pairs are worth encoding; a pin that landed on its own index
@@ -224,17 +246,8 @@ def main():
             print(f"    (already-correct/identity pins seen: {identity})")
 
     if notes or discovered:
-        out_dir  = os.path.dirname(os.path.abspath(__file__))
-        out_path = os.path.join(out_dir, f"pin_map_{DEV}.csv")
-
-        # Merge onto whatever this file already has, so a partial/resumed
-        # walk doesn't blow away notes recorded in an earlier run.
-        prior = {}   # logical_pin (str) -> {"physical_channel": ..., "note": ...}
-        if os.path.exists(out_path):
-            with open(out_path, newline="") as f:
-                for row in csv.DictReader(f):
-                    prior[row["logical_pin"]] = row
-
+        # Merge onto whatever prior (loaded above) already has, so a
+        # partial/resumed walk doesn't blow away notes recorded earlier.
         for i in range(START_PIN, END_PIN + 1):
             phys = discovered.get(i)
             row = prior.get(str(i), {"physical_channel": "", "note": ""})
