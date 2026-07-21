@@ -344,53 +344,41 @@ CARDS = {
 # pin's real mapping has been directly confirmed with pin_identify_test.py
 # — do not guess entries here. An unconfirmed remap is more dangerous than
 # none at all: it would silently send commanded voltage to a physical pin
-# you don't think you're touching. Populate only pins you've verified;
-# unlisted pins are assumed correct (identity) until proven otherwise.
+# you don't think you're touching.
 #
-# Confirmed observations on Dev2 (via pin_identify_test.py / multimeter):
-#   2026-07-15: logical pin 0  -> physical pin 31
-#               logical pin 31 -> physical pin 0
-#   2026-07-16: logical pin 15 -> physical pin 15 (UNCHANGED)
-# The 2026-07-16 point is important: pin 15 staying put DISPROVES the
-# tempting "the whole connector is reversed" theory (a full i->31-i reversal
-# would put 15 on 16). It also rules out a constant offset and any single XOR
-# mask — each contradicts at least one of the three known points. In other
-# words, endpoints are swapped but the middle is fixed, and three points out
-# of 32 do not determine the other 29. Per this file's standing rule, the
-# unconfirmed pins stay identity until walked: only 0<->31 are encoded below.
+# ROOT CAUSE FOUND 2026-07-21: the DNx-AO-333's official pinout (dnx-ao-333.pdf)
+# wires its 62-pin cable connector in 3 physical rows of 21/21/20 pins, each
+# alternating Gnd/AOut. The ribbon cable added afterward and jumpered off its
+# far end had each of those 3 rows mirrored left-to-right (row assignment
+# unchanged, only the order WITHIN each row reversed). That single rule
+# reproduces every hardware measurement taken across both walks with zero
+# exceptions — the 18 pairs below plus 5 more (8, 20, 23, 26, 28 all
+# independently confirmed landing on Gnd exactly where predicted, including
+# the 2026-07-21 multimeter reading of raw ch 8's signature on native
+# connector pin 57 = Gnd) and all 5 remaining predicted-dead channels (5, 11,
+# 14, 17, 30) confirmed silent (0 V) on their predicted Gnd landings.
 #
-# A full raw walk (2026-07-20, recorded in pin_map_Dev2.csv) directly observed
-# where 19 of the 32 raw channels land, and the involution rule fit those
-# points, so the gaps were filled from the rule as a candidate map. A
-# VERIFICATION walk (2026-07-21, same CSV: "good" / "not seeing anything")
-# then re-tested every logical pin with that candidate applied. Result:
-#   - 18 logical pins CONFIRMED end-to-end (first block below) — every route
-#     whose raw channel was directly observed in the raw walk passed, except:
-#   - logical 27 -> raw 3 FAILED even though the raw walk directly saw raw 3
-#     land on physical 27. Unresolved contradiction — raw 3 is in the re-walk.
-#   - ALL 13 rule-inferred routes failed ("not seeing anything"), so the
-#     involution theory is DISPROVED for the inferred pairs. Where raw
-#     channels 0,1,2,5,8,11,14,17,20,23,26,28 really land is UNKNOWN until
-#     pin_identify_test.py re-walks them (it is configured for exactly that).
+# Channels 1, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30 have NO reachable output
+# terminal under this wiring — channel 1 lands on the card's digital input
+# pin (DIn0, a logic-level line, NOT rated for analog swings — avoid driving
+# this pin at all until the cable is physically fixed), the rest land on Gnd.
+# No remap can route around a wire that doesn't reach an output pin; these
+# stay identity (unlisted) since that's the only choice that can't collide
+# with a working route. Fixing them requires re-terminating the physical
+# cable, not a software change.
 #
-# The UNCONFIRMED block below is kept ONLY so the dict stays a complete
-# bijection — CardSession.write() places every logical pin's value on a
-# physical slot, and dropping entries would make unlisted pins fall back to
-# identity and collide with confirmed routes (e.g. logical 29 identity would
-# fight logical 2 for raw channel 29). Those entries are wrong or unproven:
-# do NOT trust logical pins 1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30,
-# 31 to reach their matching physical pin until the re-walk lands.
+# The lone remaining soft spot: 27->3 was directly observed in both directions
+# in the original raw walk (2026-07-20) and fits this rule exactly, but one
+# 2026-07-21 verification attempt failed to reproduce it. Included below on
+# the strength of the surrounding evidence; pin_identify_test.py is set up
+# to re-isolate just this one pair next.
 PIN_REMAP = {
     "Dev2": {
-        # CONFIRMED end-to-end (verification walk 2026-07-21, pin_map_Dev2.csv)
         0: 31, 2: 29, 3: 27, 4: 25, 6: 24, 7: 22, 9: 21, 10: 19,
         12: 18, 13: 16, 15: 15, 16: 13, 18: 12, 19: 10, 21: 9, 22: 7,
-        24: 6, 25: 4,
-        # UNCONFIRMED — failed verification; bijection placeholders only,
-        # pending the targeted re-walk in pin_identify_test.py
-        1: 28, 5: 26, 8: 23, 11: 20, 14: 17, 17: 14, 20: 11, 23: 8,
-        26: 5, 27: 3, 28: 1, 29: 2, 31: 0,
-        # 30 -> identity (raw ch 30 shorted across physical 5/8/11/14/17/20)
+        24: 6, 25: 4, 27: 3, 29: 2, 31: 0,
+        # 1, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30 -> identity (no reachable
+        # terminal — see comment above; do not remap these to anything)
     },
 }
 

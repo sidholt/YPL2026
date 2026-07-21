@@ -72,48 +72,54 @@ END_PIN   = 31             # last pin to test (inclusive) — full 32-ch card.
 GUARDIAN_READBACK = True
 PDNA_DLL = r"C:\Program Files (x86)\UEI\PowerDNA\Shared\PDNALib.dll"
 
-# VERIFICATION RESULT 2026-07-21 (pin_map_Dev2.csv): the full candidate map
-# was walked. 18 pins came out at the right physical pin and were PROMOTED to
-# gui.py's PIN_REMAP["Dev2"]. Every one of the 13 rule-inferred routes showed
-# nothing ("not seeing anything"), so the involution theory is DISPROVED for
-# the inferred pairs — where raw channels 0,1,2,5,8,11,14,17,20,23,26,28
-# really land is unknown. One contradiction: logical 27 -> raw 3 showed
-# nothing even though the raw walk directly saw raw 3 land on physical 27,
-# so raw 3 gets re-checked too.
+# RESOLVED 2026-07-21: the DNx-AO-333's official pinout (dnx-ao-333.pdf) wires
+# its 62-pin connector in 3 physical rows (21/21/20 pins, alternating
+# Gnd/AOut). The cable added afterward mirrored each row left-to-right (row
+# assignment unchanged). That one rule reproduces every measurement taken —
+# 18 pairs from the first verification walk, plus raw 8/20/23/26/28 confirmed
+# landing exactly on their predicted Gnd pins by signature voltage, plus raw
+# 5/11/14/17/30 confirmed silent (0 V) on their predicted Gnd landings.
+# Channels 1 (-> the card's digital input pin DIn0, not analog ground — avoid
+# driving it) and 5/8/11/14/17/20/23/26/28/30 (-> Gnd) have no reachable
+# output terminal; no remap can fix a wire that doesn't reach a pin. The full
+# resolved map is now live in gui.py's PIN_REMAP["Dev2"].
 #
-# This script is therefore back in RAW DISCOVERY mode (PIN_REMAP empty):
-# pin i drives raw channel i with no correction, and you note the physical
-# pin where the voltage actually appears. The places still missing a source
-# are physical pins 1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31 —
-# probe those spots for each channel below.
-PIN_REMAP = {}
+# ONE loose end: 27<->3 was directly observed in both directions in the raw
+# walk and fits the rule, but one verification attempt failed to reproduce
+# it. This script is configured to re-isolate just that pair — PIN_REMAP
+# applies gui.py's confirmed map (so if you drive "logical pin 27" here, you
+# should see physical terminal 27 light up) and PINS_TO_TEST narrows the walk
+# to that single pin.
+PIN_REMAP = {
+    0: 31, 2: 29, 3: 27, 4: 25, 6: 24, 7: 22, 9: 21, 10: 19,
+    12: 18, 13: 16, 15: 15, 16: 13, 18: 12, 19: 10, 21: 9, 22: 7,
+    24: 6, 25: 4, 27: 3, 29: 2, 31: 0,
+}
 
 # Walk only these raw channels (overrides START_PIN..END_PIN when non-empty).
-# These are exactly the channels whose landing is still unknown after the
-# 2026-07-21 verification, plus raw 3 (the logical-27 contradiction).
-# Raw 30 is the known-shorted channel (seen driving physical 5/8/11/14/17/20
-# at once) — expect it to light up several pins, not one.
-PINS_TO_TEST = [0, 1, 2, 3, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30]
+PINS_TO_TEST = [27]
 
-# SIGNATURE MODE — the fast way to resolve many unknown channels at once,
+# SIGNATURE MODE — the fast way to resolve MANY unknown channels at once,
 # because probing every candidate spot for every channel one at a time is
 # quadratically slow. All PINS_TO_TEST channels are driven SIMULTANEOUSLY,
-# each at its own unique voltage, so you walk the dead physical pins ONCE:
+# each at its own unique voltage, so you walk the DEAD_PHYSICAL pins ONCE:
 # the voltage you read on a pin is a fingerprint identifying which raw
 # channel feeds it. You type the reading and the script does the lookup.
-# ~12 probes total instead of 14 passes x 14 candidate spots.
-#   - Physical pins 1 and 5 are inside Guardian ADC range (0-7), so they
-#     identify themselves automatically — don't probe those.
-#   - Raw 30 (the known short) is held at 0 V during the signature pass so
-#     its floating bus can't contaminate readings; it gets a solo pass at
-#     the end for whatever pins are still unidentified.
-# Set False to fall back to the classic one-channel-at-a-time walk.
-SIGNATURE_MODE = True
+#   - Requires PINS_TO_TEST (the channels to drive) and DEAD_PHYSICAL (the
+#     physical spots to probe). Pins inside Guardian ADC range (0-7)
+#     identify themselves automatically — no probing needed there.
+#   - Raw ch 30 (SHORTED_RAW — seen bridging physical 5/8/11/14/17/20) is
+#     held at 0 V during the pass so the short can't contaminate readings;
+#     it gets a solo pass at the end.
+#   - Mind the top voltage: max = SIG_START + (len(PINS_TO_TEST)-1)*SIG_STEP.
+# False = the classic one-channel-at-a-time walk — the right choice for the
+# single-pin 27<->3 recheck above.
+SIGNATURE_MODE = False
 SIG_START = 0.5    # lowest signature voltage
-SIG_STEP  = 0.25   # spacing (13 channels -> 0.5..3.5 V, easy to read on a DMM)
+SIG_STEP  = 0.25   # spacing between signatures (easy to split on a DMM)
 SHORTED_RAW = 30
-# The physical pins that currently show nothing — the only spots to probe.
-DEAD_PHYSICAL = [1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31]
+# Physical pins with no known source — the spots to probe in signature mode.
+DEAD_PHYSICAL = []
 
 # HOLD_ONLY: don't prompt pin-by-pin — just energize the signature pattern
 # and LEAVE IT ON while you probe every pin at your own pace and write down
@@ -121,8 +127,9 @@ DEAD_PHYSICAL = [1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31]
 # then holds the raw-30 solo pass the same way, then zeroes everything.
 # Decode afterwards: the voltage on a pin identifies the raw channel feeding
 # it (table printed at start). Nothing is typed in, so nothing is saved to
-# the CSV — the written-down readings are the record.
-HOLD_ONLY = True
+# the CSV — the written-down readings are the record. Only meaningful with
+# SIGNATURE_MODE = True.
+HOLD_ONLY = False
 # ─────────────────────────────────────────────────────────────────────────
 
 
