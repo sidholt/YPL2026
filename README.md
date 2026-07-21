@@ -90,6 +90,9 @@ or its instrument isn't connected.
 - `code/UeiDaq_gui/`
   - `gui.py` — **current entry point.** The unified, multi-tab GUI described
     above.
+  - `gui_no_remap.py` — fallback mirror of `gui.py` with `PIN_REMAP` forced
+    empty (pure identity mapping). Run this instead of `gui.py` if the Dev2
+    (AO-333) remap in progress needs to be set aside; otherwise identical.
   - `ao333_bridge.py` — optional 32-bit helper process that streams Guardian
     ADC readback for the AO-333 card; `gui.py` auto-launches it if a 32-bit
     venv is set up (see [Optional: AO-333 Guardian ADC bridge](#optional-ao-333-guardian-adc-bridge)).
