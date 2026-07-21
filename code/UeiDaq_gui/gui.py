@@ -388,6 +388,28 @@ def remap_pin(dev: str, logical_pin: int) -> int:
     return PIN_REMAP.get(dev, {}).get(logical_pin, logical_pin)
 
 
+# Pins with NO reachable output terminal at all (see PIN_REMAP comment above)
+# — drives the "Pin NN" label color-coding in the DAQ Control pin list
+# (PinConfigView.load_card): green for verified-working pins, red for these.
+# Only devices with a completed investigation appear here; other cards get
+# no color coding since they haven't been walked.
+DEAD_PINS = {
+    "Dev2": {
+        1:  "lands on the card's digital input pin (DIn0), not analog ground — avoid driving",
+        5:  "lands on Gnd — no reachable output on this cable",
+        8:  "lands on Gnd — no reachable output on this cable",
+        11: "lands on Gnd — no reachable output on this cable",
+        14: "lands on Gnd — no reachable output on this cable",
+        17: "lands on Gnd — no reachable output on this cable",
+        20: "lands on Gnd — no reachable output on this cable",
+        23: "lands on Gnd — no reachable output on this cable",
+        26: "lands on Gnd — no reachable output on this cable",
+        28: "lands on Gnd — no reachable output on this cable",
+        30: "lands on Gnd — no reachable output on this cable",
+    },
+}
+
+
 AO_CHANNEL_NAMES_FILE = os.path.join(os.path.dirname(__file__), "ao_channel_names.json")
 
 CONNECTION_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "connection_settings.json")
@@ -1421,6 +1443,7 @@ class PinConfigView(QWidget):
         self._readback_lbls = []
         self._name_edits  = []
         self._pin_rows    = []
+        self._pin_num_lbls = []
         self._active_n    = NUM_PINS
         self._channel_names = self._load_channel_names()
 
@@ -1499,6 +1522,7 @@ class PinConfigView(QWidget):
             self._readback_lbls.append(rb_lbl)
             self._name_edits.append(name_edit)
             self._pin_rows.append(row_widget)
+            self._pin_num_lbls.append(lbl)
             col_lay.addWidget(row_widget)
 
         for _, col_lay in self._pin_columns:
@@ -1992,6 +2016,24 @@ class PinConfigView(QWidget):
         self.card_title.setText(CARDS[cs.card_index]["label"].split("  —  ")[0])
         self.badge.setText(cs.mode.upper())
         self._set_active_channels(cs.num_pins)
+
+        # Color-code the "Pin NN" labels for cards with a completed remap
+        # investigation (see DEAD_PINS): green = verified working, red = no
+        # reachable output terminal on this cable, don't bother wiring it up.
+        # Cards without an entry (not walked) get no coloring, reset to
+        # default, so stale colors from a previously-loaded card don't linger
+        # — these 32 row widgets are shared/reused across every card.
+        dead_info = DEAD_PINS.get(cs.dev)
+        for i, lbl in enumerate(self._pin_num_lbls):
+            if dead_info is None:
+                lbl.setStyleSheet("")
+                lbl.setToolTip("")
+            elif i in dead_info:
+                lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+                lbl.setToolTip(f"No usable output on this cable — {dead_info[i]}")
+            else:
+                lbl.setStyleSheet(f"color: {C_GREEN};")
+                lbl.setToolTip("Verified working (2026-07-21 pin remap investigation)")
         _, _, _, s_min, s_max = MODE_RANGES[cs.mode]
         self._syncing = True
         for i in range(cs.num_pins):
