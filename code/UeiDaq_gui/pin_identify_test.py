@@ -65,26 +65,28 @@ END_PIN   = 31             # last pin to test (inclusive) — full 32-ch card.
 GUARDIAN_READBACK = True
 PDNA_DLL = r"C:\Program Files (x86)\UEI\PowerDNA\Shared\PDNALib.dll"
 
-# VERIFICATION MODE: this holds the full candidate Dev2 map from the raw walk
-# (the symmetric involution), so the script applies the correction before
-# writing and you can confirm logical pin i now actually comes out at physical
-# pin i. With END_PIN=7 the Guardian ADC auto-confirms pins 0-7 (they land on
-# physical 0-7) — no multimeter needed. This map is NOT yet in gui.py; it lives
-# here until this check passes, then gets promoted.
+# VERIFICATION RESULT 2026-07-21 (pin_map_Dev2.csv): the full candidate map
+# was walked. 18 pins came out at the right physical pin and were PROMOTED to
+# gui.py's PIN_REMAP["Dev2"]. Every one of the 13 rule-inferred routes showed
+# nothing ("not seeing anything"), so the involution theory is DISPROVED for
+# the inferred pairs — where raw channels 0,1,2,5,8,11,14,17,20,23,26,28
+# really land is unknown. One contradiction: logical 27 -> raw 3 showed
+# nothing even though the raw walk directly saw raw 3 land on physical 27,
+# so raw 3 gets re-checked too.
 #
-# Two of these pairs (1<->28, 5<->26) are the rule-inferred gap pins that land
-# inside 0-7, so THIS run actually tests them against the ADC too.
-#
-# (For a raw discovery walk instead, set PIN_REMAP = {} — logical pin i then
-# drives raw channel i with no correction and the auto-scan reports the true
-# physical landing channel.)
-PIN_REMAP = {
-    0: 31, 1: 28, 2: 29, 3: 27, 4: 25, 5: 26, 6: 24, 7: 22,
-    8: 23, 9: 21, 10: 19, 11: 20, 12: 18, 13: 16, 14: 17, 15: 15,
-    16: 13, 17: 14, 18: 12, 19: 10, 20: 11, 21: 9, 22: 7, 23: 8,
-    24: 6, 25: 4, 26: 5, 27: 3, 28: 1, 29: 2, 31: 0,
-    # 30 -> identity (shorted channel: raw ch 30 drives physical 5/8/11/14/17/20)
-}
+# This script is therefore back in RAW DISCOVERY mode (PIN_REMAP empty):
+# pin i drives raw channel i with no correction, and you note the physical
+# pin where the voltage actually appears. The places still missing a source
+# are physical pins 1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31 —
+# probe those spots for each channel below.
+PIN_REMAP = {}
+
+# Walk only these raw channels (overrides START_PIN..END_PIN when non-empty).
+# These are exactly the channels whose landing is still unknown after the
+# 2026-07-21 verification, plus raw 3 (the logical-27 contradiction).
+# Raw 30 is the known-shorted channel (seen driving physical 5/8/11/14/17/20
+# at once) — expect it to light up several pins, not one.
+PINS_TO_TEST = [0, 1, 2, 3, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30]
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -122,7 +124,12 @@ def read_guardian(dll, handle):
 
 
 def main():
-    assert 0 <= START_PIN <= END_PIN < NUM_CH, "START_PIN/END_PIN out of range for NUM_CH"
+    if PINS_TO_TEST:
+        assert all(0 <= p < NUM_CH for p in PINS_TO_TEST), "PINS_TO_TEST out of range for NUM_CH"
+        pins = list(PINS_TO_TEST)
+    else:
+        assert 0 <= START_PIN <= END_PIN < NUM_CH, "START_PIN/END_PIN out of range for NUM_CH"
+        pins = list(range(START_PIN, END_PIN + 1))
 
     print(f"Connecting to {DEV} ({MODE}) on {CUBE_IP}, channels Ao0:{NUM_CH - 1}...")
     session = UeiDaq.CUeiSession()
@@ -174,11 +181,13 @@ def main():
     try:
         write(zeros)
         print(f"\nAll {DEV} pins zeroed.")
-        print(f"Walking pins {START_PIN}..{END_PIN}, {TEST_VAL:g} {unit} each.")
+        pins_desc = (", ".join(str(p) for p in pins) if PINS_TO_TEST
+                     else f"{START_PIN}..{END_PIN}")
+        print(f"Walking pins {pins_desc}, {TEST_VAL:g} {unit} each.")
         print("Probe/observe, then Enter to advance — type a short note first "
               "if you want it recorded (e.g. \"top-left screw terminal\"), "
               "or 'q' + Enter to stop early.\n")
-        for i in range(START_PIN, END_PIN + 1):
+        for i in pins:
             values = list(zeros)
             values[i] = TEST_VAL
             write(values)
@@ -234,7 +243,7 @@ def main():
 
     print(f"\n{'Pin':>5}  {'PhysCh':>6}  Note")
     print(f"{'---':>5}  {'------':>6}  ----")
-    for i in range(START_PIN, END_PIN + 1):
+    for i in pins:
         prior_row = prior.get(str(i), {})
         phys = discovered.get(i)
         if phys is None and prior_row.get("physical_channel"):
@@ -259,7 +268,7 @@ def main():
     if notes or discovered:
         # Merge onto whatever prior (loaded above) already has, so a
         # partial/resumed walk doesn't blow away notes recorded earlier.
-        for i in range(START_PIN, END_PIN + 1):
+        for i in pins:
             phys = discovered.get(i)
             row = prior.get(str(i), {"physical_channel": "", "note": ""})
             if phys is not None:
@@ -276,8 +285,9 @@ def main():
                 w.writerow([i, row.get("physical_channel", ""), row.get("note", "")])
         print(f"\nSaved diagram to {out_path} (merged with any existing entries)")
     if stopped_early:
-        print("(Stopped before reaching the last pin — re-run with START_PIN "
-              "set to where you left off to continue.)")
+        print("(Stopped before reaching the last pin — re-run with PINS_TO_TEST "
+              "trimmed to the ones you haven't done (or START_PIN moved up) "
+              "to continue; the CSV merge keeps everything already recorded.)")
 
 
 if __name__ == "__main__":

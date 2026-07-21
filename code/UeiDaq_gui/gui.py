@@ -359,13 +359,39 @@ CARDS = {
 # of 32 do not determine the other 29. Per this file's standing rule, the
 # unconfirmed pins stay identity until walked: only 0<->31 are encoded below.
 #
-# A full raw walk (2026-07-20, recorded in pin_map_Dev2.csv) found the rest of
-# the mapping and it fits a clean symmetric involution, but the completed map
-# is being VERIFIED in pin_identify_test.py first (its PIN_REMAP now holds the
-# full candidate map) before it is promoted back here. Until that check passes,
-# gui.py deliberately stays on the minimal confirmed 0<->31 swap.
+# A full raw walk (2026-07-20, recorded in pin_map_Dev2.csv) directly observed
+# where 19 of the 32 raw channels land, and the involution rule fit those
+# points, so the gaps were filled from the rule as a candidate map. A
+# VERIFICATION walk (2026-07-21, same CSV: "good" / "not seeing anything")
+# then re-tested every logical pin with that candidate applied. Result:
+#   - 18 logical pins CONFIRMED end-to-end (first block below) — every route
+#     whose raw channel was directly observed in the raw walk passed, except:
+#   - logical 27 -> raw 3 FAILED even though the raw walk directly saw raw 3
+#     land on physical 27. Unresolved contradiction — raw 3 is in the re-walk.
+#   - ALL 13 rule-inferred routes failed ("not seeing anything"), so the
+#     involution theory is DISPROVED for the inferred pairs. Where raw
+#     channels 0,1,2,5,8,11,14,17,20,23,26,28 really land is UNKNOWN until
+#     pin_identify_test.py re-walks them (it is configured for exactly that).
+#
+# The UNCONFIRMED block below is kept ONLY so the dict stays a complete
+# bijection — CardSession.write() places every logical pin's value on a
+# physical slot, and dropping entries would make unlisted pins fall back to
+# identity and collide with confirmed routes (e.g. logical 29 identity would
+# fight logical 2 for raw channel 29). Those entries are wrong or unproven:
+# do NOT trust logical pins 1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30,
+# 31 to reach their matching physical pin until the re-walk lands.
 PIN_REMAP = {
-    "Dev2": {0: 31, 31: 0},
+    "Dev2": {
+        # CONFIRMED end-to-end (verification walk 2026-07-21, pin_map_Dev2.csv)
+        0: 31, 2: 29, 3: 27, 4: 25, 6: 24, 7: 22, 9: 21, 10: 19,
+        12: 18, 13: 16, 15: 15, 16: 13, 18: 12, 19: 10, 21: 9, 22: 7,
+        24: 6, 25: 4,
+        # UNCONFIRMED — failed verification; bijection placeholders only,
+        # pending the targeted re-walk in pin_identify_test.py
+        1: 28, 5: 26, 8: 23, 11: 20, 14: 17, 17: 14, 20: 11, 23: 8,
+        26: 5, 27: 3, 28: 1, 29: 2, 31: 0,
+        # 30 -> identity (raw ch 30 shorted across physical 5/8/11/14/17/20)
+    },
 }
 
 
