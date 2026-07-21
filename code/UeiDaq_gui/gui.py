@@ -347,24 +347,32 @@ CARDS = {
 # you don't think you're touching. Populate only pins you've verified;
 # unlisted pins are assumed correct (identity) until proven otherwise.
 #
-# Confirmed observations on Dev2 (via pin_identify_test.py / multimeter):
-#   2026-07-15: logical pin 0  -> physical pin 31
-#               logical pin 31 -> physical pin 0
-#   2026-07-16: logical pin 15 -> physical pin 15 (UNCHANGED)
-# The 2026-07-16 point is important: pin 15 staying put DISPROVES the
-# tempting "the whole connector is reversed" theory (a full i->31-i reversal
-# would put 15 on 16). It also rules out a constant offset and any single XOR
-# mask — each contradicts at least one of the three known points. In other
-# words, endpoints are swapped but the middle is fixed, and three points out
-# of 32 do not determine the other 29. Per this file's standing rule, the
-# unconfirmed pins stay identity until walked: only 0<->31 are encoded below.
-# To finish the map, run pin_identify_test.py with PIN_REMAP EMPTY (a raw
-# walk) — with the Guardian ADC auto-scan it reports the true physical
-# landing channel for every logical pin whose target is in 0-7, and the
-# multimeter covers the rest — then copy the observed logical->physical pairs
-# in here. Do NOT guess the gaps.
+# Dev2 (AO-333) mapping — completed 2026-07-20 by a full raw walk with
+# pin_identify_test.py (PIN_REMAP empty), Guardian ADC + multimeter, recorded
+# in pin_map_Dev2.csv. The ribbon cable jumpered off its far end produces a
+# SYMMETRIC swap (an involution): driving raw channel a comes out at physical
+# pin b, and driving raw channel b comes out at physical pin a. So the same
+# dict corrects both the write and the readback direction. The 21 confirmed
+# pairs below cover every physical output that has a device wired to it.
+#
+# NOT a clean i->31-i reversal and NOT a constant offset: pin 15 maps to
+# itself while the endpoints swap (0<->31). The pattern is real but irregular,
+# so it was walked pin-by-pin rather than extrapolated.
+#
+# Deliberately UNLISTED (kept identity): logical 1, 5, 8, 11, 14, 17, 20, 23,
+# 26, 28, 30. These raw channels could not be pinned to a single physical
+# output during the walk — raw channel 30 in particular lit up physical
+# 5/8/11/14/17/20 all at once (a short/floating bus, not a 1:1 route). Their
+# physical destinations are functional pins that just don't yet have a
+# confirmed logical route, so per the standing rule they stay un-remapped
+# instead of being guessed. Finish them the same way (raw walk) if/when the
+# downstream wiring for those channels is settled, then add the pairs here.
 PIN_REMAP = {
-    "Dev2": {0: 31, 31: 0},
+    "Dev2": {
+        0: 31, 2: 29, 3: 27, 4: 25, 6: 24, 7: 22, 9: 21, 10: 19,
+        12: 18, 13: 16, 15: 15, 16: 13, 18: 12, 19: 10, 21: 9,
+        22: 7, 24: 6, 25: 4, 27: 3, 29: 2, 31: 0,
+    },
 }
 
 

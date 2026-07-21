@@ -1,9 +1,9 @@
 logical_pin,physical_channel,note
-0,,31
+0,,-
 1,,
 2,,
 3,,27
-4,,
+4,,25
 5,,
 6,,24
 7,,22
@@ -28,6 +28,6 @@ logical_pin,physical_channel,note
 26,,
 27,,3
 28,,
-29,,
-30,,
+29,,2
+30,,20/17/14/11/8/5
 31,,0
