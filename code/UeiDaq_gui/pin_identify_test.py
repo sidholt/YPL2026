@@ -4,6 +4,13 @@ can correlate a GUI/software pin number to its physical location, using a
 multimeter or by watching a downstream device (e.g. an MZI heater pad)
 respond.
 
+Two walk styles: the classic one-pin-at-a-time walk, and SIGNATURE_MODE
+(see CONFIG) which drives every channel under test AT ONCE, each at its own
+unique voltage — you probe each candidate physical pin exactly once and the
+voltage you read identifies which channel feeds it. Use signature mode when
+many channels are unknown; it turns an N-passes-times-M-spots hunt into a
+single M-probe pass.
+
 Why this script exists: gui.py's write path was audited end to end and
 every write — whether triggered by clicking "Set" on one pin or by the new
 "Set All To" — goes through the exact same CardSession.write()/ramp_to()
@@ -87,6 +94,26 @@ PIN_REMAP = {}
 # Raw 30 is the known-shorted channel (seen driving physical 5/8/11/14/17/20
 # at once) — expect it to light up several pins, not one.
 PINS_TO_TEST = [0, 1, 2, 3, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30]
+
+# SIGNATURE MODE — the fast way to resolve many unknown channels at once,
+# because probing every candidate spot for every channel one at a time is
+# quadratically slow. All PINS_TO_TEST channels are driven SIMULTANEOUSLY,
+# each at its own unique voltage, so you walk the dead physical pins ONCE:
+# the voltage you read on a pin is a fingerprint identifying which raw
+# channel feeds it. You type the reading and the script does the lookup.
+# ~12 probes total instead of 14 passes x 14 candidate spots.
+#   - Physical pins 1 and 5 are inside Guardian ADC range (0-7), so they
+#     identify themselves automatically — don't probe those.
+#   - Raw 30 (the known short) is held at 0 V during the signature pass so
+#     its floating bus can't contaminate readings; it gets a solo pass at
+#     the end for whatever pins are still unidentified.
+# Set False to fall back to the classic one-channel-at-a-time walk.
+SIGNATURE_MODE = True
+SIG_START = 0.5    # lowest signature voltage
+SIG_STEP  = 0.25   # spacing (13 channels -> 0.5..3.5 V, easy to read on a DMM)
+SHORTED_RAW = 30
+# The physical pins that currently show nothing — the only spots to probe.
+DEAD_PHYSICAL = [1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31]
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -121,6 +148,102 @@ def read_guardian(dll, handle):
     if ret < 0:
         raise RuntimeError(f"DqAdv333ReadADC failed: {ret}")
     return list(fdata)
+
+
+def signature_walk(write, zeros, guardian, unit, notes, discovered):
+    """The fast walk: drives every PINS_TO_TEST channel AT ONCE, each at its
+    own unique voltage, so each dead physical pin needs exactly one probe —
+    the voltage read there fingerprints the raw channel feeding it. Fills
+    `notes`/`discovered` keyed by raw channel (same shape as the classic
+    walk, so the shared table/CSV code just works). Returns True if the
+    user stopped early."""
+    sig_chans = [c for c in PINS_TO_TEST if c != SHORTED_RAW]
+    sig = {c: SIG_START + k * SIG_STEP for k, c in enumerate(sig_chans)}
+
+    def match_sig(volts):
+        best = min(sig_chans, key=lambda c: abs(sig[c] - volts))
+        return best if abs(sig[best] - volts) <= SIG_STEP / 2 - 0.02 else None
+
+    values = list(zeros)
+    for c, v in sig.items():
+        values[c] = v
+    write(values)
+
+    print("\nSIGNATURE PASS — all unknown channels driven at once:")
+    print("   raw ch:" + "".join(f"  {c:>4d}" for c in sig_chans))
+    print("   volts :" + "".join(f"  {sig[c]:>4.2f}" for c in sig_chans))
+    print(f"   (raw {SHORTED_RAW} held at 0 until its solo pass at the end)")
+
+    remaining = list(DEAD_PHYSICAL)
+
+    # Physical 0-7 read back automatically — no probing needed there.
+    if guardian is not None:
+        time.sleep(0.3)
+        vals = read_guardian(*guardian)
+        for p in [p for p in remaining if p < 8]:
+            r = match_sig(vals[p])
+            if r is not None:
+                discovered[r] = p
+                notes[r] = f"phys {p} @ {vals[p]:+.3f} V (Guardian, signature pass)"
+                remaining.remove(p)
+                print(f"   [Guardian] physical {p} reads {vals[p]:+.3f} V "
+                      f"-> fed by raw ch {r}")
+            else:
+                print(f"   [Guardian] physical {p} reads {vals[p]:+.3f} V "
+                      f"-> no signature match (dead, or on the raw-{SHORTED_RAW} "
+                      f"bus — the solo pass will tell)")
+
+    print("\nProbe each pin below ONCE and type the voltage you read "
+          "(Enter = nothing/0 there, 'q' = stop):")
+    stopped = False
+    for p in [p for p in remaining if p >= 8 or guardian is None]:
+        ans = input(f"   physical pin {p:2d} reads ({unit}): ").strip().lower()
+        if ans == "q":
+            stopped = True
+            break
+        if not ans:
+            continue
+        try:
+            volts = float(ans.rstrip("v").strip())
+        except ValueError:
+            print("      couldn't parse that as a number — skipping this pin")
+            continue
+        r = match_sig(volts)
+        if r is None:
+            print(f"      {volts:g} {unit} matches no signature — leaving pin "
+                  f"{p} unidentified")
+            continue
+        discovered[r] = p
+        notes[r] = f"phys {p} @ {volts:g} V (signature pass)"
+        remaining.remove(p)
+        print(f"      -> physical {p} is fed by raw ch {r} "
+              f"(signature {sig[r]:.2f} V)")
+
+    write(zeros)
+
+    if not stopped:
+        # Solo pass for the shorted channel: everything else is at 0 now, so
+        # any pin that lights up is on the raw-30 bus (or solely fed by it).
+        values = list(zeros)
+        values[SHORTED_RAW] = TEST_VAL
+        write(values)
+        print(f"\nSOLO PASS — only raw ch {SHORTED_RAW} at {TEST_VAL:g} {unit} "
+              f"(known short: several pins may light up).")
+        if remaining:
+            print(f"   Physical pins still unidentified: {remaining} — check those.")
+        if guardian is not None:
+            time.sleep(0.3)
+            vals = read_guardian(*guardian)
+            hits = [ch for ch, v in enumerate(vals) if abs(v - TEST_VAL) < 0.5]
+            if hits:
+                print(f"   [Guardian] physical {hits} responding on 0-7")
+        ans = input(f"   physical pins showing ~{TEST_VAL:g} {unit} "
+                    "(comma-separated, Enter = none): ").strip()
+        if ans:
+            notes[SHORTED_RAW] = f"drives phys {ans} (solo pass, known short)"
+        write(zeros)
+
+    return stopped
 
 
 def main():
@@ -181,55 +304,59 @@ def main():
     try:
         write(zeros)
         print(f"\nAll {DEV} pins zeroed.")
-        pins_desc = (", ".join(str(p) for p in pins) if PINS_TO_TEST
-                     else f"{START_PIN}..{END_PIN}")
-        print(f"Walking pins {pins_desc}, {TEST_VAL:g} {unit} each.")
-        print("Probe/observe, then Enter to advance — type a short note first "
-              "if you want it recorded (e.g. \"top-left screw terminal\"), "
-              "or 'q' + Enter to stop early.\n")
-        for i in pins:
-            values = list(zeros)
-            values[i] = TEST_VAL
-            write(values)
-            expected = i   # a correct remap makes logical pin i come out at
-                           # physical pin i; in a raw walk (empty remap) this is
-                           # still i, so identity wiring reads "as expected"
-            prev_note = prior.get(str(i), {}).get("note", "")
-            msg = f"  >>> Pin {i:02d} -> {TEST_VAL:g} {unit}  — probe it now"
-            if prev_note:
-                msg += f'   [previous note: "{prev_note}"]'
-            if guardian is not None:
-                time.sleep(0.3)   # let the ADC settle before reading
-                vals = read_guardian(*guardian)   # 8 physical readback channels
-                # Auto-detect which physical channel actually responded, rather
-                # than only checking the one we EXPECT: the channel(s) that
-                # jumped close to TEST_VAL. With an empty PIN_REMAP this reveals
-                # the true logical->physical landing for every pin whose target
-                # is in physical 0-7 — no multimeter needed for those.
-                hits = [ch for ch, v in enumerate(vals) if abs(v - TEST_VAL) < 0.5]
-                if len(hits) == 1:
-                    found = hits[0]
-                    discovered[i] = found
-                    tag = "as expected" if found == expected else f"but EXPECTED {expected}"
-                    msg += (f"   [Guardian: logical {i} -> physical ch {found} "
-                            f"({vals[found]:+.3f} V) — {tag}]")
-                elif not hits:
-                    msg += (f"   [Guardian: nothing near {TEST_VAL:g} V on physical 0-7 "
-                            f"— it lands on physical 8-31; read it on the multimeter]")
-                else:
-                    msg += (f"   [Guardian: MULTIPLE channels responded {hits} "
-                            f"— possible short/crosstalk, investigate]")
-            print(msg)
-            prompt = f"      note for Pin {i:02d} "
-            prompt += f'(Enter to keep "{prev_note}", ' if prev_note else "(Enter to skip, "
-            prompt += "'q' to stop): "
-            note = input(prompt).strip()
-            write(zeros)
-            if note.lower() == "q":
-                stopped_early = True
-                break
-            if note:
-                notes[i] = note
+        if SIGNATURE_MODE and PINS_TO_TEST:
+            stopped_early = signature_walk(write, zeros, guardian, unit,
+                                           notes, discovered)
+        else:
+            pins_desc = (", ".join(str(p) for p in pins) if PINS_TO_TEST
+                         else f"{START_PIN}..{END_PIN}")
+            print(f"Walking pins {pins_desc}, {TEST_VAL:g} {unit} each.")
+            print("Probe/observe, then Enter to advance — type a short note first "
+                  "if you want it recorded (e.g. \"top-left screw terminal\"), "
+                  "or 'q' + Enter to stop early.\n")
+            for i in pins:
+                values = list(zeros)
+                values[i] = TEST_VAL
+                write(values)
+                expected = i   # a correct remap makes logical pin i come out at
+                               # physical pin i; in a raw walk (empty remap) this
+                               # is still i, so identity wiring reads "as expected"
+                prev_note = prior.get(str(i), {}).get("note", "")
+                msg = f"  >>> Pin {i:02d} -> {TEST_VAL:g} {unit}  — probe it now"
+                if prev_note:
+                    msg += f'   [previous note: "{prev_note}"]'
+                if guardian is not None:
+                    time.sleep(0.3)   # let the ADC settle before reading
+                    vals = read_guardian(*guardian)   # 8 physical readback channels
+                    # Auto-detect which physical channel actually responded, rather
+                    # than only checking the one we EXPECT: the channel(s) that
+                    # jumped close to TEST_VAL. With an empty PIN_REMAP this reveals
+                    # the true logical->physical landing for every pin whose target
+                    # is in physical 0-7 — no multimeter needed for those.
+                    hits = [ch for ch, v in enumerate(vals) if abs(v - TEST_VAL) < 0.5]
+                    if len(hits) == 1:
+                        found = hits[0]
+                        discovered[i] = found
+                        tag = "as expected" if found == expected else f"but EXPECTED {expected}"
+                        msg += (f"   [Guardian: logical {i} -> physical ch {found} "
+                                f"({vals[found]:+.3f} V) — {tag}]")
+                    elif not hits:
+                        msg += (f"   [Guardian: nothing near {TEST_VAL:g} V on physical 0-7 "
+                                f"— it lands on physical 8-31; read it on the multimeter]")
+                    else:
+                        msg += (f"   [Guardian: MULTIPLE channels responded {hits} "
+                                f"— possible short/crosstalk, investigate]")
+                print(msg)
+                prompt = f"      note for Pin {i:02d} "
+                prompt += f'(Enter to keep "{prev_note}", ' if prev_note else "(Enter to skip, "
+                prompt += "'q' to stop): "
+                note = input(prompt).strip()
+                write(zeros)
+                if note.lower() == "q":
+                    stopped_early = True
+                    break
+                if note:
+                    notes[i] = note
     except KeyboardInterrupt:
         stopped_early = True
         print("\nStopped early.")
@@ -254,13 +381,23 @@ def main():
 
     # Auto-discovered pairs, ready to paste into gui.py's PIN_REMAP. Only the
     # non-identity pairs are worth encoding; a pin that landed on its own index
-    # is already correct. Pins that landed on physical 8-31 aren't here (no
-    # ADC readback) — add those from your multimeter notes by hand.
+    # is already correct. DIRECTION MATTERS now that the map isn't a symmetric
+    # involution: `discovered` holds raw/driven channel -> physical landing,
+    # while gui.py's PIN_REMAP maps logical pin -> raw channel to DRIVE, so in
+    # a raw walk (empty PIN_REMAP) the paste-ready entries are the INVERSE
+    # {physical: raw} — the entry that makes GUI pin p come out at physical p.
     nontrivial = {i: p for i, p in discovered.items() if i != p}
     if discovered:
-        print("\nAuto-discovered mapping (Guardian ADC, physical 0-7 only):")
-        pairs = ", ".join(f"{i}: {p}" for i, p in sorted(nontrivial.items()))
-        print(f'    PIN_REMAP = {{"{DEV}": {{{pairs}}}}}')
+        if PIN_REMAP:
+            print("\nAuto-discovered mapping (logical -> physical landing):")
+            pairs = ", ".join(f"{i}: {p}" for i, p in sorted(nontrivial.items()))
+            print(f'    PIN_REMAP = {{"{DEV}": {{{pairs}}}}}')
+        else:
+            print("\ngui.py-ready PIN_REMAP entries (logical pin p is fed by "
+                  "raw channel r, i.e. {p: r}):")
+            pairs = ", ".join(f"{p}: {r}" for p, r in
+                              sorted((p, r) for r, p in nontrivial.items()))
+            print(f"    {pairs}")
         identity = sorted(i for i, p in discovered.items() if i == p)
         if identity:
             print(f"    (already-correct/identity pins seen: {identity})")
