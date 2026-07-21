@@ -347,44 +347,25 @@ CARDS = {
 # you don't think you're touching. Populate only pins you've verified;
 # unlisted pins are assumed correct (identity) until proven otherwise.
 #
-# Dev2 (AO-333) mapping — completed 2026-07-20 by a full raw walk with
-# pin_identify_test.py (PIN_REMAP empty), Guardian ADC + multimeter, recorded
-# in pin_map_Dev2.csv. The ribbon cable jumpered off its far end produces a
-# SYMMETRIC swap (an involution): driving raw channel a comes out at physical
-# pin b, and driving raw channel b comes out at physical pin a. So the same
-# dict corrects both the write and the readback direction, and GUI pin N now
-# drives physical pin N for every channel.
+# Confirmed observations on Dev2 (via pin_identify_test.py / multimeter):
+#   2026-07-15: logical pin 0  -> physical pin 31
+#               logical pin 31 -> physical pin 0
+#   2026-07-16: logical pin 15 -> physical pin 15 (UNCHANGED)
+# The 2026-07-16 point is important: pin 15 staying put DISPROVES the
+# tempting "the whole connector is reversed" theory (a full i->31-i reversal
+# would put 15 on 16). It also rules out a constant offset and any single XOR
+# mask — each contradicts at least one of the three known points. In other
+# words, endpoints are swapped but the middle is fixed, and three points out
+# of 32 do not determine the other 29. Per this file's standing rule, the
+# unconfirmed pins stay identity until walked: only 0<->31 are encoded below.
 #
-# The swap is exactly described by a per-residue-class rule that reproduces
-# ALL 21 directly-walked points with zero misfits (verify: rerun the check in
-# this repo's history / pin_map_Dev2.csv):
-#     n % 3 == 2  ->  31 - n     (2<->29, 5<->26, 8<->23, 11<->20, 14<->17)
-#     n % 3 == 1  ->  29 - n     (4<->25, 7<->22, 10<->19, 13<->16), plus 1<->28
-#     n % 3 == 0  ->  30 - n     (3<->27, 6<->24, 9<->21, 12<->18, 15->15)
-#     endpoints   ->  0 <-> 31   (special-cased; breaks the mod-0 rule)
-# 19 of the 21 pins were seen directly on a device; the remaining gap pins
-# (1<->28, 5<->26, 8<->23, 11<->20, 14<->17) were filled from this rule at the
-# user's request. That is normally against this file's no-guessing rule, but
-# it is safe here for one concrete reason: every gap route lands on a physical
-# pin that currently has NO working device on it (verified — no gap fill
-# collides with any of the 21 working physical outputs), so completing the map
-# cannot misroute anything that works. It only makes GUI pin N line up with
-# physical pin N ahead of time, so a device wired to one of those pins later
-# is controlled by its own number instead of a scrambled one.
-#
-# EXCEPTION — logical 30 is left identity (unlisted): the rule would send it to
-# physical 0, which pin 31 already owns, and the walk showed raw channel 30
-# shorted across physical 5/8/11/14/17/20 (a floating bus, not a 1:1 route).
-# That is a hardware short no remap can fix; leave it until the short is
-# resolved, then walk it.
+# A full raw walk (2026-07-20, recorded in pin_map_Dev2.csv) found the rest of
+# the mapping and it fits a clean symmetric involution, but the completed map
+# is being VERIFIED in pin_identify_test.py first (its PIN_REMAP now holds the
+# full candidate map) before it is promoted back here. Until that check passes,
+# gui.py deliberately stays on the minimal confirmed 0<->31 swap.
 PIN_REMAP = {
-    "Dev2": {
-        0: 31, 1: 28, 2: 29, 3: 27, 4: 25, 5: 26, 6: 24, 7: 22,
-        8: 23, 9: 21, 10: 19, 11: 20, 12: 18, 13: 16, 14: 17, 15: 15,
-        16: 13, 17: 14, 18: 12, 19: 10, 20: 11, 21: 9, 22: 7, 23: 8,
-        24: 6, 25: 4, 26: 5, 27: 3, 28: 1, 29: 2, 31: 0,
-        # 30 -> identity (shorted channel; see EXCEPTION note above)
-    },
+    "Dev2": {0: 31, 31: 0},
 }
 
 

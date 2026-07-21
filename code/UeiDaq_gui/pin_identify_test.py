@@ -52,7 +52,11 @@ MODE      = "voltage"      # "voltage" or "current" — must match DEV above
 NUM_CH    = 32             # total channels on this card (16 for Dev0/Dev1, 32 for Dev2)
 TEST_VAL  = 3.0            # value to drive each pin to (volts, or mA if MODE="current")
 START_PIN = 0              # first pin to test
-END_PIN   = 31             # last pin to test (inclusive)
+END_PIN   = 7              # last pin to test (inclusive). 0-7 is the Guardian-
+                           # auto-verifiable range: with the full map below,
+                           # logical 0-7 land on physical 0-7, so the ADC
+                           # confirms each with no multimeter. Raise to 31 to
+                           # walk the rest (needs a multimeter for physical 8-31).
 
 # Cross-checks Dev2 pins 0-7 against real Guardian ADC hardware feedback —
 # the only channels with actual ADC readback (see ao333_bridge.py / gui.py's
@@ -61,21 +65,26 @@ END_PIN   = 31             # last pin to test (inclusive)
 GUARDIAN_READBACK = True
 PDNA_DLL = r"C:\Program Files (x86)\UEI\PowerDNA\Shared\PDNALib.dll"
 
-# Leave EMPTY for a raw diagnostic walk (drives logical pin i with NO
-# correction — this is how the 0->31 and 15->15 findings were made, and it's
-# the mode you want right now to discover the full mapping). With Guardian
-# readback on, an empty remap turns this script into an auto-mapper: it
-# drives each raw logical pin, scans all 8 physical readback channels, and
-# tells you exactly which physical channel lit up — no multimeter needed for
-# any pin whose target lands in physical 0-7.
+# VERIFICATION MODE: this holds the full candidate Dev2 map from the raw walk
+# (the symmetric involution), so the script applies the correction before
+# writing and you can confirm logical pin i now actually comes out at physical
+# pin i. With END_PIN=7 the Guardian ADC auto-confirms pins 0-7 (they land on
+# physical 0-7) — no multimeter needed. This map is NOT yet in gui.py; it lives
+# here until this check passes, then gets promoted.
 #
-# Once you have confirmed pairs, copy the same dict here (same shape as
-# gui.py's PIN_REMAP) and re-run: the script applies the correction before
-# writing, so you can verify pin i now actually shows up at physical
-# position i (the auto-scan will then confirm each lands where you asked).
-# Only put CONFIRMED entries here — see the PIN_REMAP comment in gui.py for
-# why guessing is unsafe.
-PIN_REMAP = {}   # empty = raw walk; discover the true map before encoding anything
+# Two of these pairs (1<->28, 5<->26) are the rule-inferred gap pins that land
+# inside 0-7, so THIS run actually tests them against the ADC too.
+#
+# (For a raw discovery walk instead, set PIN_REMAP = {} — logical pin i then
+# drives raw channel i with no correction and the auto-scan reports the true
+# physical landing channel.)
+PIN_REMAP = {
+    0: 31, 1: 28, 2: 29, 3: 27, 4: 25, 5: 26, 6: 24, 7: 22,
+    8: 23, 9: 21, 10: 19, 11: 20, 12: 18, 13: 16, 14: 17, 15: 15,
+    16: 13, 17: 14, 18: 12, 19: 10, 20: 11, 21: 9, 22: 7, 23: 8,
+    24: 6, 25: 4, 26: 5, 27: 3, 28: 1, 29: 2, 31: 0,
+    # 30 -> identity (shorted channel: raw ch 30 drives physical 5/8/11/14/17/20)
+}
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -173,7 +182,9 @@ def main():
             values = list(zeros)
             values[i] = TEST_VAL
             write(values)
-            expected = PIN_REMAP.get(i, i)   # where this logical pin SHOULD land
+            expected = i   # a correct remap makes logical pin i come out at
+                           # physical pin i; in a raw walk (empty remap) this is
+                           # still i, so identity wiring reads "as expected"
             prev_note = prior.get(str(i), {}).get("note", "")
             msg = f"  >>> Pin {i:02d} -> {TEST_VAL:g} {unit}  — probe it now"
             if prev_note:
