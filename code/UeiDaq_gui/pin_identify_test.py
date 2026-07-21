@@ -72,48 +72,40 @@ END_PIN   = 31             # last pin to test (inclusive) — full 32-ch card.
 GUARDIAN_READBACK = True
 PDNA_DLL = r"C:\Program Files (x86)\UEI\PowerDNA\Shared\PDNALib.dll"
 
-# VERIFICATION RESULT 2026-07-21 (pin_map_Dev2.csv): the full candidate map
-# was walked. 18 pins came out at the right physical pin and were PROMOTED to
-# gui.py's PIN_REMAP["Dev2"]. Every one of the 13 rule-inferred routes showed
-# nothing ("not seeing anything"), so the involution theory is DISPROVED for
-# the inferred pairs — where raw channels 0,1,2,5,8,11,14,17,20,23,26,28
-# really land is unknown. One contradiction: logical 27 -> raw 3 showed
-# nothing even though the raw walk directly saw raw 3 land on physical 27,
-# so raw 3 gets re-checked too.
-#
-# This script is therefore back in RAW DISCOVERY mode (PIN_REMAP empty):
-# pin i drives raw channel i with no correction, and you note the physical
-# pin where the voltage actually appears. The places still missing a source
-# are physical pins 1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31 —
-# probe those spots for each channel below.
+# RAW DISCOVERY mode (PIN_REMAP empty): pin i drives raw channel i with no
+# correction, and you note the physical pin where the voltage actually
+# appears. To VERIFY a candidate map instead, paste it here — the script
+# then applies the correction before writing, so logical pin i should come
+# out at physical pin i everywhere if the candidate is right.
+# (2026-07-21: mapping restarted from scratch at the user's request; the
+# previous investigation's data is in git history — fa1785b / 276e4ab.)
 PIN_REMAP = {}
 
 # Walk only these raw channels (overrides START_PIN..END_PIN when non-empty).
-# These are exactly the channels whose landing is still unknown after the
-# 2026-07-21 verification, plus raw 3 (the logical-27 contradiction).
-# Raw 30 is the known-shorted channel (seen driving physical 5/8/11/14/17/20
-# at once) — expect it to light up several pins, not one.
-PINS_TO_TEST = [0, 1, 2, 3, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30]
+# Leave empty for a full fresh walk of START_PIN..END_PIN.
+PINS_TO_TEST = []
 
-# SIGNATURE MODE — the fast way to resolve many unknown channels at once,
+# SIGNATURE MODE — the fast way to resolve MANY unknown channels at once,
 # because probing every candidate spot for every channel one at a time is
 # quadratically slow. All PINS_TO_TEST channels are driven SIMULTANEOUSLY,
-# each at its own unique voltage, so you walk the dead physical pins ONCE:
+# each at its own unique voltage, so you walk the DEAD_PHYSICAL pins ONCE:
 # the voltage you read on a pin is a fingerprint identifying which raw
 # channel feeds it. You type the reading and the script does the lookup.
-# ~12 probes total instead of 14 passes x 14 candidate spots.
-#   - Physical pins 1 and 5 are inside Guardian ADC range (0-7), so they
-#     identify themselves automatically — don't probe those.
-#   - Raw 30 (the known short) is held at 0 V during the signature pass so
-#     its floating bus can't contaminate readings; it gets a solo pass at
-#     the end for whatever pins are still unidentified.
-# Set False to fall back to the classic one-channel-at-a-time walk.
-SIGNATURE_MODE = True
+#   - Requires PINS_TO_TEST (the channels to drive) and DEAD_PHYSICAL (the
+#     physical spots to probe). Pins inside Guardian ADC range (0-7)
+#     identify themselves automatically — no probing needed there.
+#   - Raw ch 30 (SHORTED_RAW — seen bridging physical 5/8/11/14/17/20) is
+#     held at 0 V during the pass so the short can't contaminate readings;
+#     it gets a solo pass at the end.
+#   - Mind the top voltage: max = SIG_START + (len(PINS_TO_TEST)-1)*SIG_STEP.
+# False = the classic one-channel-at-a-time walk (right choice for a fresh
+# full discovery, where every physical pin is a candidate anyway).
+SIGNATURE_MODE = False
 SIG_START = 0.5    # lowest signature voltage
-SIG_STEP  = 0.25   # spacing (13 channels -> 0.5..3.5 V, easy to read on a DMM)
+SIG_STEP  = 0.25   # spacing between signatures (easy to split on a DMM)
 SHORTED_RAW = 30
-# The physical pins that currently show nothing — the only spots to probe.
-DEAD_PHYSICAL = [1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31]
+# Physical pins with no known source — the spots to probe in signature mode.
+DEAD_PHYSICAL = []
 # ─────────────────────────────────────────────────────────────────────────
 
 
