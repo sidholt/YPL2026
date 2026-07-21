@@ -52,11 +52,11 @@ MODE      = "voltage"      # "voltage" or "current" — must match DEV above
 NUM_CH    = 32             # total channels on this card (16 for Dev0/Dev1, 32 for Dev2)
 TEST_VAL  = 3.0            # value to drive each pin to (volts, or mA if MODE="current")
 START_PIN = 0              # first pin to test
-END_PIN   = 7              # last pin to test (inclusive). 0-7 is the Guardian-
-                           # auto-verifiable range: with the full map below,
-                           # logical 0-7 land on physical 0-7, so the ADC
-                           # confirms each with no multimeter. Raise to 31 to
-                           # walk the rest (needs a multimeter for physical 8-31).
+END_PIN   = 31             # last pin to test (inclusive) — full 32-ch card.
+                           # Only physical 0-7 have Guardian ADC readback, so
+                           # pins 0-7 auto-confirm; for 8-31 the script drives
+                           # them for real but you read them on a multimeter.
+                           # Set to 7 for a quick ADC-only check of 0-7.
 
 # Cross-checks Dev2 pins 0-7 against real Guardian ADC hardware feedback —
 # the only channels with actual ADC readback (see ao333_bridge.py / gui.py's
