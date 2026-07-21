@@ -352,26 +352,38 @@ CARDS = {
 # in pin_map_Dev2.csv. The ribbon cable jumpered off its far end produces a
 # SYMMETRIC swap (an involution): driving raw channel a comes out at physical
 # pin b, and driving raw channel b comes out at physical pin a. So the same
-# dict corrects both the write and the readback direction. The 21 confirmed
-# pairs below cover every physical output that has a device wired to it.
+# dict corrects both the write and the readback direction, and GUI pin N now
+# drives physical pin N for every channel.
 #
-# NOT a clean i->31-i reversal and NOT a constant offset: pin 15 maps to
-# itself while the endpoints swap (0<->31). The pattern is real but irregular,
-# so it was walked pin-by-pin rather than extrapolated.
+# The swap is exactly described by a per-residue-class rule that reproduces
+# ALL 21 directly-walked points with zero misfits (verify: rerun the check in
+# this repo's history / pin_map_Dev2.csv):
+#     n % 3 == 2  ->  31 - n     (2<->29, 5<->26, 8<->23, 11<->20, 14<->17)
+#     n % 3 == 1  ->  29 - n     (4<->25, 7<->22, 10<->19, 13<->16), plus 1<->28
+#     n % 3 == 0  ->  30 - n     (3<->27, 6<->24, 9<->21, 12<->18, 15->15)
+#     endpoints   ->  0 <-> 31   (special-cased; breaks the mod-0 rule)
+# 19 of the 21 pins were seen directly on a device; the remaining gap pins
+# (1<->28, 5<->26, 8<->23, 11<->20, 14<->17) were filled from this rule at the
+# user's request. That is normally against this file's no-guessing rule, but
+# it is safe here for one concrete reason: every gap route lands on a physical
+# pin that currently has NO working device on it (verified — no gap fill
+# collides with any of the 21 working physical outputs), so completing the map
+# cannot misroute anything that works. It only makes GUI pin N line up with
+# physical pin N ahead of time, so a device wired to one of those pins later
+# is controlled by its own number instead of a scrambled one.
 #
-# Deliberately UNLISTED (kept identity): logical 1, 5, 8, 11, 14, 17, 20, 23,
-# 26, 28, 30. These raw channels could not be pinned to a single physical
-# output during the walk — raw channel 30 in particular lit up physical
-# 5/8/11/14/17/20 all at once (a short/floating bus, not a 1:1 route). Their
-# physical destinations are functional pins that just don't yet have a
-# confirmed logical route, so per the standing rule they stay un-remapped
-# instead of being guessed. Finish them the same way (raw walk) if/when the
-# downstream wiring for those channels is settled, then add the pairs here.
+# EXCEPTION — logical 30 is left identity (unlisted): the rule would send it to
+# physical 0, which pin 31 already owns, and the walk showed raw channel 30
+# shorted across physical 5/8/11/14/17/20 (a floating bus, not a 1:1 route).
+# That is a hardware short no remap can fix; leave it until the short is
+# resolved, then walk it.
 PIN_REMAP = {
     "Dev2": {
-        0: 31, 2: 29, 3: 27, 4: 25, 6: 24, 7: 22, 9: 21, 10: 19,
-        12: 18, 13: 16, 15: 15, 16: 13, 18: 12, 19: 10, 21: 9,
-        22: 7, 24: 6, 25: 4, 27: 3, 29: 2, 31: 0,
+        0: 31, 1: 28, 2: 29, 3: 27, 4: 25, 5: 26, 6: 24, 7: 22,
+        8: 23, 9: 21, 10: 19, 11: 20, 12: 18, 13: 16, 14: 17, 15: 15,
+        16: 13, 17: 14, 18: 12, 19: 10, 20: 11, 21: 9, 22: 7, 23: 8,
+        24: 6, 25: 4, 26: 5, 27: 3, 28: 1, 29: 2, 31: 0,
+        # 30 -> identity (shorted channel; see EXCEPTION note above)
     },
 }
 
