@@ -114,6 +114,15 @@ SIG_STEP  = 0.25   # spacing (13 channels -> 0.5..3.5 V, easy to read on a DMM)
 SHORTED_RAW = 30
 # The physical pins that currently show nothing — the only spots to probe.
 DEAD_PHYSICAL = [1, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29, 30, 31]
+
+# HOLD_ONLY: don't prompt pin-by-pin — just energize the signature pattern
+# and LEAVE IT ON while you probe every pin at your own pace and write down
+# "physical pin -> volts" on paper. Press Enter once when done; the script
+# then holds the raw-30 solo pass the same way, then zeroes everything.
+# Decode afterwards: the voltage on a pin identifies the raw channel feeding
+# it (table printed at start). Nothing is typed in, so nothing is saved to
+# the CSV — the written-down readings are the record.
+HOLD_ONLY = True
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -192,6 +201,28 @@ def signature_walk(write, zeros, guardian, unit, notes, discovered):
                 print(f"   [Guardian] physical {p} reads {vals[p]:+.3f} V "
                       f"-> no signature match (dead, or on the raw-{SHORTED_RAW} "
                       f"bus — the solo pass will tell)")
+
+    if HOLD_ONLY:
+        print("\nHOLD mode — the signature voltages above STAY ON now.")
+        print("Probe all the pins at your own pace and write down "
+              "physical pin -> volts; nothing to type here.")
+        print("   volts -> raw ch:  " +
+              ",  ".join(f"{sig[c]:.2f}->{c}"
+                         for c in sorted(sig_chans, key=lambda c: sig[c])))
+        print(f"   (~0 V means: fed by an already-confirmed channel, fed by "
+              f"raw {SHORTED_RAW} — held at 0 until the next step — or dead)")
+        input("\n   Press Enter when done probing to switch to the "
+              f"raw-{SHORTED_RAW} solo pass... ")
+        write(zeros)
+        values = list(zeros)
+        values[SHORTED_RAW] = TEST_VAL
+        write(values)
+        print(f"\n   Only raw ch {SHORTED_RAW} is at {TEST_VAL:g} {unit} now "
+              f"(known short: several pins may show it). Note which pins are "
+              f"live.")
+        input("   Press Enter when done to zero everything... ")
+        write(zeros)
+        return False
 
     print("\nProbe each pin below ONCE and type the voltage you read "
           "(Enter = nothing/0 there, 'q' = stop):")
