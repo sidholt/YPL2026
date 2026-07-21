@@ -19,10 +19,10 @@ channel Ao{i} within the Dev{N}/Ao0:{num_pins-1} channel group created at
 connect time (see CardSession.connect() in gui.py). No reversal, no offset,
 no Set-All-specific code path was found. That makes a pure software
 indexing bug unlikely — this script lets you verify pin-by-pin directly
-instead of taking that on faith, and for Dev2 channels 0-7 (the only ones
-with real Guardian ADC feedback) it cross-checks each write against
-hardware readback automatically, so a software bug there would show up
-immediately as a mismatch without needing the multimeter at all.
+instead of taking that on faith, and for Dev2 (with real Guardian ADC
+feedback across all N_GUARDIAN_CH channels) it cross-checks each write
+against hardware readback automatically, so a software bug there would show
+up immediately as a mismatch without needing the multimeter at all.
 
 Advances on Enter (not a timer) — probe/observe, type a short note on where
 you found the pin (or just hit Enter to skip the note and move on, or 'q'
@@ -60,17 +60,25 @@ NUM_CH    = 32             # total channels on this card (16 for Dev0/Dev1, 32 f
 TEST_VAL  = 3.0            # value to drive each pin to (volts, or mA if MODE="current")
 START_PIN = 0              # first pin to test
 END_PIN   = 31             # last pin to test (inclusive) — full 32-ch card.
-                           # Only physical 0-7 have Guardian ADC readback, so
-                           # pins 0-7 auto-confirm; for 8-31 the script drives
-                           # them for real but you read them on a multimeter.
-                           # Set to 7 for a quick ADC-only check of 0-7.
+                           # All 32 physical pins now have Guardian ADC
+                           # readback (N_GUARDIAN_CH — see that constant's
+                           # comment re: untested timing at this size), so
+                           # every pin should auto-confirm; the multimeter is
+                           # now only a fallback if Guardian is unreachable.
 
-# Cross-checks Dev2 pins 0-7 against real Guardian ADC hardware feedback —
-# the only channels with actual ADC readback (see ao333_bridge.py / gui.py's
-# NUM_PINS comment). Set False to skip even for Dev2, or if the bridge DLL
-# isn't reachable from this machine.
+# Cross-checks Dev2 pins against real Guardian ADC hardware feedback (see
+# ao333_bridge.py / gui.py's NUM_PINS comment). Set False to skip even for
+# Dev2, or if the bridge DLL isn't reachable from this machine.
 GUARDIAN_READBACK = True
 PDNA_DLL = r"C:\Program Files (x86)\UEI\PowerDNA\Shared\PDNALib.dll"
+
+# Channels requested from DqAdv333ReadADC — was 8 (only physical 0-7 had
+# readback) until 2026-07-21, now attempting all 32 to cover every Dev2
+# output. Untested at this size: watch how long read_guardian() takes to
+# return on this hardware (the datasheet's own "all 32 channels read in 2.4
+# seconds" spec suggests it may be much slower per-channel than 8 was) —
+# drop back to 8 if it makes this walk impractically slow.
+N_GUARDIAN_CH = 32
 
 # RESOLVED 2026-07-21: the DNx-AO-333's official pinout (dnx-ao-333.pdf) wires
 # its 62-pin connector in 3 physical rows (21/21/20 pins, alternating
@@ -106,8 +114,9 @@ PINS_TO_TEST = [27]
 # the voltage you read on a pin is a fingerprint identifying which raw
 # channel feeds it. You type the reading and the script does the lookup.
 #   - Requires PINS_TO_TEST (the channels to drive) and DEAD_PHYSICAL (the
-#     physical spots to probe). Pins inside Guardian ADC range (0-7)
-#     identify themselves automatically — no probing needed there.
+#     physical spots to probe). Pins inside Guardian ADC range (0 to
+#     N_GUARDIAN_CH-1 — now all 32) identify themselves automatically — no
+#     probing needed there, multimeter only as a fallback.
 #   - Raw ch 30 (SHORTED_RAW — seen bridging physical 5/8/11/14/17/20) is
 #     held at 0 V during the pass so the short can't contaminate readings;
 #     it gets a solo pass at the end.
@@ -135,7 +144,7 @@ HOLD_ONLY = False
 
 def setup_guardian(cube_ip):
     """Opens a second, low-level connection for Guardian ADC readback —
-    only works for Dev2 channels 0-7. Mirrors ao333_bridge.py."""
+    Dev2 only, N_GUARDIAN_CH channels. Mirrors ao333_bridge.py."""
     dll = ctypes.WinDLL(PDNA_DLL)
     dll.DqInitDAQLib.restype  = ctypes.c_int
     dll.DqOpenIOM.restype     = ctypes.c_int
@@ -156,13 +165,17 @@ def setup_guardian(cube_ip):
 
 
 def read_guardian(dll, handle):
-    n = 8
+    n = N_GUARDIAN_CH
     cl    = (ctypes.c_uint32 * n)(*range(n))
     bdata = (ctypes.c_uint32 * n)()
     fdata = (ctypes.c_double * n)()
+    t0 = time.time()
     ret = dll.DqAdv333ReadADC(handle, 2, n, cl, bdata, fdata)
+    dt_ms = (time.time() - t0) * 1000
     if ret < 0:
         raise RuntimeError(f"DqAdv333ReadADC failed: {ret}")
+    if dt_ms > 200:   # only worth printing if it's slow enough to matter
+        print(f"   [Guardian] read of {n} channels took {dt_ms:.0f} ms")
     return list(fdata)
 
 
@@ -192,11 +205,12 @@ def signature_walk(write, zeros, guardian, unit, notes, discovered):
 
     remaining = list(DEAD_PHYSICAL)
 
-    # Physical 0-7 read back automatically — no probing needed there.
+    # Physical pins inside Guardian range read back automatically — no
+    # probing needed there (now all 32, see N_GUARDIAN_CH).
     if guardian is not None:
         time.sleep(0.3)
         vals = read_guardian(*guardian)
-        for p in [p for p in remaining if p < 8]:
+        for p in [p for p in remaining if p < len(vals)]:
             r = match_sig(vals[p])
             if r is not None:
                 discovered[r] = p
@@ -274,7 +288,7 @@ def signature_walk(write, zeros, guardian, unit, notes, discovered):
             vals = read_guardian(*guardian)
             hits = [ch for ch, v in enumerate(vals) if abs(v - TEST_VAL) < 0.5]
             if hits:
-                print(f"   [Guardian] physical {hits} responding on 0-7")
+                print(f"   [Guardian] physical {hits} responding")
         ans = input(f"   physical pins showing ~{TEST_VAL:g} {unit} "
                     "(comma-separated, Enter = none): ").strip()
         if ans:
@@ -306,7 +320,7 @@ def main():
     if GUARDIAN_READBACK and DEV == "Dev2":
         try:
             guardian = setup_guardian(CUBE_IP)
-            print("Guardian ADC readback connected — will cross-check pins 0-7 against hardware.")
+            print("Guardian ADC readback connected — will cross-check all pins against hardware.")
         except Exception as e:
             print(f"[WARN] Guardian readback unavailable ({e}) — continuing without it.")
 
@@ -365,12 +379,12 @@ def main():
                     msg += f'   [previous note: "{prev_note}"]'
                 if guardian is not None:
                     time.sleep(0.3)   # let the ADC settle before reading
-                    vals = read_guardian(*guardian)   # 8 physical readback channels
+                    vals = read_guardian(*guardian)   # N_GUARDIAN_CH physical readback channels
                     # Auto-detect which physical channel actually responded, rather
                     # than only checking the one we EXPECT: the channel(s) that
                     # jumped close to TEST_VAL. With an empty PIN_REMAP this reveals
                     # the true logical->physical landing for every pin whose target
-                    # is in physical 0-7 — no multimeter needed for those.
+                    # is within Guardian range — no multimeter needed for those.
                     hits = [ch for ch, v in enumerate(vals) if abs(v - TEST_VAL) < 0.5]
                     if len(hits) == 1:
                         found = hits[0]
@@ -379,8 +393,9 @@ def main():
                         msg += (f"   [Guardian: logical {i} -> physical ch {found} "
                                 f"({vals[found]:+.3f} V) — {tag}]")
                     elif not hits:
-                        msg += (f"   [Guardian: nothing near {TEST_VAL:g} V on physical 0-7 "
-                                f"— it lands on physical 8-31; read it on the multimeter]")
+                        msg += (f"   [Guardian: nothing near {TEST_VAL:g} V within Guardian range "
+                                f"({len(vals)} ch) — it lands beyond that or is dead; "
+                                f"read it on the multimeter]")
                     else:
                         msg += (f"   [Guardian: MULTIPLE channels responded {hits} "
                                 f"— possible short/crosstalk, investigate]")

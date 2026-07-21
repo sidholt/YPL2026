@@ -325,7 +325,12 @@ class MultiPinSelector(QPushButton):
 CUBE_IP = "172.28.2.4"
 MOKU_IP = "172.28.5.6"
 
-NUM_PINS = 8    # Guardian ADC readback bridge channel count (ao333_bridge.py) — unrelated to AO channel count
+NUM_PINS = 32   # Guardian ADC readback bridge channel count (ao333_bridge.py) — was
+                # 8 until 2026-07-21; bumped to cover all of Dev2's outputs (see
+                # ao333_bridge.py's docstring re: untested per-read timing at this
+                # size — drop back to 8 there and here if it proves too slow).
+                # Equal to MAX_PINS by coincidence for Dev2, but a separate
+                # concept (readback capability, not output channel count).
 MAX_PINS = 32   # widest channel count any single card exposes (Dev2 / AO-333)
 
 CARDS = {
@@ -1511,7 +1516,7 @@ class PinConfigView(QWidget):
             rb_lbl = QLabel("—")
             rb_lbl.setFixedWidth(90)
             rb_lbl.setStyleSheet(f"color: {C_BLUE}; font-size: 10px;")
-            rb_lbl.setToolTip("Guardian ADC readback (Dev2 only, first 8 channels)")
+            rb_lbl.setToolTip("Guardian ADC readback (Dev2 only, all 32 channels)")
             rb_lbl.setVisible(False)
 
             rl.addWidget(lbl); rl.addWidget(name_edit); rl.addWidget(sb)
@@ -2085,14 +2090,13 @@ class PinConfigView(QWidget):
             self._rec_plot_win.close()
             self._rec_plot_win = None
 
-        # Guardian readback — only for voltage card (Dev2 / AO-333), and only
-        # for whichever NUM_PINS logical pins actually land on physical
-        # channels 0-7: the ao333_bridge.py readback bridge only streams 8
-        # monitor channels even though Dev2 now exposes MAX_PINS=32 outputs,
-        # and PIN_REMAP means "logical pin i" isn't necessarily "physical
-        # channel i" — a pin remapped onto physical 8-31 has no hardware
-        # readback even if i < NUM_PINS, and conversely a pin remapped IN
-        # from beyond 31 would (there isn't one, but the check stays general).
+        # Guardian readback — only for the voltage card (Dev2 / AO-333). The
+        # ao333_bridge.py bridge now streams all 32 monitor channels (was 8
+        # until 2026-07-21 — see that file's docstring for the untested
+        # per-read timing tradeoff at this size), so every logical pin gets
+        # readback regardless of PIN_REMAP; the `< NUM_PINS` check stays here
+        # only in case NUM_PINS is ever dialed back down to cover fewer
+        # channels than a card's `remap_pin()` outputs can land on.
         is_voltage = cs.mode == "voltage"
         for i, lbl in enumerate(self._readback_lbls):
             lbl.setVisible(is_voltage and remap_pin(cs.dev, i) < NUM_PINS)
@@ -2119,7 +2123,7 @@ class PinConfigView(QWidget):
             QTimer.singleShot(0, self._guardian_worker.stop)
 
     def _on_guardian_readback(self, values: list):
-        # `values` is indexed by PHYSICAL Guardian ADC channel (0-7) — always
+        # `values` is indexed by PHYSICAL Guardian ADC channel (0-31) — always
         # go through remap_pin() to find which physical channel a given
         # logical pin actually landed on before indexing into it.
         self._guardian_values = values
