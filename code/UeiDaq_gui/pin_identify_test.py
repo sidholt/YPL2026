@@ -66,9 +66,11 @@ END_PIN   = 31             # last pin to test (inclusive) — full 32-ch card.
                            # every pin should auto-confirm; the multimeter is
                            # now only a fallback if Guardian is unreachable.
 
-# Cross-checks Dev2 pins against real Guardian ADC hardware feedback (see
-# ao333_bridge.py / gui.py's NUM_PINS comment). Set False to skip even for
-# Dev2, or if the bridge DLL isn't reachable from this machine.
+# Cross-checks Dev2 pins against real Guardian ADC hardware feedback via a
+# direct connection to PDNALib.dll (see N_GUARDIAN_CH below). Set False to
+# skip even for Dev2, or if that DLL isn't reachable from this machine.
+# Note: this DLL path is 32-bit only — run this script with .venv32's
+# python.exe for GUARDIAN_READBACK to actually load (see README.md).
 GUARDIAN_READBACK = True
 PDNA_DLL = r"C:\Program Files (x86)\UEI\PowerDNA\Shared\PDNALib.dll"
 
@@ -144,7 +146,7 @@ HOLD_ONLY = False
 
 def setup_guardian(cube_ip):
     """Opens a second, low-level connection for Guardian ADC readback —
-    Dev2 only, N_GUARDIAN_CH channels. Mirrors ao333_bridge.py."""
+    Dev2 only, N_GUARDIAN_CH channels."""
     dll = ctypes.WinDLL(PDNA_DLL)
     dll.DqInitDAQLib.restype  = ctypes.c_int
     dll.DqOpenIOM.restype     = ctypes.c_int

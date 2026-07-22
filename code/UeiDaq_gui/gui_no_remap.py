@@ -3,11 +3,11 @@ gui_no_remap.py — FALLBACK COPY of gui.py with the Dev2 pin remap disabled
 (PIN_REMAP forced empty, i.e. every logical pin drives its own-numbered
 physical channel). Run this instead of gui.py if the in-progress Dev2
 (AO-333) remap needs to be set aside. Everything else mirrors gui.py as of
-2026-07-21 — see that file for the up-to-date remap investigation.
+2026-07-22 — see that file for the up-to-date remap investigation.
 
 unified_lab_gui.py — YPL Lab Control
 One window, multiple tabs:
-  • DAQ Control    — UEI PowerDNA cards + Moku:Go + Guardian
+  • DAQ Control    — UEI PowerDNA cards + Moku:Go
   • ITLA Laser     — Emcore TTX ITLA controller
   • CONEX Motor    — Newport CONEX-CC / TRA12CC controller
   • HP-8168F Laser — HP/Agilent 8168F tunable laser source (GPIB)
@@ -24,9 +24,6 @@ import sys
 import math
 import time
 import threading
-import subprocess
-import socket
-import json
 import numpy as np
 
 from PyQt6.QtWidgets import (
@@ -331,7 +328,6 @@ class MultiPinSelector(QPushButton):
 CUBE_IP = "172.28.2.4"
 MOKU_IP = "172.28.5.6"
 
-NUM_PINS = 8    # Guardian ADC readback bridge channel count (ao333_bridge.py) — unrelated to AO channel count
 MAX_PINS = 32   # widest channel count any single card exposes (Dev2 / AO-333)
 
 CARDS = {
@@ -343,19 +339,73 @@ CARDS = {
         "channels": MAX_PINS},
 }
 
-# NO-REMAP FALLBACK COPY: this file is a mirror of gui.py with the Dev2 pin
-# remap disabled (PIN_REMAP forced empty / pure identity), kept as a
-# known-good rollback in case the in-progress remap work in gui.py needs to
-# be set aside. Every logical pin drives its own-numbered physical channel
-# here, exactly as it did before the Dev2 (AO-333) remap investigation
-# started. Update by re-copying gui.py over this file and re-applying this
-# edit — do not hand-maintain feature drift between the two.
+# Physical pin remap — maps "GUI/logical pin index" -> "actual physical
+# output channel index" for cards whose connector/cable doesn't wire in
+# straight sequential order. Keyed by CARDS[...]["dev"]. An empty/missing
+# entry means identity (no remap), which MUST stay the default until a
+# pin's real mapping has been directly confirmed with pin_identify_test.py
+# — do not guess entries here. An unconfirmed remap is more dangerous than
+# none at all: it would silently send commanded voltage to a physical pin
+# you don't think you're touching.
+#
+# ROOT CAUSE FOUND 2026-07-21: the DNx-AO-333's official pinout (dnx-ao-333.pdf)
+# wires its 62-pin cable connector in 3 physical rows of 21/21/20 pins, each
+# alternating Gnd/AOut. The ribbon cable added afterward and jumpered off its
+# far end had each of those 3 rows mirrored left-to-right (row assignment
+# unchanged, only the order WITHIN each row reversed). That single rule
+# reproduces every hardware measurement taken across both walks with zero
+# exceptions — the 18 pairs below plus 5 more (8, 20, 23, 26, 28 all
+# independently confirmed landing on Gnd exactly where predicted, including
+# the 2026-07-21 multimeter reading of raw ch 8's signature on native
+# connector pin 57 = Gnd) and all 5 remaining predicted-dead channels (5, 11,
+# 14, 17, 30) confirmed silent (0 V) on their predicted Gnd landings.
+#
+# Channels 1, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30 have NO reachable output
+# terminal under this wiring — channel 1 lands on the card's digital input
+# pin (DIn0, a logic-level line, NOT rated for analog swings — avoid driving
+# this pin at all until the cable is physically fixed), the rest land on Gnd.
+# No remap can route around a wire that doesn't reach an output pin; these
+# stay identity (unlisted) since that's the only choice that can't collide
+# with a working route. Fixing them requires re-terminating the physical
+# cable, not a software change.
+#
+# The lone remaining soft spot: 27->3 was directly observed in both directions
+# in the original raw walk (2026-07-20) and fits this rule exactly, but one
+# 2026-07-21 verification attempt failed to reproduce it. Included below on
+# the strength of the surrounding evidence; pin_identify_test.py is set up
+# to re-isolate just this one pair next.
+#
+# NO-REMAP FALLBACK COPY: PIN_REMAP forced empty here (see module docstring)
+# — every logical pin drives its own-numbered physical channel, regardless
+# of gui.py's in-progress Dev2 remap above.
 PIN_REMAP = {}
 
 
 def remap_pin(dev: str, logical_pin: int) -> int:
     """GUI pin index -> actual physical channel index to write/read for `dev`."""
     return PIN_REMAP.get(dev, {}).get(logical_pin, logical_pin)
+
+
+# Pins with NO reachable output terminal at all (see PIN_REMAP comment above)
+# — drives the "Pin NN" label color-coding in the DAQ Control pin list
+# (PinConfigView.load_card): green for verified-working pins, red for these.
+# Only devices with a completed investigation appear here; other cards get
+# no color coding since they haven't been walked.
+DEAD_PINS = {
+    "Dev2": {
+        1:  "lands on the card's digital input pin (DIn0), not analog ground — avoid driving",
+        5:  "lands on Gnd — no reachable output on this cable",
+        8:  "lands on Gnd — no reachable output on this cable",
+        11: "lands on Gnd — no reachable output on this cable",
+        14: "lands on Gnd — no reachable output on this cable",
+        17: "lands on Gnd — no reachable output on this cable",
+        20: "lands on Gnd — no reachable output on this cable",
+        23: "lands on Gnd — no reachable output on this cable",
+        26: "lands on Gnd — no reachable output on this cable",
+        28: "lands on Gnd — no reachable output on this cable",
+        30: "lands on Gnd — no reachable output on this cable",
+    },
+}
 
 
 AO_CHANNEL_NAMES_FILE = os.path.join(os.path.dirname(__file__), "ao_channel_names.json")
@@ -461,13 +511,6 @@ MOKU_PLOT_WINDOW_S     = 10.0
 MOKU_POLL_MS           = 100
 MOKU_SHUNT_OHMS        = 100.0
 
-AO333_GUARDIAN_POLL_MS = 50
-
-BRIDGE_PORT       = 57333
-BRIDGE_PYTHON     = r".venv32\Scripts\python.exe"
-BRIDGE_SCRIPT     = r"code\UeiDaq_gui\ao333_bridge.py"
-
-READBACK_DECIMALS      = 6
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 COREDAQ_PLOT_WINDOW_S  = 30.0
@@ -565,106 +608,6 @@ class MokuWorker(QObject):
             self.lost.emit()
             return
         self.sample_ready.emit(sample[0], sample[1])
-
-
-class AO333ReadbackWorker(QObject):
-    """
-    Runs on a background QThread.
-    Connects to ao333_bridge.py which streams JSON lines as fast as the
-    Guardian ADC allows. Buffers the latest reading and emits readback_ready
-    at AO333_GUARDIAN_POLL_MS for GUI updates.
-    """
-    readback_ready = pyqtSignal(list)
-    error          = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._sock       = None
-        self._running    = False
-        self._timer      = None
-        self._latest     = [0.0] * NUM_PINS
-        self._buf        = ""
-        self._stream_thread = None
-
-    def start(self):
-        self.stop()
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(2.0)
-            self._sock.connect(("127.0.0.1", BRIDGE_PORT))
-            self._sock.settimeout(0.5)
-            self._buf    = ""
-            self._latest = [0.0] * NUM_PINS
-            print("[AO333] Connected to bridge — streaming mode")
-        except Exception as e:
-            msg = f"Cannot connect to bridge on port {BRIDGE_PORT}: {e}"
-            print(f"[AO333] {msg}")
-            self.error.emit(msg)
-            self._sock = None
-            return
-
-        self._running = True
-
-        import threading
-        self._stream_thread = threading.Thread(
-            target=self._stream_loop, daemon=True)
-        self._stream_thread.start()
-
-        self._timer = QTimer()
-        self._timer.setInterval(AO333_GUARDIAN_POLL_MS)
-        self._timer.timeout.connect(self._emit_latest)
-        self._timer.start()
-
-    def _stream_loop(self):
-        while self._running and self._sock:
-            try:
-                chunk = self._sock.recv(4096).decode("utf-8")
-                if not chunk:
-                    break
-                self._buf += chunk
-                while "\n" in self._buf:
-                    line, self._buf = self._buf.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("ERROR"):
-                        print(f"[AO333] Bridge error: {line}")
-                        continue
-                    try:
-                        self._latest = json.loads(line)
-                    except Exception:
-                        pass
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self._running:
-                    print(f"[AO333] Stream error: {e}")
-                break
-        self._running = False
-
-    def _emit_latest(self):
-        if self._running:
-            self.readback_ready.emit(list(self._latest))
-        else:
-            self.stop()
-            self.error.emit("Bridge stream ended")
-
-    def stop(self):
-        self._running = False
-        if self._timer:
-            self._timer.stop()
-            self._timer = None
-        try:
-            if self._sock:
-                self._sock.sendall(b"QUIT\n")
-        except Exception:
-            pass
-        try:
-            if self._sock:
-                self._sock.close()
-        except Exception:
-            pass
-        self._sock = None
 
 
 # ── Moku live plot widget ──────────────────────────────────────────────────────
@@ -848,7 +791,7 @@ class CardSession:
         self.writer     = None
         self.mode       = CARDS[card_index]["mode"]
         self.dev        = CARDS[card_index]["dev"]
-        self.num_pins   = CARDS[card_index].get("channels", NUM_PINS)
+        self.num_pins   = CARDS[card_index].get("channels", MAX_PINS)
         self.values     = [0.0] * self.num_pins
         self._targets   = [0.0] * self.num_pins
         min_val, max_val, unit, _, _ = MODE_RANGES[self.mode]
@@ -927,8 +870,7 @@ class CardSession:
             # left every other position holding its stale same-index copy —
             # correct for a clean 0<->31 swap, but silently wrong the moment
             # the map is anything else (which is exactly the situation we're
-            # now in). This is the same remap_pin() lookup the Guardian
-            # readback path uses, so writes and readbacks stay in agreement.
+            # now in).
             physical = list(values)
             for logical_pin in range(len(values)):
                 phys = remap_pin(self.dev, logical_pin)
@@ -1204,7 +1146,7 @@ class RecordingPlotWindow(QWidget):
             self._ts_curve.setPen(pg.mkPen(color, width=2))
             self._ts_curve.setData(ts, ys)
 
-            src = "Guardian" if mode == "voltage" else "Moku"
+            src = "Moku"
             xs_vi = [float(np.mean(r['daq'])) for r in records]
             self._vi_plot.setLabel('bottom',
                 'DAQ Output (mA)' if mode == 'current' else 'DAQ Output (V)')
@@ -1227,7 +1169,7 @@ class LiveComparisonPlot(QWidget):
     Pin selector lets you choose which pin's commanded value to compare.
     """
 
-    def __init__(self, card_label: str, mode: str, num_pins: int = NUM_PINS, parent=None):
+    def __init__(self, card_label: str, mode: str, num_pins: int = MAX_PINS, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Output vs Readback — {card_label}")
         self.resize(620, 640)
@@ -1388,10 +1330,10 @@ class PinConfigView(QWidget):
         outer_pin_lay.setContentsMargins(4, 4, 4, 4)
 
         self.spinboxes, self.sliders = [], []
-        self._readback_lbls = []
         self._name_edits  = []
         self._pin_rows    = []
-        self._active_n    = NUM_PINS
+        self._pin_num_lbls = []
+        self._active_n    = MAX_PINS
         self._channel_names = self._load_channel_names()
 
         self._group_seps  = []   # [(first_pin_idx_in_group, separator_widget), ...]
@@ -1404,7 +1346,7 @@ class PinConfigView(QWidget):
             col_lay.setContentsMargins(0, 0, 0, 0)
 
             col_row = QHBoxLayout()
-            for text, width in [("Pin", 50), ("Name", 90), ("Value", 120), ("Slider", -1), ("", 60), ("Readback", 90)]:
+            for text, width in [("Pin", 50), ("Name", 90), ("Value", 120), ("Slider", -1), ("", 60)]:
                 lbl = QLabel(text)
                 if width > 0: lbl.setFixedWidth(width)
                 col_row.addWidget(lbl)
@@ -1455,25 +1397,18 @@ class PinConfigView(QWidget):
             sb.valueChanged.connect(lambda val, idx=i: self._sb_changed(idx, val))
             sl.valueChanged.connect(lambda val, idx=i: self._sl_changed(idx, val))
 
-            rb_lbl = QLabel("—")
-            rb_lbl.setFixedWidth(90)
-            rb_lbl.setStyleSheet(f"color: {C_BLUE}; font-size: 10px;")
-            rb_lbl.setToolTip("Guardian ADC readback (Dev2 only, first 8 channels)")
-            rb_lbl.setVisible(False)
-
             rl.addWidget(lbl); rl.addWidget(name_edit); rl.addWidget(sb)
             rl.addWidget(sl, stretch=1); rl.addWidget(set_btn)
-            rl.addWidget(rb_lbl)
             self.spinboxes.append(sb)
             self.sliders.append(sl)
-            self._readback_lbls.append(rb_lbl)
             self._name_edits.append(name_edit)
             self._pin_rows.append(row_widget)
+            self._pin_num_lbls.append(lbl)
             col_lay.addWidget(row_widget)
 
         for _, col_lay in self._pin_columns:
             col_lay.addStretch()
-        self._set_active_channels(NUM_PINS)
+        self._set_active_channels(MAX_PINS)
         root.addWidget(pin_container)
 
         sep3 = QFrame()
@@ -1519,7 +1454,7 @@ class PinConfigView(QWidget):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Pins:"))
         self.sweep_pin_combo = MultiPinSelector("No pins selected")
-        for i in range(NUM_PINS):
+        for i in range(MAX_PINS):
             self.sweep_pin_combo.addCheckableItem(f"Pin {i:02d}", i)
         self.sweep_pin_combo.setFixedWidth(140)
         self.sweep_pin_combo.setToolTip(
@@ -1643,7 +1578,7 @@ class PinConfigView(QWidget):
         wrow1 = QHBoxLayout()
         wrow1.addWidget(QLabel("Pins:"))
         self.wave_pin_combo = MultiPinSelector("No pins selected")
-        for i in range(NUM_PINS):
+        for i in range(MAX_PINS):
             self.wave_pin_combo.addCheckableItem(f"Pin {i:02d}", i)
         self.wave_pin_combo.setFixedWidth(140)
         self.wave_pin_combo.setToolTip(
@@ -1747,20 +1682,6 @@ class PinConfigView(QWidget):
         rec_row2.addStretch()
         rg.addLayout(rec_row2)
 
-        rec_row3 = QHBoxLayout()
-        rec_row3.addWidget(QLabel("Readback source:"))
-        self._rec_src_combo = QComboBox()
-        self._rec_src_combo.addItem("Moku",      "moku")
-        self._rec_src_combo.addItem("Guardian",  "guardian")
-        self._rec_src_combo.setFixedWidth(110)
-        self._rec_src_lbl = QLabel("Readback source:")
-        rec_row3.addWidget(self._rec_src_combo)
-        rec_row3.addStretch()
-        self._rec_src_row_widget = QWidget()
-        self._rec_src_row_widget.setLayout(rec_row3)
-        self._rec_src_row_widget.setVisible(False)   # shown only for Dev2
-        rg.addWidget(self._rec_src_row_widget)
-
         root.addWidget(rec_group)
 
         # recording state
@@ -1776,15 +1697,7 @@ class PinConfigView(QWidget):
         self._cmp_btn.setFixedWidth(200)
         self._cmp_btn.clicked.connect(self._open_comparison_plot)
 
-        self._cmp_src_combo = QComboBox()
-        self._cmp_src_combo.setFixedWidth(110)
-        self._cmp_src_label = QLabel("Source:")
-        self._cmp_src_label.setVisible(True)
-
         cmp_row.addWidget(self._cmp_btn)
-        cmp_row.addSpacing(8)
-        cmp_row.addWidget(self._cmp_src_label)
-        cmp_row.addWidget(self._cmp_src_combo)
         cmp_row.addStretch()
 
         sep_cmp = QFrame()
@@ -1795,17 +1708,6 @@ class PinConfigView(QWidget):
 
         self._cmp_win: LiveComparisonPlot = None
         self._last_moku_v = 0.0
-        self._last_guardian_v = 0.0
-
-        # AO-333 Guardian readback worker (Dev2 only)
-        self._guardian_thread = QThread()
-        self._guardian_worker = AO333ReadbackWorker()
-        self._guardian_worker.moveToThread(self._guardian_thread)
-        self._guardian_thread.start()
-        self._guardian_worker.readback_ready.connect(self._on_guardian_readback)
-        self._guardian_worker.error.connect(
-            lambda msg: print(f"[AO333] {msg}"))
-        self._guardian_values: list = [0.0] * NUM_PINS
 
         # ── batch plot repaint timer ──
         self._plot_dirty = False
@@ -1840,14 +1742,10 @@ class PinConfigView(QWidget):
         label = CARDS[cs.card_index]["label"]
         self._cmp_win = LiveComparisonPlot(label, cs.mode, cs.num_pins)
 
-        src = self._cmp_src_combo.currentData()
-        src_names = {"moku": "Moku Ch1", "guardian": "Guardian ADC"}
-        src_name = src_names.get(src, src)
         if cs.mode == "current":
-            unit_note = "→ mA via shunt" if src == "moku" else "→ mA via A1"
-            self._cmp_win.set_source_label(f"Measured = {src_name} {unit_note}")
+            self._cmp_win.set_source_label("Measured = Moku Ch1 → mA via shunt")
         else:
-            self._cmp_win.set_source_label(f"Measured = {src_name}")
+            self._cmp_win.set_source_label("Measured = Moku Ch1")
 
         # spawn beside the main window instead of on top of it
         mw = self.window()
@@ -1962,6 +1860,24 @@ class PinConfigView(QWidget):
         self.card_title.setText(CARDS[cs.card_index]["label"].split("  —  ")[0])
         self.badge.setText(cs.mode.upper())
         self._set_active_channels(cs.num_pins)
+
+        # Color-code the "Pin NN" labels for cards with a completed remap
+        # investigation (see DEAD_PINS): green = verified working, red = no
+        # reachable output terminal on this cable, don't bother wiring it up.
+        # Cards without an entry (not walked) get no coloring, reset to
+        # default, so stale colors from a previously-loaded card don't linger
+        # — these 32 row widgets are shared/reused across every card.
+        dead_info = DEAD_PINS.get(cs.dev)
+        for i, lbl in enumerate(self._pin_num_lbls):
+            if dead_info is None:
+                lbl.setStyleSheet("")
+                lbl.setToolTip("")
+            elif i in dead_info:
+                lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+                lbl.setToolTip(f"No usable output on this cable — {dead_info[i]}")
+            else:
+                lbl.setStyleSheet(f"color: {C_GREEN};")
+                lbl.setToolTip("Verified working (2026-07-21 pin remap investigation)")
         _, _, _, s_min, s_max = MODE_RANGES[cs.mode]
         self._syncing = True
         for i in range(cs.num_pins):
@@ -2013,63 +1929,10 @@ class PinConfigView(QWidget):
             self._rec_plot_win.close()
             self._rec_plot_win = None
 
-        # Guardian readback — only for voltage card (Dev2 / AO-333), and only
-        # for whichever NUM_PINS logical pins actually land on physical
-        # channels 0-7: the ao333_bridge.py readback bridge only streams 8
-        # monitor channels even though Dev2 now exposes MAX_PINS=32 outputs,
-        # and PIN_REMAP means "logical pin i" isn't necessarily "physical
-        # channel i" — a pin remapped onto physical 8-31 has no hardware
-        # readback even if i < NUM_PINS, and conversely a pin remapped IN
-        # from beyond 31 would (there isn't one, but the check stays general).
-        is_voltage = cs.mode == "voltage"
-        for i, lbl in enumerate(self._readback_lbls):
-            lbl.setVisible(is_voltage and remap_pin(cs.dev, i) < NUM_PINS)
-            lbl.setText("—")
-        self._guardian_values = [0.0] * NUM_PINS
-        self._rec_src_row_widget.setVisible(is_voltage)
-
-        self._cmp_src_combo.blockSignals(True)
-        self._cmp_src_combo.clear()
-        self._cmp_src_combo.addItem("Moku",      "moku")
-        if is_voltage:
-            self._cmp_src_combo.addItem("Guardian",  "guardian")
-        self._cmp_src_combo.blockSignals(False)
-
         if self._cmp_win and self._cmp_win.isVisible():
             self._cmp_win.close()
         self._cmp_win = None
         self._last_moku_v = 0.0
-        self._last_guardian_v = 0.0
-
-        if is_voltage:
-            QTimer.singleShot(0, self._guardian_worker.start)
-        else:
-            QTimer.singleShot(0, self._guardian_worker.stop)
-
-    def _on_guardian_readback(self, values: list):
-        # `values` is indexed by PHYSICAL Guardian ADC channel (0-7) — always
-        # go through remap_pin() to find which physical channel a given
-        # logical pin actually landed on before indexing into it.
-        self._guardian_values = values
-        dev = self.card_session.dev if self.card_session else None
-        self._last_guardian_v = float(np.mean(values[:NUM_PINS]))
-        for i, lbl in enumerate(self._readback_lbls):
-            phys = remap_pin(dev, i) if dev else i
-            if phys < len(values):
-                lbl.setText(f"{values[phys]:+.{READBACK_DECIMALS}f}V")
-
-        if (self._cmp_src_combo.currentData() == "guardian"
-                and self._cmp_win and self._cmp_win.isVisible()
-                and self.card_session):
-            pin  = self._cmp_win.get_pin()
-            phys = remap_pin(self.card_session.dev, pin)
-            v    = values[phys] if phys < len(values) else 0.0
-            self._push_comparison(v, dt=AO333_GUARDIAN_POLL_MS / 1000.0)
-
-        if (self._recording and self.card_session
-                and self._rec_src_combo.currentData() == "guardian"):
-            self._append_record(self._last_guardian_v,
-                                dt=AO333_GUARDIAN_POLL_MS / 1000.0)
 
     def push_moku_sample(self, ch1_v: float, ch2_v: float):
         """Receives every Moku poll tick."""
@@ -2081,15 +1944,13 @@ class PinConfigView(QWidget):
 
         if self.card_session.mode == "current":
             meas_ma = (ch1_v / MOKU_SHUNT_OHMS) * 1000.0
-            if self._cmp_src_combo.currentData() == "moku":
-                self._push_comparison(meas_ma, dt=dt)
+            self._push_comparison(meas_ma, dt=dt)
             if self._recording:
                 self._append_record(ch1_v, dt)
 
         elif self.card_session.mode == "voltage":
-            if self._cmp_src_combo.currentData() == "moku":
-                self._push_comparison(ch1_v, dt=dt)
-            if self._recording and self._rec_src_combo.currentData() == "moku":
+            self._push_comparison(ch1_v, dt=dt)
+            if self._recording:
                 self._append_record(ch1_v, dt)
 
     def _toggle_recording(self):
@@ -2133,15 +1994,8 @@ class PinConfigView(QWidget):
         unit  = self.card_session.unit
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        if mode == "current":
-            src          = "moku"
-            readback_col = "moku_mA"
-        else:
-            src = self._rec_src_combo.currentData()
-            readback_col = {
-                "moku":      "moku_V",
-                "guardian":  "guardian_V",
-            }.get(src, "readback_V")
+        src          = "moku"
+        readback_col = "moku_mA" if mode == "current" else "moku_V"
 
         fname    = os.path.join(data_dir, f"{dev}_{mode}_{src}_{stamp}.csv")
         pin_hdrs = [f"pin{i:02d}_{unit}" for i in range(self.card_session.num_pins)]
@@ -2517,26 +2371,6 @@ class DAQPanel(QWidget):
         self.stacked.addWidget(main_view)
         self.stacked.addWidget(pin_scroll)
 
-        # auto-launch the 32-bit Guardian bridge process
-        self._bridge_proc = None
-        self._launch_bridge()
-
-    def _launch_bridge(self):
-        """Start ao333_bridge.py as a subprocess using .venv32."""
-        if not (os.path.exists(BRIDGE_PYTHON) and os.path.exists(BRIDGE_SCRIPT)):
-            print(f"[Bridge] Not launched — {BRIDGE_PYTHON} or {BRIDGE_SCRIPT} not found")
-            return
-        try:
-            self._bridge_proc = subprocess.Popen(
-                [BRIDGE_PYTHON, BRIDGE_SCRIPT],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NEW_CONSOLE)
-            print(f"[Bridge] Launched PID {self._bridge_proc.pid}")
-            QTimer.singleShot(2000, lambda: print("[Bridge] Ready"))
-        except Exception as e:
-            print(f"[Bridge] Failed to launch: {e}")
-
     def _status(self, msg: str):
         w = self.window()
         if hasattr(w, "status_bar"):
@@ -2624,12 +2458,6 @@ class DAQPanel(QWidget):
             self.pin_view._rec_plot_win.close()
         if self.pin_view._cmp_win:
             self.pin_view._cmp_win.close()
-        self.pin_view._guardian_worker.stop()
-        self.pin_view._guardian_thread.quit()
-        self.pin_view._guardian_thread.wait(2000)
-        if self._bridge_proc and self._bridge_proc.poll() is None:
-            self._bridge_proc.terminate()
-            print("[Bridge] Terminated")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5826,8 +5654,9 @@ class SantecPanel(QWidget):
 
         self._build_ui()
 
-        # auto-connect on launch using the saved GPIB/COM settings
-        self._do_connect()
+        # Deliberately no auto-connect here — connect manually via the
+        # "Connect to Laser" button. (Used to auto-connect on launch using
+        # the saved GPIB/COM settings; removed 2026-07-21 at user request.)
 
     # ── UI construction ───────────────────────────────────────────────────────
 

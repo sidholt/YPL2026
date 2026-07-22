@@ -26,17 +26,15 @@ or its instrument isn't connected.
 - Software waveform generator — sine/cosine on any subset of pins at once
   (all playing the same waveform together), with adjustable frequency,
   amplitude, offset, and update rate
-- Data recording (start/stop) with live commanded-vs-measured and V-I plots,
-  saved to CSV
-- Live Guardian ADC readback for the AO-333 card (optional — needs the
-  32-bit bridge, see below)
+- Data recording (start/stop) with live commanded-vs-measured and V-I plots
+  (measured via the Moku:Go oscilloscope), saved to CSV
 - Embedded Moku:Go oscilloscope panel
 - Combined/global recording across multiple sources into one CSV
 - Physical pin remap (`PIN_REMAP` in `gui.py`) for AO-333 cards whose
   connector/cabling doesn't wire in straight sequential order — every write
   path (Set, Write All, Set All To, ramp, sweep, wave) goes through the same
-  correction, and readback follows it too. See `pin_identify_test.py` (below)
-  to work out a card's actual mapping.
+  correction. See `pin_identify_test.py` (below) to work out a card's actual
+  mapping.
 
 **CoreDAQ Power Meter**
 - Connects over USB-serial (auto-detect or manual COM port)
@@ -93,16 +91,16 @@ or its instrument isn't connected.
   - `gui_no_remap.py` — fallback mirror of `gui.py` with `PIN_REMAP` forced
     empty (pure identity mapping). Run this instead of `gui.py` if the Dev2
     (AO-333) remap in progress needs to be set aside; otherwise identical.
-  - `ao333_bridge.py` — optional 32-bit helper process that streams Guardian
-    ADC readback for the AO-333 card; `gui.py` auto-launches it if a 32-bit
-    venv is set up (see [Optional: AO-333 Guardian ADC bridge](#optional-ao-333-guardian-adc-bridge)).
   - `pin_identify_test.py` — standalone script (not launched by the GUI) that
     walks an AO-333 card's pins one at a time so you can work out its real
-    `PIN_REMAP`. With Guardian ADC readback it auto-detects which physical
-    channel each logical pin lands on (all 32 channels as of 2026-07-21); the
-    multimeter is now only a fallback if the bridge/DLL is unreachable.
-    Close the main GUI (or disconnect that card) before running it — two
-    processes on the same channels will fight each other.
+    `PIN_REMAP`. Optionally connects directly to the Guardian ADC (needs the
+    32-bit environment, see [Optional: AO-333 Guardian ADC check](#optional-ao-333-guardian-adc-check))
+    to auto-detect which physical channel each logical pin lands on (all 32
+    channels as of 2026-07-21); the multimeter is a fallback if that DLL is
+    unreachable. Close the main GUI (or disconnect that card) before running
+    it — two processes on the same channels will fight each other. (The GUI
+    itself no longer has any live Guardian ADC readback — removed
+    2026-07-22 — this script's own connection is independent of that.)
   - `hardware/` — one module per instrument (`coredaq.py`, `itla.py`,
     `laser_hp_8168F.py`, `laser_tsl_550.py`, plus a shared `visa_module/` for
     GPIB-over-Prologix support).
@@ -134,8 +132,8 @@ or its instrument isn't connected.
   (`C:\Program Files (x86)\UEI\Framework\...` and `...\PowerDNA\...`). This
   is UEI's own Windows installer (comes with the DAQ hardware / from UEI
   support) — it provides both the `UeiDaq` Python bindings `uv sync` links
-  against and `PDNALib.dll`, which the optional Guardian ADC bridge needs.
-  Not something `uv`/pip can install for you.
+  against and `PDNALib.dll`, which `pin_identify_test.py`'s optional Guardian
+  ADC check needs. Not something `uv`/pip can install for you.
 - *(Optional)* [NI-DAQmx runtime](https://www.ni.com/en/support/downloads/drivers/download.ni-daqmx.html) —
   only needed for the Santec TSL-550 tab to actually talk to hardware (the
   `nidaqmx` Python package itself installs fine without it; you'll only hit
@@ -194,20 +192,14 @@ library failed to import show a message explaining what's missing instead of
 a blank/crashed tab; if you see one after `uv sync` succeeded, something in
 step 2 or 3 didn't take (see [Troubleshooting](#troubleshooting)).
 
-### Optional: AO-333 Guardian ADC bridge
+### Optional: AO-333 Guardian ADC check
 
-The DAQ Control tab's live Guardian ADC readback for the AO-333 card
-(Dev2) needs a **separate 32-bit** Python environment — the UEI wheel for
-that particular DLL path is 32-bit only. This is optional: without it, the
-GUI still runs and controls outputs normally, it just won't show live
-readback for that card.
-
-As of 2026-07-21 the bridge requests all 32 channels (previously just the
-first 8) — `ao333_bridge.py`'s `NUM_CH` constant. Per-read timing at this
-size hasn't been characterized on real hardware yet; the bridge logs its
-sustained reads/sec to the console every couple seconds so you can judge
-whether it's keeping up. Drop `NUM_CH` back to 8 there (and `NUM_PINS` in
-`gui.py`) if it proves too slow for live feedback.
+`pin_identify_test.py`'s optional Guardian ADC cross-check (auto-detects
+which physical channel a driven pin actually lands on, instead of needing a
+multimeter for every pin) needs a **separate 32-bit** Python environment —
+the UEI wheel for that particular DLL path is 32-bit only. This is optional:
+without it, the script still drives pins for real, you just read the result
+on a multimeter instead of getting it auto-confirmed.
 
 ```powershell
 uv venv --python cpython-3.12.13-windows-x86-none .venv32
@@ -215,8 +207,15 @@ uv pip install --python .venv32\Scripts\python.exe numpy==1.26.4 pywin32 `
   "C:\Program Files (x86)\UEI\Framework\Python\UeiDaq_np1-5.2.0-cp312-abi3-win32.whl"
 ```
 
-`gui.py` looks for `.venv32\Scripts\python.exe` at startup and auto-launches
-`ao333_bridge.py` as a subprocess if it's there — nothing else to configure.
+Run `pin_identify_test.py` with `.venv32\Scripts\python.exe` for the
+Guardian check to actually load; run it with your normal environment and
+`GUARDIAN_READBACK` just logs "unavailable" and falls back to the
+multimeter for every pin.
+
+(2026-07-22: the GUI's own live Guardian ADC readback — and the
+`ao333_bridge.py` helper process it used to auto-launch — was removed
+entirely at user request. This section now only concerns
+`pin_identify_test.py`'s independent, on-demand check.)
 
 ## Usage
 
