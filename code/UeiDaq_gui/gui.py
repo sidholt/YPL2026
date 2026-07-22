@@ -15,6 +15,7 @@ import os
 os.environ["MOKU_CLI_PATH"] = r"C:\Program Files\Liquid Instruments\Moku CLI\mokucli.exe"
 
 import sys
+import json
 import math
 import time
 import threading
