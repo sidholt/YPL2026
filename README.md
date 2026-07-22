@@ -230,9 +230,10 @@ uv run code\UeiDaq_gui\gui.py
 This opens one window sized to use most of your screen, with a tab per
 instrument (see [Features](#features) above). A few things worth knowing:
 
-- Tabs try to auto-connect on launch using whatever COM port/GPIB
+- Most tabs try to auto-connect on launch using whatever COM port/GPIB
   address/wavelength was last used — nothing to re-enter for a setup you've
-  already run before.
+  already run before. Santec Laser is the exception (as of 2026-07-21): it
+  never auto-connects, use its "Connect to Laser" button.
 - The "⬡ Pop out tab" button (top-right corner of the tab bar) detaches the
   current tab into its own window — useful for watching two instruments side
   by side. A detached window has its own control to reattach it.

@@ -5902,8 +5902,9 @@ class SantecPanel(QWidget):
 
         self._build_ui()
 
-        # auto-connect on launch using the saved GPIB/COM settings
-        self._do_connect()
+        # Deliberately no auto-connect here — connect manually via the
+        # "Connect to Laser" button. (Used to auto-connect on launch using
+        # the saved GPIB/COM settings; removed 2026-07-21 at user request.)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
