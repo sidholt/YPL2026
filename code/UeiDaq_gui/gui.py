@@ -17,6 +17,7 @@ os.environ["MOKU_CLI_PATH"] = r"C:\Program Files\Liquid Instruments\Moku CLI\mok
 import sys
 import json
 import math
+import signal
 import time
 import threading
 import numpy as np
@@ -25,7 +26,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QScrollArea, QFrame, QSizePolicy,
     QDoubleSpinBox, QSlider, QStackedWidget, QStatusBar, QGroupBox,
-    QSpinBox, QComboBox, QLineEdit, QCheckBox, QTabWidget, QTextEdit,
+    QSpinBox, QComboBox, QLineEdit, QCheckBox, QTabWidget, QTabBar, QTextEdit,
     QMessageBox, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QObject, QEventLoop, QEvent
@@ -1870,13 +1871,10 @@ class PinConfigView(QWidget):
         for i, lbl in enumerate(self._pin_num_lbls):
             if dead_info is None:
                 lbl.setStyleSheet("")
-                lbl.setToolTip("")
             elif i in dead_info:
                 lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
-                lbl.setToolTip(f"No usable output on this cable — {dead_info[i]}")
             else:
                 lbl.setStyleSheet(f"color: {C_GREEN};")
-                lbl.setToolTip("Verified working (2026-07-21 pin remap investigation)")
         _, _, _, s_min, s_max = MODE_RANGES[cs.mode]
         self._syncing = True
         for i in range(cs.num_pins):
@@ -2316,12 +2314,26 @@ class PinConfigView(QWidget):
 # ── DAQ panel (former DAQMainWindow, now a tab) ────────────────────────────────
 
 class DAQPanel(QWidget):
+    # Marshal card-connect completion back to the GUI thread. A plain
+    # QTimer.singleShot(0, ...) called from inside the raw connect thread
+    # below doesn't work for this — that thread never runs a Qt event loop
+    # (its run() is overridden to just call do_connect() and return), and a
+    # singleShot timer needs an event loop on the thread that created it to
+    # ever fire. A signal/slot connection only needs an event loop on the
+    # *receiving* end (the GUI thread, always running), so it's delivered
+    # reliably regardless of what the emitting thread is doing.
+    _card_connect_done  = pyqtSignal(int, object)   # idx, on_connected callback (or None)
+    _card_connect_error = pyqtSignal(int, str)       # idx, error message
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self.card_sessions = {
             i: CardSession(i) for i, info in CARDS.items() if info["available"]
         }
+
+        self._card_connect_done.connect(self._card_connected)
+        self._card_connect_error.connect(self._on_card_connect_error)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -2404,11 +2416,10 @@ class DAQPanel(QWidget):
         def do_connect():
             try:
                 cs.connect()
-                QTimer.singleShot(0, lambda: self._card_connected(idx, on_connected))
+                self._card_connect_done.emit(idx, on_connected)
             except Exception as e:
                 print(f"[DAQ] FAILED to connect — {CARDS[idx]['label']}: {e}")
-                QTimer.singleShot(0, lambda: self._status(
-                    f"Connection error: {e}"))
+                self._card_connect_error.emit(idx, str(e))
 
         t = QThread(self)
         self._connect_threads = getattr(self, '_connect_threads', [])
@@ -2427,6 +2438,9 @@ class DAQPanel(QWidget):
         self.daq_box.refresh()
         if on_connected:
             on_connected()
+
+    def _on_card_connect_error(self, idx: int, msg: str):
+        self._status(f"Connection error: {msg}")
 
     def _disconnect_card(self, idx: int):
         cs = self.card_sessions[idx]
@@ -2813,6 +2827,13 @@ class LaserWorker(QThread):
                 seen.add(ch)
                 pts.append(ch)
 
+        if step_ghz < itla_grid and len(pts) < len(targets_ghz):
+            self.status_update.emit(
+                f"Requested step ({step_ghz:.1f} GHz) is finer than the ITLA's "
+                f"{itla_grid:.0f} GHz native grid — points collapse to every "
+                f"{itla_grid:.0f} GHz channel ({len(pts)} distinct channels, "
+                f"not {len(targets_ghz)})", "warn")
+
         self.status_update.emit(
             f"Sweep: {len(pts)} channels, {dwell_s:.1f}s dwell, "
             f"{step_ghz:.1f} GHz step", "info")
@@ -2845,12 +2866,19 @@ class LaserWorker(QThread):
             self.state_changed.emit("locking")
             self.itla.write(REG["CHANNEL"], ch)
 
+            locked = False
             t0 = time.time()
             while time.time() - t0 < 15:
                 nop_status, _ = self.itla.read(REG["NOP"], verbose=False)
                 if nop_status == 0:
+                    locked = True
                     break
                 time.sleep(0.2)
+
+            if not locked:
+                self.status_update.emit(
+                    f"[{idx+1}/{len(pts)}] ch {ch} — did not confirm lock within "
+                    f"15s, reading below may be stale/inaccurate", "warn")
 
             elapsed = time.time() - t0
             if elapsed < dwell_s:
@@ -6731,11 +6759,20 @@ class CoreDAQPanel(QWidget):
                               # thousand samples/channel, and re-rendering all of them
                               # 30x/sec was enough GUI-thread work to make the tab feel
                               # frozen even though nothing was actually stuck
+    AUTOGAIN_INTERVAL_MS = 60_000   # periodic re-autogain while connected + linear frontend
+    SATURATION_MV = 3000.0   # same upper bound do_autogain() itself targets — a channel
+                              # reading above this is already "too hot," on its way to
+                              # railing/flatlining at the ADC's ~5000 mV full scale
+    SATURATION_COOLDOWN_S = 2.0   # min gap between reactive auto-triggers, so a stale
+                                   # high reading right after a gain change (before the
+                                   # new gain's settled) can't immediately re-trigger
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._connected     = False
-        self._frontend_type = None
+        self._connected      = False
+        self._frontend_type  = None
+        self._external_pause = False   # True while Fast Sweep owns the serial link directly
+        self._last_reactive_autogain_t = 0.0
 
         if not HAS_SERIAL or not HAS_COREDAQ:
             lay = QVBoxLayout(self)
@@ -6783,6 +6820,14 @@ class CoreDAQPanel(QWidget):
         self._display_timer = QTimer()
         self._display_timer.setInterval(self.DISPLAY_MS)
         self._display_timer.timeout.connect(self._update_live_plot)
+
+        # Periodic re-autogain — always running; each tick is a no-op unless
+        # connected, on a linear frontend, idle (not already autogaining),
+        # and not paused for a Fast Sweep's exclusive serial access.
+        self._autogain_timer = QTimer()
+        self._autogain_timer.setInterval(self.AUTOGAIN_INTERVAL_MS)
+        self._autogain_timer.timeout.connect(self._auto_autogain_tick)
+        self._autogain_timer.start()
 
         self._build_ui()
 
@@ -7033,6 +7078,11 @@ class CoreDAQPanel(QWidget):
         self._autogain_btn.setText("Autogain…")
         self._sig_autogain.emit()
 
+    def _auto_autogain_tick(self):
+        if (self._connected and self._frontend_type == CoreDAQ.FRONTEND_LINEAR
+                and self._autogain_btn.isEnabled() and not self._external_pause):
+            self._do_autogain()
+
     def _on_autogain_done(self, gains: list):
         self._autogain_btn.setText("Autogain")
         self._autogain_btn.setEnabled(self._frontend_type == CoreDAQ.FRONTEND_LINEAR)
@@ -7050,6 +7100,16 @@ class CoreDAQPanel(QWidget):
         for i in range(min(4, len(mv))):
             g = gains[i] if i < len(gains) else 0
             self._raw_lbls[i].setText(f"{mv[i]:.2f} mV  (G{g})")
+
+        # Reactive autogain: don't wait for the 60s periodic pass if a head
+        # is already running hot enough to be heading for a railed/flatlined
+        # ADC reading — jump on it immediately instead.
+        if (self._frontend_type == CoreDAQ.FRONTEND_LINEAR and self._autogain_btn.isEnabled()
+                and not self._external_pause and any(abs(v) >= self.SATURATION_MV for v in mv[:4])):
+            now = time.monotonic()
+            if now - self._last_reactive_autogain_t >= self.SATURATION_COOLDOWN_S:
+                self._last_reactive_autogain_t = now
+                self._do_autogain()
 
     def _on_show_plot_toggled(self, checked: bool):
         """Show/hide the live plot and start/stop its redraw timer. While
@@ -7184,9 +7244,12 @@ class CoreDAQPanel(QWidget):
         self._sig_pause_poll.emit()
         loop.exec()
         self._worker.poll_paused.disconnect(_on_confirmed)
+        if confirmed:
+            self._external_pause = True
         return confirmed
 
     def resume_polling(self):
+        self._external_pause = False
         if self._connected:
             self._sig_resume_poll.emit()
 
@@ -7200,6 +7263,40 @@ class CoreDAQPanel(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 # UNIFIED MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
+
+class DetachableTabBar(QTabBar):
+    """A QTabBar that emits tabDetachRequested when a tab is dragged far enough
+    vertically away from the bar — the drag-out-to-pop-out gesture used by
+    browser/IDE tab strips. Normal in-bar drag still works (Qt's own
+    move-tab-within-the-bar handling runs first via super())."""
+
+    tabDetachRequested = pyqtSignal(int, object)   # index, global drop position
+
+    DETACH_MARGIN_PX = 50
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_index = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_index = self.tabAt(event.position().toPoint())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if self._drag_index is None or not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        y = event.position().toPoint().y()
+        if y < -self.DETACH_MARGIN_PX or y > self.height() + self.DETACH_MARGIN_PX:
+            idx = self._drag_index
+            self._drag_index = None
+            self.tabDetachRequested.emit(idx, event.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, event):
+        self._drag_index = None
+        super().mouseReleaseEvent(event)
+
 
 class DetachedWindow(QMainWindow):
     """A panel popped out of the main tab bar into its own window."""
@@ -7271,14 +7368,17 @@ class UnifiedMainWindow(QMainWindow):
         self._detached: dict[str, DetachedWindow] = {}
 
         self.tabs = QTabWidget()
-        self.tabs.setCornerWidget(self._make_popout_btn(), Qt.Corner.TopRightCorner)
+        self._tab_bar = DetachableTabBar()
+        self.tabs.setTabBar(self._tab_bar)
+        self._tab_bar.setToolTip("Drag a tab down/up out of the bar to pop it out into its own window")
+        self._tab_bar.tabDetachRequested.connect(self._detach_tab)
 
         self.tabs.addTab(self.daq_panel,     "DAQ Control")
         self.tabs.addTab(self.coredaq_panel, "CoreDAQ Power Meter")
         self.tabs.addTab(self.santec_panel,  "Santec Laser")
-        self.tabs.addTab(self.conex_panel,   "CONEX Motor")
         self.tabs.addTab(self.itla_panel,    "ITLA Laser")
         self.tabs.addTab(self.hp8168f_panel, "HP-8168F Laser")
+        self.tabs.addTab(self.conex_panel,   "CONEX Motor")
 
         # Recording bar sits above the tabs so it's visible no matter which
         # tab is active — recording spans every connected device, not just
@@ -7445,17 +7545,9 @@ class UnifiedMainWindow(QMainWindow):
         self._last_global_csv = fname
         self._rec_open_btn.setEnabled(True)
 
-    # ── Pop-out ────────────────────────────────────────────────────────────────
+    # ── Pop-out (drag a tab out of the bar) ─────────────────────────────────────
 
-    def _make_popout_btn(self):
-        btn = QPushButton("⬡  Pop out tab")
-        btn.setFixedHeight(24)
-        btn.setToolTip("Open the active tab in its own window")
-        btn.clicked.connect(self._popout_current)
-        return btn
-
-    def _popout_current(self):
-        idx = self.tabs.currentIndex()
+    def _detach_tab(self, idx: int, global_pos=None):
         if idx < 0:
             return
         title = self.tabs.tabText(idx)
@@ -7482,6 +7574,9 @@ class UnifiedMainWindow(QMainWindow):
         if daq_page is not None:
             panel.stacked.setCurrentIndex(daq_page)
 
+        if global_pos is not None:
+            win.move(global_pos.x() - win.width() // 2, global_pos.y())
+
         win.show()
         self._detached[title] = win
 
@@ -7492,7 +7587,7 @@ class UnifiedMainWindow(QMainWindow):
     def _reattach(self, panel: QWidget, title: str):
         self._detached.pop(title, None)
         order = {"DAQ Control": 0, "CoreDAQ Power Meter": 1, "Santec Laser": 2,
-                  "CONEX Motor": 3, "ITLA Laser": 4, "HP-8168F Laser": 5}
+                  "ITLA Laser": 3, "HP-8168F Laser": 4, "CONEX Motor": 5}
         slot = order.get(title, self.tabs.count())
         self.tabs.insertTab(slot, panel, title)
         self.tabs.setCurrentIndex(slot)
@@ -7530,6 +7625,30 @@ def main():
     apply_dark_theme(app)
     window = UnifiedMainWindow()
     window.show()
+
+    # Route Ctrl+C (and SIGTERM) through the normal window-close path so a
+    # console-launched quit still zeroes DAQ outputs and turns off the ITLA/
+    # Santec/HP-8168F lasers before exiting, instead of just dying in place
+    # with everything still live. window.close() triggers closeEvent(),
+    # which is what already does that shutdown work for the X-button path.
+    def _handle_quit_signal(*_args):
+        window.close()
+        app.quit()
+    signal.signal(signal.SIGINT, _handle_quit_signal)
+    try:
+        signal.signal(signal.SIGTERM, _handle_quit_signal)
+    except (ValueError, AttributeError, OSError):
+        pass
+
+    # Qt's event loop runs in C++ and won't let a Python signal handler fire
+    # until control returns to the interpreter — which can be indefinitely
+    # while just idling in app.exec(). This timer's only job is to hand
+    # control back to Python regularly so a pending Ctrl+C actually gets
+    # noticed promptly.
+    _signal_pump = QTimer()
+    _signal_pump.timeout.connect(lambda: None)
+    _signal_pump.start(200)
+
     sys.exit(app.exec())
 
 
