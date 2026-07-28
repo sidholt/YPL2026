@@ -435,6 +435,40 @@ DEAD_PIN_NATIVE = {
     },
 }
 
+# Every AOut channel's own native DB62 connector pin, straight from the
+# official DNx-AO-333 pinout (dnx-ao-333.pdf, Figure 1-3) — e.g. AOut0 is
+# always native pin 22, AOut1 is always native pin 2, etc. For a WORKING
+# (green, PIN_REMAP-listed) channel this is also where its signal actually
+# comes out physically: PIN_REMAP exists specifically to compensate for the
+# row-mirror so that logical AOut N really does land on AOut N's own native
+# pin. For a DEAD (red/yellow) channel it's irrelevant — that pin can't be
+# reached at all, which is why DEAD_PIN_NATIVE (the pin it lands on INSTEAD)
+# is used for those rather than this table. Reference data only — not
+# currently shown in the AOut list (working channels display with no
+# annotation), kept here in case it's needed again.
+AOUT_NATIVE_PIN = {
+    "Dev2": {
+        0: 22, 1: 2, 2: 44, 3: 24, 4: 4, 5: 46, 6: 26, 7: 6,
+        8: 48, 9: 28, 10: 8, 11: 50, 12: 30, 13: 10, 14: 52, 15: 32,
+        16: 12, 17: 54, 18: 34, 19: 14, 20: 56, 21: 36, 22: 16, 23: 58,
+        24: 38, 25: 18, 26: 60, 27: 40, 28: 19, 29: 61, 30: 62, 31: 42,
+    },
+}
+
+# Every native Gnd pin on the DB62 connector, per the official DNx-AO-333
+# pinout (dnx-ao-333.pdf, Figure 1-3) — 3 rows of 9/10/9 Gnd pins, alternating
+# with AOut/DIn0/DOut0. Used to work out how many are still free to use as a
+# dedicated ground tie point for external wiring vs. already doubling as a
+# dead channel's landing spot (still electrically fine to use as ground
+# either way — a dead channel there is just permanently sinking into the
+# same Gnd net — but worth knowing which is which before wiring more into
+# them).
+DEV2_NATIVE_GND_PINS = [
+    1, 3, 5, 7, 9, 11, 13, 15, 17,             # row 1 (9)
+    23, 25, 27, 29, 31, 33, 35, 37, 39, 41,    # row 2 (10)
+    43, 45, 47, 49, 51, 53, 55, 57, 59,        # row 3 (9)
+]
+
 
 AO_CHANNEL_NAMES_FILE = os.path.join(os.path.dirname(__file__), "ao_channel_names.json")
 
@@ -1439,6 +1473,28 @@ class PinConfigView(QWidget):
         self._set_active_channels(MAX_PINS)
         root.addWidget(pin_container)
 
+        # Prominent standalone caution for AOut1 specifically — it lands on
+        # DIn0 (a digital logic input), not Gnd like the rest of the dead
+        # channels, so driving it risks actually damaging the card rather
+        # than just harmlessly doing nothing. Only populated/visible for
+        # devices where this applies.
+        self._aout1_warning_lbl = QLabel("")
+        self._aout1_warning_lbl.setWordWrap(True)
+        self._aout1_warning_lbl.setStyleSheet(f"color: {C_ORANGE}; font-weight: bold; font-size: 10px;")
+        self._aout1_warning_lbl.setVisible(False)
+        root.addWidget(self._aout1_warning_lbl)
+
+        # Free-vs-occupied native Gnd pin count for the loaded card (see
+        # DEV2_NATIVE_GND_PINS) — only populated/visible for cards with a
+        # completed remap investigation, same gating as the AOut coloring
+        # above. Blank/hidden otherwise so it doesn't imply info that hasn't
+        # actually been walked yet.
+        self._gnd_note_lbl = QLabel("")
+        self._gnd_note_lbl.setWordWrap(True)
+        self._gnd_note_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        self._gnd_note_lbl.setVisible(False)
+        root.addWidget(self._gnd_note_lbl)
+
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.Shape.HLine)
         sep3.setFrameShadow(QFrame.Shadow.Sunken)
@@ -1901,14 +1957,54 @@ class PinConfigView(QWidget):
             if dead_info is None:
                 lbl.setStyleSheet("")
                 lbl.setText(f"AOut {i:02d}")
-            elif i in dead_info:
+            elif i == 1 and i in dead_info:
+                # AOut1 lands on DIn0, a digital logic input not rated for
+                # analog swings — unlike the other dead channels (which just
+                # harmlessly sink into Gnd), driving this one risks actually
+                # damaging the card. Red, not yellow like the routine dead
+                # ones — full explanation of why this one's worse is in the
+                # warning note below the list.
                 lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+                lbl.setText(f"AOut {i:02d} → {native_pins.get(1)}")
+            elif i in dead_info:
+                # Dead but harmless (lands on Gnd) — yellow, and framed as a
+                # possible ground tie point rather than just "dead," since
+                # that's the one useful thing this pin is still good for.
+                lbl.setStyleSheet(f"color: {C_GOLD}; font-weight: bold;")
                 native = native_pins.get(i)
-                lbl.setText(f"AOut {i:02d} → {native}" if native is not None
+                lbl.setText(f"AOut {i:02d} → gnd {native}" if native is not None
                             else f"AOut {i:02d}")
             else:
+                # Working — no annotation needed, it just does what it says.
                 lbl.setStyleSheet(f"color: {C_GREEN};")
                 lbl.setText(f"AOut {i:02d}")
+
+        if dead_info is not None and 1 in dead_info:
+            self._aout1_warning_lbl.setText(
+                f"⚠ Do not drive AOut 1")
+            self._aout1_warning_lbl.setVisible(True)
+        else:
+            self._aout1_warning_lbl.setText("")
+            self._aout1_warning_lbl.setVisible(False)
+
+        # Free-vs-occupied native Gnd pin count (see DEV2_NATIVE_GND_PINS).
+        # "Occupied" = a dead channel's landing spot happens to be that Gnd
+        # pin — still fine to use as ground (it's the same Gnd net either
+        # way), just worth knowing before you wire more into it.
+        all_gnd = DEV2_NATIVE_GND_PINS if cs.dev == "Dev2" else None
+        if all_gnd:
+            occupied = sorted(int(v) for v in native_pins.values() if v.isdigit())
+            free     = sorted(set(all_gnd) - set(occupied))
+            self._gnd_note_lbl.setText(
+                f"Native Gnd pins on the DB62 connector: {len(free)}/{len(all_gnd)} free — "
+                f"{', '.join(str(p) for p in free)}.  "
+                f"{len(occupied)} more ({', '.join(str(p) for p in occupied)}) also double as "
+                f"a dead channel's landing spot — still usable as ground, just already shared.")
+            self._gnd_note_lbl.setVisible(True)
+        else:
+            self._gnd_note_lbl.setText("")
+            self._gnd_note_lbl.setVisible(False)
+
         _, _, _, s_min, s_max = MODE_RANGES[cs.mode]
         self._syncing = True
         for i in range(cs.num_pins):
@@ -7383,6 +7479,10 @@ class DetachedWindow(QMainWindow):
         event.accept()
 
 
+DEFAULT_TAB_ORDER = ["DAQ Control", "CoreDAQ Power Meter", "Santec Laser",
+                      "ITLA Laser", "HP-8168F Laser", "CONEX Motor"]
+
+
 class UnifiedMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -7401,18 +7501,35 @@ class UnifiedMainWindow(QMainWindow):
 
         self._detached: dict[str, DetachedWindow] = {}
 
+        # Tab order persists across sessions (drag to reorder). Fall back to
+        # DEFAULT_TAB_ORDER wholesale, or patch in any titles missing from a
+        # saved list (e.g. a panel added after the user last saved an order).
+        saved_order = load_connection_settings().get("tab_order")
+        if isinstance(saved_order, list):
+            self._tab_order = [t for t in saved_order if t in DEFAULT_TAB_ORDER]
+            self._tab_order += [t for t in DEFAULT_TAB_ORDER if t not in self._tab_order]
+        else:
+            self._tab_order = list(DEFAULT_TAB_ORDER)
+
+        panels_by_title = {
+            "DAQ Control":         self.daq_panel,
+            "CoreDAQ Power Meter": self.coredaq_panel,
+            "Santec Laser":        self.santec_panel,
+            "ITLA Laser":          self.itla_panel,
+            "HP-8168F Laser":      self.hp8168f_panel,
+            "CONEX Motor":         self.conex_panel,
+        }
+
         self.tabs = QTabWidget()
         self._tab_bar = DetachableTabBar()
         self.tabs.setTabBar(self._tab_bar)
-        self._tab_bar.setToolTip("Drag a tab down/up out of the bar to pop it out into its own window")
+        self.tabs.setMovable(True)
+        self._tab_bar.setToolTip("Drag a tab left/right to reorder it, or down/up out of the bar to pop it out into its own window")
         self._tab_bar.tabDetachRequested.connect(self._detach_tab)
+        self._tab_bar.tabMoved.connect(self._on_tab_moved)
 
-        self.tabs.addTab(self.daq_panel,     "DAQ Control")
-        self.tabs.addTab(self.coredaq_panel, "CoreDAQ Power Meter")
-        self.tabs.addTab(self.santec_panel,  "Santec Laser")
-        self.tabs.addTab(self.itla_panel,    "ITLA Laser")
-        self.tabs.addTab(self.hp8168f_panel, "HP-8168F Laser")
-        self.tabs.addTab(self.conex_panel,   "CONEX Motor")
+        for title in self._tab_order:
+            self.tabs.addTab(panels_by_title[title], title)
 
         # Recording bar sits above the tabs so it's visible no matter which
         # tab is active — recording spans every connected device, not just
@@ -7620,12 +7737,25 @@ class UnifiedMainWindow(QMainWindow):
 
     def _reattach(self, panel: QWidget, title: str):
         self._detached.pop(title, None)
-        order = {"DAQ Control": 0, "CoreDAQ Power Meter": 1, "Santec Laser": 2,
-                  "ITLA Laser": 3, "HP-8168F Laser": 4, "CONEX Motor": 5}
-        slot = order.get(title, self.tabs.count())
+        rank = {t: i for i, t in enumerate(self._tab_order)}
+        target_rank = rank.get(title, len(self._tab_order))
+        slot = 0
+        for i in range(self.tabs.count()):
+            if rank.get(self.tabs.tabText(i), len(self._tab_order)) >= target_rank:
+                break
+            slot += 1
         self.tabs.insertTab(slot, panel, title)
         self.tabs.setCurrentIndex(slot)
         self.raise_()
+
+    def _on_tab_moved(self, *_):
+        """Persists the user's drag-to-reorder tab order. Detached tabs
+        aren't in the bar to move, so they keep their old slot in
+        self._tab_order while the visible tabs get reordered around them."""
+        visible_titles = iter(self.tabs.tabText(i) for i in range(self.tabs.count()))
+        self._tab_order = [t if t in self._detached else next(visible_titles)
+                            for t in self._tab_order]
+        save_connection_setting("tab_order", self._tab_order)
         self.activateWindow()
 
     # ── Sizing ─────────────────────────────────────────────────────────────────
