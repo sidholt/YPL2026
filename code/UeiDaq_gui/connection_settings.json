@@ -9,15 +9,15 @@
   "conex_x_com_port": 13,
   "conex_y_com_port": 12,
   "itla_com_port": 15,
-  "itla_channel": 43,
+  "itla_channel": 93,
   "daq_sweep_stop": 10.0,
-  "itla_wavelength_nm": 1550.1161,
+  "itla_wavelength_nm": 1530.1161,
   "santec_fast_sweep_start_nm": 1500.0,
   "daq_wave_offset": 0.0,
   "daq_sweep_steps": 100,
   "santec_fast_sweep_stop_nm": 1555.0,
   "santec_fast_sweep_power_mw": 10.0,
-  "itla_power_mw": 5.0,
+  "itla_power_mw": 10.0,
   "itla_sweep_step_ghz": 100.0,
   "coredaq_wavelength_nm": 1550.0
 }

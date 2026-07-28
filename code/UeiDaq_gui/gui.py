@@ -239,7 +239,7 @@ class MultiPinSelector(QPushButton):
     view-internal handling gets a chance to swallow it.
     """
 
-    def __init__(self, placeholder: str = "No pins selected", parent=None):
+    def __init__(self, placeholder: str = "No AOuts selected", parent=None):
         super().__init__(placeholder, parent)
         self._placeholder = placeholder
         self.clicked.connect(self._toggle_popup)
@@ -314,7 +314,7 @@ class MultiPinSelector(QPushButton):
         elif len(checked) == 1:
             text = self._items[checked[0]].text()
         else:
-            text = f"{len(checked)} pins selected"
+            text = f"{len(checked)} AOuts selected"
         self.setText(text)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,35 +335,48 @@ CARDS = {
         "channels": MAX_PINS},
 }
 
-# Physical pin remap — maps "GUI/logical pin index" -> "actual physical
-# output channel index" for cards whose connector/cable doesn't wire in
-# straight sequential order. Keyed by CARDS[...]["dev"]. An empty/missing
-# entry means identity (no remap), which MUST stay the default until a
-# pin's real mapping has been directly confirmed with pin_identify_test.py
-# — do not guess entries here. An unconfirmed remap is more dangerous than
-# none at all: it would silently send commanded voltage to a physical pin
-# you don't think you're touching.
+# AOut remap — maps "GUI/logical AOut index" -> "the raw AOut channel to
+# actually write to" for cards whose connector/cable doesn't wire in
+# straight sequential order, so the signal lands on the physical DB62 pin
+# you expect. Keyed by CARDS[...]["dev"]. An empty/missing entry means
+# identity (no remap), which MUST stay the default until an AOut's real
+# landing has been directly confirmed with pin_identify_test.py — do not
+# guess entries here. An unconfirmed remap is more dangerous than none at
+# all: it would silently send commanded voltage to a physical pin you don't
+# think you're touching.
 #
 # ROOT CAUSE FOUND 2026-07-21: the DNx-AO-333's official pinout (dnx-ao-333.pdf)
-# wires its 62-pin cable connector in 3 physical rows of 21/21/20 pins, each
-# alternating Gnd/AOut. The ribbon cable added afterward and jumpered off its
-# far end had each of those 3 rows mirrored left-to-right (row assignment
-# unchanged, only the order WITHIN each row reversed). That single rule
-# reproduces every hardware measurement taken across both walks with zero
-# exceptions — the 18 pairs below plus 5 more (8, 20, 23, 26, 28 all
-# independently confirmed landing on Gnd exactly where predicted, including
-# the 2026-07-21 multimeter reading of raw ch 8's signature on native
-# connector pin 57 = Gnd) and all 5 remaining predicted-dead channels (5, 11,
-# 14, 17, 30) confirmed silent (0 V) on their predicted Gnd landings.
+# wires its 62-pin connector in 3 physical rows of 21/21/20 pins, each
+# alternating Gnd/AOut. Something between the card and the bench mirrors
+# each of those 3 rows left-to-right (row assignment unchanged, only the
+# order WITHIN each row reversed). That single rule reproduces every
+# hardware measurement taken across both walks with zero exceptions — the 18
+# pairs below plus 5 more (8, 20, 23, 26, 28 all independently confirmed
+# landing on Gnd exactly where predicted, including the 2026-07-21
+# multimeter reading of raw ch 8's signature on native connector pin 57 =
+# Gnd) and all 5 remaining predicted-dead channels (5, 11, 14, 17, 30)
+# confirmed silent (0 V) on their predicted Gnd landings.
+#
+# CORRECTED 2026-07-27: it is NOT the DNA-CBL-62 cable. The manufacturer's
+# own cable schematic (DNA-CBL-62-SCHEMATIC.PDF) documents a pure 1:1
+# pass-through — every one of the 62 pins (plus shield) wires straight
+# across, pin N to pin N, no crossing, no reversal. Confirmed as the actual
+# cable in use here. The mirror is introduced somewhere further down the
+# chain — most likely the DNA-STP-62 (or equivalent) terminal block's own
+# physical terminal layout not matching ascending DB62 pin order — not by
+# anything that can be fixed by replacing or re-terminating the cable
+# itself. Root cause of the mirror is still open; the empirical
+# logical->physical measurements below remain valid regardless of where
+# exactly in the chain it happens.
 #
 # Channels 1, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30 have NO reachable output
 # terminal under this wiring — channel 1 lands on the card's digital input
 # pin (DIn0, a logic-level line, NOT rated for analog swings — avoid driving
-# this pin at all until the cable is physically fixed), the rest land on Gnd.
-# No remap can route around a wire that doesn't reach an output pin; these
-# stay identity (unlisted) since that's the only choice that can't collide
-# with a working route. Fixing them requires re-terminating the physical
-# cable, not a software change.
+# this pin at all), the rest land on Gnd. No remap can route around a wire
+# that doesn't reach an output pin; these stay identity (unlisted) since
+# that's the only choice that can't collide with a working route. Fixing
+# them requires identifying and correcting wherever downstream of the card
+# the mirroring actually happens, not a software change.
 #
 # The lone remaining soft spot: 27->3 was directly observed in both directions
 # in the original raw walk (2026-07-20) and fits this rule exactly, but one
@@ -382,15 +395,15 @@ PIN_REMAP = {
 
 
 def remap_pin(dev: str, logical_pin: int) -> int:
-    """GUI pin index -> actual physical channel index to write/read for `dev`."""
+    """GUI/logical AOut index -> raw AOut channel to write/read for `dev`."""
     return PIN_REMAP.get(dev, {}).get(logical_pin, logical_pin)
 
 
-# Pins with NO reachable output terminal at all (see PIN_REMAP comment above)
-# — drives the "Pin NN" label color-coding in the DAQ Control pin list
-# (PinConfigView.load_card): green for verified-working pins, red for these.
-# Only devices with a completed investigation appear here; other cards get
-# no color coding since they haven't been walked.
+# AOut channels with NO reachable physical pin at all (see PIN_REMAP comment
+# above) — drives the "AOut NN" label color-coding in the DAQ Control AOut
+# list (PinConfigView.load_card): green for verified-working channels, red
+# for these. Only devices with a completed investigation appear here; other
+# cards get no color coding since they haven't been walked.
 DEAD_PINS = {
     "Dev2": {
         1:  "lands on the card's digital input pin (DIn0), not analog ground — avoid driving",
@@ -404,6 +417,21 @@ DEAD_PINS = {
         26: "lands on Gnd — no reachable output on this cable",
         28: "lands on Gnd — no reachable output on this cable",
         30: "lands on Gnd — no reachable output on this cable",
+    },
+}
+
+# What each dead channel above actually lands on (see pin_map_Dev2.csv) —
+# shown inline on the red "AOut NN" label in the DAQ Control AOut list so the
+# landing is visible without a hover/tooltip. Values are display strings, not
+# bare pin numbers, so pin 1's DIn0 landing (a digital input, confirmed at
+# native connector pin 20) can't be misread as just another Gnd pin the way
+# the rest of these are. 1/8/20/23/26/28/30 are multimeter-confirmed;
+# 5/11/14/17 are predicted from the official pinout + the still-open
+# row-mirror pattern (see PIN_REMAP comment above) and not yet reprobed.
+DEAD_PIN_NATIVE = {
+    "Dev2": {
+        1: "DIn0 (20)", 5: "59", 8: "57", 11: "55", 14: "53",
+        17: "51", 20: "49", 23: "47", 26: "45", 28: "3", 30: "43",
     },
 }
 
@@ -1040,7 +1068,7 @@ class DAQBoxWidget(QWidget):
             open_btn = QPushButton("Open")
             open_btn.setFixedWidth(80)
             open_btn.setVisible(False)
-            open_btn.setToolTip("Open pin controls")
+            open_btn.setToolTip("Open AOut controls")
 
             x_btn = QPushButton("✕")
             x_btn.setFixedSize(24, 24)
@@ -1186,10 +1214,10 @@ class LiveComparisonPlot(QWidget):
         layout.setSpacing(6)
 
         pin_row = QHBoxLayout()
-        pin_row.addWidget(QLabel("Pin:"))
+        pin_row.addWidget(QLabel("AOut:"))
         self._pin_combo = QComboBox()
         for i in range(num_pins):
-            self._pin_combo.addItem(f"Pin {i:02d}", i)
+            self._pin_combo.addItem(f"AOut {i:02d}", i)
         self._pin_combo.setFixedWidth(80)
         self._pin_combo.currentIndexChanged.connect(self._on_pin_changed)
         pin_row.addWidget(self._pin_combo)
@@ -1346,7 +1374,7 @@ class PinConfigView(QWidget):
             col_lay.setContentsMargins(0, 0, 0, 0)
 
             col_row = QHBoxLayout()
-            for text, width in [("Pin", 50), ("Name", 90), ("Value", 120), ("Slider", -1), ("", 60)]:
+            for text, width in [("AOut", 135), ("Name", 90), ("Value", 120), ("Slider", -1), ("", 60)]:
                 lbl = QLabel(text)
                 if width > 0: lbl.setFixedWidth(width)
                 col_row.addWidget(lbl)
@@ -1377,8 +1405,8 @@ class PinConfigView(QWidget):
             rl  = QHBoxLayout(row_widget)
             rl.setContentsMargins(4, 1, 4, 1)
             rl.setSpacing(6)
-            lbl = QLabel(f"Pin {i:02d}")
-            lbl.setFixedWidth(50)
+            lbl = QLabel(f"AOut {i:02d}")
+            lbl.setFixedWidth(135)
             name_edit = QLineEdit(self._channel_names.get(str(i), ""))
             name_edit.setPlaceholderText("(nickname)")
             name_edit.setFixedWidth(90)
@@ -1436,7 +1464,7 @@ class PinConfigView(QWidget):
         self._set_all_spin.setFixedWidth(100)
         bottom.addWidget(self._set_all_spin)
         set_all_btn = QPushButton("Apply")
-        set_all_btn.setToolTip("Set every active pin's value box to the amount above, then write it")
+        set_all_btn.setToolTip("Set every active AOut's value box to the amount above, then write it")
         set_all_btn.clicked.connect(self._set_all_to)
         bottom.addWidget(set_all_btn)
         bottom.addStretch()
@@ -1452,18 +1480,18 @@ class PinConfigView(QWidget):
         sg.setSpacing(6)
 
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Pins:"))
-        self.sweep_pin_combo = MultiPinSelector("No pins selected")
+        row1.addWidget(QLabel("AOuts:"))
+        self.sweep_pin_combo = MultiPinSelector("No AOuts selected")
         for i in range(MAX_PINS):
-            self.sweep_pin_combo.addCheckableItem(f"Pin {i:02d}", i)
+            self.sweep_pin_combo.addCheckableItem(f"AOut {i:02d}", i)
         self.sweep_pin_combo.setFixedWidth(140)
         self.sweep_pin_combo.setToolTip(
-            "Every checked pin sweeps the same Start→Stop range together, "
+            "Every checked AOut sweeps the same Start→Stop range together, "
             "in lockstep")
         row1.addWidget(self.sweep_pin_combo)
         self.sweep_select_all_btn = QPushButton("All")
         self.sweep_select_all_btn.setFixedWidth(36)
-        self.sweep_select_all_btn.setToolTip("Check every pin for the sweep")
+        self.sweep_select_all_btn.setToolTip("Check every AOut for the sweep")
         self.sweep_select_all_btn.clicked.connect(self.sweep_pin_combo.select_all)
         row1.addWidget(self.sweep_select_all_btn)
         row1.addSpacing(10)
@@ -1576,17 +1604,17 @@ class PinConfigView(QWidget):
         wg.setSpacing(6)
 
         wrow1 = QHBoxLayout()
-        wrow1.addWidget(QLabel("Pins:"))
-        self.wave_pin_combo = MultiPinSelector("No pins selected")
+        wrow1.addWidget(QLabel("AOuts:"))
+        self.wave_pin_combo = MultiPinSelector("No AOuts selected")
         for i in range(MAX_PINS):
-            self.wave_pin_combo.addCheckableItem(f"Pin {i:02d}", i)
+            self.wave_pin_combo.addCheckableItem(f"AOut {i:02d}", i)
         self.wave_pin_combo.setFixedWidth(140)
         self.wave_pin_combo.setToolTip(
-            "Every checked pin plays the same waveform together, in lockstep")
+            "Every checked AOut plays the same waveform together, in lockstep")
         wrow1.addWidget(self.wave_pin_combo)
         self.wave_select_all_btn = QPushButton("All")
         self.wave_select_all_btn.setFixedWidth(36)
-        self.wave_select_all_btn.setToolTip("Check every pin for the waveform")
+        self.wave_select_all_btn.setToolTip("Check every AOut for the waveform")
         self.wave_select_all_btn.clicked.connect(self.wave_pin_combo.select_all)
         wrow1.addWidget(self.wave_select_all_btn)
         wrow1.addSpacing(10)
@@ -1840,7 +1868,7 @@ class PinConfigView(QWidget):
 
     def _pin_display_name(self, idx: int) -> str:
         name = self._channel_names.get(str(idx), "")
-        base = f"Pin {idx:02d}"
+        base = f"AOut {idx:02d}"
         return f"{base} — {name}" if name else base
 
     def _set_active_channels(self, n: int):
@@ -1861,20 +1889,26 @@ class PinConfigView(QWidget):
         self.badge.setText(cs.mode.upper())
         self._set_active_channels(cs.num_pins)
 
-        # Color-code the "Pin NN" labels for cards with a completed remap
+        # Color-code the "AOut NN" labels for cards with a completed remap
         # investigation (see DEAD_PINS): green = verified working, red = no
         # reachable output terminal on this cable, don't bother wiring it up.
         # Cards without an entry (not walked) get no coloring, reset to
         # default, so stale colors from a previously-loaded card don't linger
         # — these 32 row widgets are shared/reused across every card.
-        dead_info = DEAD_PINS.get(cs.dev)
+        dead_info   = DEAD_PINS.get(cs.dev)
+        native_pins = DEAD_PIN_NATIVE.get(cs.dev, {})
         for i, lbl in enumerate(self._pin_num_lbls):
             if dead_info is None:
                 lbl.setStyleSheet("")
+                lbl.setText(f"AOut {i:02d}")
             elif i in dead_info:
                 lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+                native = native_pins.get(i)
+                lbl.setText(f"AOut {i:02d} → {native}" if native is not None
+                            else f"AOut {i:02d}")
             else:
                 lbl.setStyleSheet(f"color: {C_GREEN};")
+                lbl.setText(f"AOut {i:02d}")
         _, _, _, s_min, s_max = MODE_RANGES[cs.mode]
         self._syncing = True
         for i in range(cs.num_pins):
@@ -1995,7 +2029,7 @@ class PinConfigView(QWidget):
         readback_col = "moku_mA" if mode == "current" else "moku_V"
 
         fname    = os.path.join(data_dir, f"{dev}_{mode}_{src}_{stamp}.csv")
-        pin_hdrs = [f"pin{i:02d}_{unit}" for i in range(self.card_session.num_pins)]
+        pin_hdrs = [f"aout{i:02d}_{unit}" for i in range(self.card_session.num_pins)]
         header   = ["time_s", "readback_raw", readback_col] + pin_hdrs
 
         with open(fname, "w", newline="") as f:
@@ -2045,7 +2079,7 @@ class PinConfigView(QWidget):
             if not cs.connected: cs.connect()
             pins = self.sweep_pin_combo.checked_data()
             if not pins:
-                self._status("Sweep error: no pins selected")
+                self._status("Sweep error: no AOuts selected")
                 return
             start    = self.sweep_start.value()
             stop     = self.sweep_stop.value()
@@ -2058,7 +2092,7 @@ class PinConfigView(QWidget):
                            self._on_sweep_step, self._on_sweep_done)
             self.sweep_run_btn.setEnabled(False)
             self.sweep_stop_btn.setEnabled(True)
-            pin_desc = f"Pin {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} pins"
+            pin_desc = f"AOut {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} AOuts"
             self._status(f"Sweep running — {pin_desc}  {start:.3f} → "
                          f"{stop:.3f} {cs.unit}  {steps} steps")
         except Exception as e:
@@ -2077,7 +2111,7 @@ class PinConfigView(QWidget):
             self.sliders[pin].setValue(int(value * 100))
         self._syncing = False
         cs = self.card_session
-        pin_desc = f"Pin {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} pins"
+        pin_desc = f"AOut {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} AOuts"
         self._status(f"Sweep — {pin_desc} at {value:.3f} "
                      f"{cs.unit if cs else ''}  (step {step}/{total})")
 
@@ -2170,7 +2204,7 @@ class PinConfigView(QWidget):
             targets[idx] = val
             if self._ramp_chk.isChecked():
                 cs.ramp_to(targets)
-                self._status(f"Ramping Pin {idx:02d} → {val:.3f} {cs.unit}")
+                self._status(f"Ramping AOut {idx:02d} → {val:.3f} {cs.unit}")
             else:
                 def do_write():
                     try:
@@ -2180,7 +2214,7 @@ class PinConfigView(QWidget):
                 t = QThread(self)
                 t.run = do_write
                 t.start()
-                self._status(f"Instant set Pin {idx:02d} → {val:.3f} {cs.unit}")
+                self._status(f"Instant set AOut {idx:02d} → {val:.3f} {cs.unit}")
         except Exception as e:
             self._status(f"Error: {e}")
 
@@ -2193,7 +2227,7 @@ class PinConfigView(QWidget):
             if self._ramp_chk.isChecked():
                 cs.ramp_to(values)
                 if focused_pin is not None:
-                    msg = (f"Ramping Pin {focused_pin:02d} → "
+                    msg = (f"Ramping AOut {focused_pin:02d} → "
                            f"{values[focused_pin]:.3f} {cs.unit}")
                 else:
                     msg = ("Ramping all: " +
@@ -2208,7 +2242,7 @@ class PinConfigView(QWidget):
                 t = QThread(self)
                 t.run = do_write
                 t.start()
-                msg = "Instant write all pins"
+                msg = "Instant write all AOuts"
             self._status(msg)
         except Exception as e:
             self._status(f"Error: {e}")
@@ -2224,7 +2258,7 @@ class PinConfigView(QWidget):
             self._syncing = False
             if self._ramp_chk.isChecked():
                 cs.zero()
-                self._status("Ramping all pins to zero")
+                self._status("Ramping all AOuts to zero")
             else:
                 def do_zero():
                     try:
@@ -2234,15 +2268,15 @@ class PinConfigView(QWidget):
                 t = QThread(self)
                 t.run = do_zero
                 t.start()
-                self._status("Instant zero all pins")
+                self._status("Instant zero all AOuts")
         except Exception as e:
             self._status(f"Error: {e}")
 
     def _set_all_to(self):
-        """Sets every active pin's value box (and slider) to the amount in
+        """Sets every active AOut's value box (and slider) to the amount in
         "Set All To", then writes it out — same ramp-vs-instant behavior as
         Write All/Zero All, just with a configurable target instead of
-        whatever's already dialed into each pin, or a hardcoded zero."""
+        whatever's already dialed into each AOut, or a hardcoded zero."""
         cs = self.card_session
         if cs is None: return
         value = self._set_all_spin.value()
@@ -2254,7 +2288,7 @@ class PinConfigView(QWidget):
             self._syncing = False
             if self._ramp_chk.isChecked():
                 cs.ramp_to([value] * cs.num_pins)
-                self._status(f"Ramping all pins to {value:.3f} {cs.unit}")
+                self._status(f"Ramping all AOuts to {value:.3f} {cs.unit}")
             else:
                 def do_set_all():
                     try:
@@ -2264,7 +2298,7 @@ class PinConfigView(QWidget):
                 t = QThread(self)
                 t.run = do_set_all
                 t.start()
-                self._status(f"Instant set all pins to {value:.3f} {cs.unit}")
+                self._status(f"Instant set all AOuts to {value:.3f} {cs.unit}")
         except Exception as e:
             self._status(f"Error: {e}")
 
@@ -2275,7 +2309,7 @@ class PinConfigView(QWidget):
             if not cs.connected: cs.connect()
             pins = self.wave_pin_combo.checked_data()
             if not pins:
-                self._status("Wave error: no pins selected")
+                self._status("Wave error: no AOuts selected")
                 return
             waveform  = self.wave_type_combo.currentData()
             freq      = self.wave_freq_sb.value()
@@ -2286,7 +2320,7 @@ class PinConfigView(QWidget):
                           self._on_wave_tick)
             self.wave_run_btn.setEnabled(False)
             self.wave_stop_btn.setEnabled(True)
-            pin_desc = f"Pin {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} pins"
+            pin_desc = f"AOut {pins[0]:02d}" if len(pins) == 1 else f"{len(pins)} AOuts"
             self._status(f"Wave running — {pin_desc}  {waveform}  {freq}Hz  "
                          f"amp={amplitude} {cs.unit}  offset={offset} {cs.unit}")
         except Exception as e:
@@ -7476,7 +7510,7 @@ class UnifiedMainWindow(QMainWindow):
         if ao:
             label, unit, values = ao
             for i, v in enumerate(values):
-                row[f"AO_{label}_pin{i:02d}_{unit}"] = v
+                row[f"AO_{label}_aout{i:02d}_{unit}"] = v
 
         powers = self.coredaq_panel.latest_power_w()
         if powers:

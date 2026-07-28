@@ -1,22 +1,22 @@
 logical_pin,physical_channel,note
 0,31,confirmed
-1,,DEAD - lands on card's digital input pin (DIn0) per row-mirror theory; do not drive, no software fix possible
+1,20,DEAD - lands on the card's digital input pin (DIn0) at native connector pin 20; do not drive, no software fix possible
 2,29,confirmed
 3,27,confirmed (raw walk both directions; one verification retry failed, re-isolating next)
 4,25,confirmed
-5,,DEAD - lands on Gnd (0V confirmed on multimeter)
+5,,DEAD - lands on Gnd (native connector pin 59, predicted per official pinout + row-mirror model; 0V confirmed on multimeter, exact pin not yet reprobed)
 6,24,confirmed
 7,22,confirmed
 8,,DEAD - lands on Gnd (native connector pin 57, 0V/signature confirmed on multimeter)
 9,21,confirmed
 10,19,confirmed
-11,,DEAD - lands on Gnd (0V confirmed on multimeter)
+11,,DEAD - lands on Gnd (native connector pin 55, predicted per official pinout + row-mirror model; 0V confirmed on multimeter, exact pin not yet reprobed)
 12,18,confirmed
 13,16,confirmed
-14,,DEAD - lands on Gnd (0V confirmed on multimeter)
+14,,DEAD - lands on Gnd (native connector pin 53, predicted per official pinout + row-mirror model; 0V confirmed on multimeter, exact pin not yet reprobed)
 15,15,confirmed (unchanged)
 16,13,confirmed
-17,,DEAD - lands on Gnd (0V confirmed on multimeter)
+17,,DEAD - lands on Gnd (native connector pin 51, predicted per official pinout + row-mirror model; 0V confirmed on multimeter, exact pin not yet reprobed)
 18,12,confirmed
 19,10,confirmed
 20,,DEAD - lands on Gnd (native connector pin 49, signature confirmed on multimeter)

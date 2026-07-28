@@ -349,25 +349,37 @@ CARDS = {
 # you don't think you're touching.
 #
 # ROOT CAUSE FOUND 2026-07-21: the DNx-AO-333's official pinout (dnx-ao-333.pdf)
-# wires its 62-pin cable connector in 3 physical rows of 21/21/20 pins, each
-# alternating Gnd/AOut. The ribbon cable added afterward and jumpered off its
-# far end had each of those 3 rows mirrored left-to-right (row assignment
-# unchanged, only the order WITHIN each row reversed). That single rule
-# reproduces every hardware measurement taken across both walks with zero
-# exceptions — the 18 pairs below plus 5 more (8, 20, 23, 26, 28 all
-# independently confirmed landing on Gnd exactly where predicted, including
-# the 2026-07-21 multimeter reading of raw ch 8's signature on native
-# connector pin 57 = Gnd) and all 5 remaining predicted-dead channels (5, 11,
-# 14, 17, 30) confirmed silent (0 V) on their predicted Gnd landings.
+# wires its 62-pin connector in 3 physical rows of 21/21/20 pins, each
+# alternating Gnd/AOut. Something between the card and the bench mirrors
+# each of those 3 rows left-to-right (row assignment unchanged, only the
+# order WITHIN each row reversed). That single rule reproduces every
+# hardware measurement taken across both walks with zero exceptions — the 18
+# pairs below plus 5 more (8, 20, 23, 26, 28 all independently confirmed
+# landing on Gnd exactly where predicted, including the 2026-07-21
+# multimeter reading of raw ch 8's signature on native connector pin 57 =
+# Gnd) and all 5 remaining predicted-dead channels (5, 11, 14, 17, 30)
+# confirmed silent (0 V) on their predicted Gnd landings.
+#
+# CORRECTED 2026-07-27: it is NOT the DNA-CBL-62 cable. The manufacturer's
+# own cable schematic (DNA-CBL-62-SCHEMATIC.PDF) documents a pure 1:1
+# pass-through — every one of the 62 pins (plus shield) wires straight
+# across, pin N to pin N, no crossing, no reversal. Confirmed as the actual
+# cable in use here. The mirror is introduced somewhere further down the
+# chain — most likely the DNA-STP-62 (or equivalent) terminal block's own
+# physical terminal layout not matching ascending DB62 pin order — not by
+# anything that can be fixed by replacing or re-terminating the cable
+# itself. Root cause of the mirror is still open; the empirical
+# logical->physical measurements below remain valid regardless of where
+# exactly in the chain it happens.
 #
 # Channels 1, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30 have NO reachable output
 # terminal under this wiring — channel 1 lands on the card's digital input
 # pin (DIn0, a logic-level line, NOT rated for analog swings — avoid driving
-# this pin at all until the cable is physically fixed), the rest land on Gnd.
-# No remap can route around a wire that doesn't reach an output pin; these
-# stay identity (unlisted) since that's the only choice that can't collide
-# with a working route. Fixing them requires re-terminating the physical
-# cable, not a software change.
+# this pin at all), the rest land on Gnd. No remap can route around a wire
+# that doesn't reach an output pin; these stay identity (unlisted) since
+# that's the only choice that can't collide with a working route. Fixing
+# them requires identifying and correcting wherever downstream of the card
+# the mirroring actually happens, not a software change.
 #
 # The lone remaining soft spot: 27->3 was directly observed in both directions
 # in the original raw walk (2026-07-20) and fits this rule exactly, but one

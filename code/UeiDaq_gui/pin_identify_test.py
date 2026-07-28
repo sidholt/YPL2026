@@ -84,30 +84,56 @@ N_GUARDIAN_CH = 32
 
 # RESOLVED 2026-07-21: the DNx-AO-333's official pinout (dnx-ao-333.pdf) wires
 # its 62-pin connector in 3 physical rows (21/21/20 pins, alternating
-# Gnd/AOut). The cable added afterward mirrored each row left-to-right (row
-# assignment unchanged). That one rule reproduces every measurement taken —
-# 18 pairs from the first verification walk, plus raw 8/20/23/26/28 confirmed
-# landing exactly on their predicted Gnd pins by signature voltage, plus raw
-# 5/11/14/17/30 confirmed silent (0 V) on their predicted Gnd landings.
-# Channels 1 (-> the card's digital input pin DIn0, not analog ground — avoid
-# driving it) and 5/8/11/14/17/20/23/26/28/30 (-> Gnd) have no reachable
-# output terminal; no remap can fix a wire that doesn't reach a pin. The full
-# resolved map is now live in gui.py's PIN_REMAP["Dev2"].
+# Gnd/AOut). Something between the card and the bench mirrors each row
+# left-to-right (row assignment unchanged). That one rule reproduces every
+# measurement taken — 18 pairs from the first verification walk, plus raw
+# 8/20/23/26/28 confirmed landing exactly on their predicted Gnd pins by
+# signature voltage, plus raw 5/11/14/17/30 confirmed silent (0 V) on their
+# predicted Gnd landings. Channels 1 (-> the card's digital input pin DIn0,
+# not analog ground — avoid driving it) and 5/8/11/14/17/20/23/26/28/30
+# (-> Gnd) have no reachable output terminal; no remap can fix a wire that
+# doesn't reach a pin. The full resolved map is now live in gui.py's
+# PIN_REMAP["Dev2"].
+#
+# CORRECTED 2026-07-27: it's NOT the DNA-CBL-62 cable — confirmed via the
+# manufacturer's own cable schematic (DNA-CBL-62-SCHEMATIC.PDF), a pure 1:1
+# pass-through (pin N -> pin N for all 62 + shield, no crossing), and this
+# is the actual cable in use. The mirror happens further downstream, most
+# likely in the DNA-STP-62 (or equivalent) terminal block's physical
+# terminal layout — not something a cable swap fixes. The measurements and
+# PIN_REMAP above are still correct; only "the cable does it" is wrong.
 #
 # ONE loose end: 27<->3 was directly observed in both directions in the raw
 # walk and fits the rule, but one verification attempt failed to reproduce
-# it. This script is configured to re-isolate just that pair — PIN_REMAP
-# applies gui.py's confirmed map (so if you drive "logical pin 27" here, you
-# should see physical terminal 27 light up) and PINS_TO_TEST narrows the walk
-# to that single pin.
-PIN_REMAP = {
-    0: 31, 2: 29, 3: 27, 4: 25, 6: 24, 7: 22, 9: 21, 10: 19,
-    12: 18, 13: 16, 15: 15, 16: 13, 18: 12, 19: 10, 21: 9, 22: 7,
-    24: 6, 25: 4, 27: 3, 29: 2, 31: 0,
-}
+# it — worth watching for on this pass too.
+#
+# Left empty below for a full fresh walk: a full re-walk from raw
+# (unremapped) channels is the ground-truth method (see docstring above) —
+# every pin is driven raw and whatever physical/Guardian channel lights up
+# IS the logical->physical mapping, independent of what the datasheet-derived
+# map below claims. To instead verify the confirmed map still holds (drive
+# "logical pin p", expect physical terminal p to light up), uncomment it:
+# PIN_REMAP = {
+#     0: 31, 2: 29, 3: 27, 4: 25, 6: 24, 7: 22, 9: 21, 10: 19,
+#     12: 18, 13: 16, 15: 15, 16: 13, 18: 12, 19: 10, 21: 9, 22: 7,
+#     24: 6, 25: 4, 27: 3, 29: 2, 31: 0,
+# }
+PIN_REMAP = {}
 
-# Walk only these raw channels (overrides START_PIN..END_PIN when non-empty).
-PINS_TO_TEST = [27]
+# The pins gui.py's DEAD_PINS["Dev2"] marks red. The official DNx-AO-333
+# pinout (Figure 1-3) + the row-mirror model predicts each one's landing on a
+# NATIVE CONNECTOR PIN below — every one is a Gnd (or DIn0), which is why the
+# signal is lost. 6 of these native pins are already multimeter-confirmed
+# (marked ✓); this run is a check that the other 4 (5,11,14,17) land where
+# predicted. Expect each dead pin to read ~0 V at its predicted native pin.
+#   logical -> native connector pin (signal there)
+#      1 -> 20 (DIn0)  ✓        17 -> 51 (Gnd)  predicted
+#      5 -> 59 (Gnd)  predicted 20 -> 49 (Gnd)  ✓
+#      8 -> 57 (Gnd)  ✓         23 -> 47 (Gnd)  ✓
+#     11 -> 55 (Gnd)  predicted 26 -> 45 (Gnd)  ✓
+#     14 -> 53 (Gnd)  predicted 28 ->  3 (Gnd)  ✓
+#                               30 -> 43 (Gnd)  ✓
+PINS_TO_TEST = [1, 5, 8, 11, 14, 17, 20, 23, 26, 28, 30]
 
 # SIGNATURE MODE — the fast way to resolve MANY unknown channels at once,
 # because probing every candidate spot for every channel one at a time is
@@ -123,14 +149,18 @@ PINS_TO_TEST = [27]
 #     held at 0 V during the pass so the short can't contaminate readings;
 #     it gets a solo pass at the end.
 #   - Mind the top voltage: max = SIG_START + (len(PINS_TO_TEST)-1)*SIG_STEP.
-# False = the classic one-channel-at-a-time walk — the right choice for the
-# single-pin 27<->3 recheck above.
+# False = classic one-pin-at-a-time walk (advance on Enter). PINS_TO_TEST is
+# already narrowed to just the 11 dead/Gnd-landing pins above, so this walks
+# only those, one per Enter press — not signature mode's all-at-once drive.
 SIGNATURE_MODE = False
 SIG_START = 0.5    # lowest signature voltage
 SIG_STEP  = 0.25   # spacing between signatures (easy to split on a DMM)
-SHORTED_RAW = 30
-# Physical pins with no known source — the spots to probe in signature mode.
-DEAD_PHYSICAL = []
+SHORTED_RAW = 30   # one of our dead pins — gets its own solo pass automatically
+# Scan every physical output terminal (0-31) for a signature match — we don't
+# know in advance where, if anywhere, a "dead" channel's signal actually
+# lands, so check everywhere rather than guessing candidate spots. Guardian
+# covers all of these automatically; only stays manual if Guardian is down.
+DEAD_PHYSICAL = list(range(32))
 
 # HOLD_ONLY: don't prompt pin-by-pin — just energize the signature pattern
 # and LEAVE IT ON while you probe every pin at your own pace and write down
@@ -181,13 +211,24 @@ def read_guardian(dll, handle):
     return list(fdata)
 
 
-def signature_walk(write, zeros, guardian, unit, notes, discovered):
+def signature_walk(write, zeros, guardian, unit, notes, discovered, prior=None):
     """The fast walk: drives every PINS_TO_TEST channel AT ONCE, each at its
     own unique voltage, so each dead physical pin needs exactly one probe —
     the voltage read there fingerprints the raw channel feeding it. Fills
     `notes`/`discovered` keyed by raw channel (same shape as the classic
     walk, so the shared table/CSV code just works). Returns True if the
-    user stopped early."""
+    user stopped early.
+
+    `prior` is the logical_pin -> {"physical_channel", "note"} table loaded
+    from pin_map_Dev2.csv — shown alongside every match so you can eyeball
+    whether this pass agrees with what was already recorded (predicted vs.
+    confirmed native pin, etc.) instead of having to cross-reference the CSV
+    by hand while you're mid-walk."""
+    prior = prior or {}
+
+    def prior_note(raw_ch: int) -> str:
+        return prior.get(str(raw_ch), {}).get("note", "")
+
     sig_chans = [c for c in PINS_TO_TEST if c != SHORTED_RAW]
     sig = {c: SIG_START + k * SIG_STEP for k, c in enumerate(sig_chans)}
 
@@ -204,6 +245,11 @@ def signature_walk(write, zeros, guardian, unit, notes, discovered):
     print("   raw ch:" + "".join(f"  {c:>4d}" for c in sig_chans))
     print("   volts :" + "".join(f"  {sig[c]:>4.2f}" for c in sig_chans))
     print(f"   (raw {SHORTED_RAW} held at 0 until its solo pass at the end)")
+    print("   CSV notes on record for these channels:")
+    for c in sig_chans + [SHORTED_RAW]:
+        note = prior_note(c)
+        if note:
+            print(f"      raw {c:2d}: {note}")
 
     remaining = list(DEAD_PHYSICAL)
 
@@ -218,8 +264,10 @@ def signature_walk(write, zeros, guardian, unit, notes, discovered):
                 discovered[r] = p
                 notes[r] = f"phys {p} @ {vals[p]:+.3f} V (Guardian, signature pass)"
                 remaining.remove(p)
+                pn = prior_note(r)
+                tag = f"  [CSV said: {pn}]" if pn else "  [no prior CSV note]"
                 print(f"   [Guardian] physical {p} reads {vals[p]:+.3f} V "
-                      f"-> fed by raw ch {r}")
+                      f"-> fed by raw ch {r}{tag}")
             else:
                 print(f"   [Guardian] physical {p} reads {vals[p]:+.3f} V "
                       f"-> no signature match (dead, or on the raw-{SHORTED_RAW} "
@@ -270,8 +318,10 @@ def signature_walk(write, zeros, guardian, unit, notes, discovered):
         discovered[r] = p
         notes[r] = f"phys {p} @ {volts:g} V (signature pass)"
         remaining.remove(p)
+        pn = prior_note(r)
+        tag = f"  [CSV said: {pn}]" if pn else "  [no prior CSV note]"
         print(f"      -> physical {p} is fed by raw ch {r} "
-              f"(signature {sig[r]:.2f} V)")
+              f"(signature {sig[r]:.2f} V){tag}")
 
     write(zeros)
 
@@ -360,7 +410,7 @@ def main():
         print(f"\nAll {DEV} pins zeroed.")
         if SIGNATURE_MODE and PINS_TO_TEST:
             stopped_early = signature_walk(write, zeros, guardian, unit,
-                                           notes, discovered)
+                                           notes, discovered, prior)
         else:
             pins_desc = (", ".join(str(p) for p in pins) if PINS_TO_TEST
                          else f"{START_PIN}..{END_PIN}")
