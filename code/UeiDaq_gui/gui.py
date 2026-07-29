@@ -859,8 +859,8 @@ class MokuWidget(QGroupBox):
 # ── Moku waveform generator + live plot (MultiInstrument mode) ─────────────────
 
 class MokuMultiSession:
-    """Wraps moku MultiInstrument: Oscilloscope (Slot1, reads Input1/Input2)
-    + WaveformGenerator (Slot2, drives Output1/Output2) sharing the device at
+    """Wraps moku MultiInstrument: Oscilloscope (Slot1, reads InputA/InputB)
+    + WaveformGenerator (Slot2, drives OutputA/OutputB) sharing the device at
     once — so a generated waveform can be watched live on the same plot via
     a loopback cable, instead of the plain single-instrument MokuSession
     above which can only do one or the other."""
@@ -879,11 +879,16 @@ class MokuMultiSession:
         self._mim = MultiInstrument(ip, force_connect=True, platform_id=2)
         self._osc = self._mim.set_instrument(1, Oscilloscope)
         self._wg  = self._mim.set_instrument(2, WaveformGenerator)
+        # Moku:Go has 2 physical analog channels, so its MultiInstrument
+        # connections API refers to them by letter (InputA/InputB,
+        # OutputA/OutputB) — the numbered Input1..4/Output1..4 forms are for
+        # Moku:Pro's 4-channel front end. Using the numbered forms here fails
+        # with "Source port is not valid in the given configuration."
         self._mim.set_connections(connections=[
-            dict(source="Input1",    destination="Slot1InA"),
-            dict(source="Input2",    destination="Slot1InB"),
-            dict(source="Slot2OutA", destination="Output1"),
-            dict(source="Slot2OutB", destination="Output2"),
+            dict(source="InputA",    destination="Slot1InA"),
+            dict(source="InputB",    destination="Slot1InB"),
+            dict(source="Slot2OutA", destination="OutputA"),
+            dict(source="Slot2OutB", destination="OutputB"),
         ])
         self._osc.set_timebase(-0.1, 0.0)
         self._osc.set_frontend(1, impedance='1MOhm', coupling='DC', range='10Vpp')
@@ -1152,8 +1157,8 @@ class MokuGenPanel(QWidget):
 
         note = QLabel(
             "MultiInstrument mode: Slot 1 = Oscilloscope\n"
-            "(Input1/2), Slot 2 = Waveform Generator\n"
-            "(Output1/2). Loop an output back to an input\n"
+            "(In A/B), Slot 2 = Waveform Generator\n"
+            "(Out A/B). Loop an output back to an input\n"
             "to see the generated waveform on the plot below.")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
