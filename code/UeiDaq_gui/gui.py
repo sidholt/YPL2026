@@ -605,6 +605,9 @@ class MokuSession:
             raise RuntimeError("moku library not installed")
         self._osc = Oscilloscope(ip, force_connect=True)
         self._osc.set_timebase(-0.1, 0.0)
+        # Single-instrument mode, so the frontend is set on the instrument and
+        # `range` is valid here — unlike MokuMultiSession below, where the
+        # frontend belongs to the platform and takes no range parameter.
         self._osc.set_frontend(1, impedance='1MOhm', coupling='DC', range='10Vpp')
         self._osc.set_frontend(2, impedance='1MOhm', coupling='DC', range='10Vpp')
         print(f"[Moku] Connected to {ip}")
@@ -930,12 +933,43 @@ class MokuMultiSession:
                   f"Slot2OutB→Output2 ({e}); continuing with Output 1 only.")
             _step("set_connections()", self._mim.set_connections, connections=base)
             self.output_channels = 1
+        # Timebase is a slot-instrument setting, so it stays on the
+        # Oscilloscope object.
         _step("set_timebase()", self._osc.set_timebase, -0.1, 0.0)
-        _step("set_frontend(1)", self._osc.set_frontend, 1,
-              impedance='1MOhm', coupling='DC', range='10Vpp')
-        _step("set_frontend(2)", self._osc.set_frontend, 2,
-              impedance='1MOhm', coupling='DC', range='10Vpp')
-        print(f"[Moku] MultiInstrument connected to {ip}")
+
+        # The frontend, by contrast, belongs to the platform in MiM:
+        # Oscilloscope.set_frontend() here fails with "Frontend parameters
+        # cannot be set on an instrument when using Multi-Instrument Mode, use
+        # mim/set_frontend". MultiInstrument.set_frontend() also has no `range`
+        # parameter (it takes attenuation/gain instead), so the single-
+        # instrument path's 10Vpp range has no equivalent here and the input
+        # range is left at the device default.
+        _step("set_frontend(1)", self._set_frontend, 1)
+        _step("set_frontend(2)", self._set_frontend, 2)
+        print(f"[Moku] MultiInstrument connected to {ip} — "
+              f"{self.output_channels} generator output(s) routed")
+
+    # Frontend kwargs tried in order, first accepted set wins. attenuation and
+    # gain are both optional and their valid values differ across Moku
+    # hardware, so the plain impedance/coupling call is preferred and the
+    # others are only fallbacks — beats hardcoding a guess that strands the
+    # whole tab on a device that wants a different one.
+    _FRONTEND_CANDIDATES = (
+        dict(impedance='1MOhm', coupling='DC'),
+        dict(impedance='1MOhm', coupling='DC', attenuation='0dB'),
+        dict(impedance='1MOhm', coupling='DC', gain='0dB'),
+    )
+
+    def _set_frontend(self, channel: int):
+        errors = []
+        for kwargs in self._FRONTEND_CANDIDATES:
+            try:
+                self._mim.set_frontend(channel, **kwargs)
+                return
+            except Exception as e:
+                errors.append(f"{kwargs} -> {e}")
+        raise RuntimeError("no accepted parameter set; tried: "
+                            + " | ".join(errors))
 
     def get_sample(self):
         """Raises on failure — the worker's poll loop decides how to react to
