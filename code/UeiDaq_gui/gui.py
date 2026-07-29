@@ -859,8 +859,8 @@ class MokuWidget(QGroupBox):
 # ── Moku waveform generator + live plot (MultiInstrument mode) ─────────────────
 
 class MokuMultiSession:
-    """Wraps moku MultiInstrument: Oscilloscope (Slot1, reads InputA/InputB)
-    + WaveformGenerator (Slot2, drives OutputA/OutputB) sharing the device at
+    """Wraps moku MultiInstrument: Oscilloscope (Slot1, reads Input1/Input2)
+    + WaveformGenerator (Slot2, drives Output1/Output2) sharing the device at
     once — so a generated waveform can be watched live on the same plot via
     a loopback cable, instead of the plain single-instrument MokuSession
     above which can only do one or the other."""
@@ -895,16 +895,32 @@ class MokuMultiSession:
                            self._mim.set_instrument, 1, Oscilloscope)
         self._wg  = _step("set_instrument(2, WaveformGenerator)",
                            self._mim.set_instrument, 2, WaveformGenerator)
-        # Moku:Go has 2 physical analog channels, so its MultiInstrument
-        # connections API refers to them by letter (InputA/InputB,
-        # OutputA/OutputB) — the numbered Input1..4/Output1..4 forms are for
-        # Moku:Pro's 4-channel front end. Using the numbered forms here fails
-        # with "Source port is not valid in the given configuration."
+
+        # Diagnostic only — printed so the console shows the device's own
+        # default/current routing state right after both slots are deployed
+        # but before we've touched it, in case that reveals which of the
+        # port-name guesses below the firmware actually expects. Never
+        # allowed to abort connect() itself.
+        try:
+            print(f"[Moku] get_connections() before wiring: {self._mim.get_connections()}")
+        except Exception as e:
+            print(f"[Moku] get_connections() diagnostic call failed (non-fatal): {e}")
+
+        # Letter-form physical port names (InputA/InputB, OutputA/OutputB)
+        # were tried first and made things worse — a generic "Cannot
+        # understand request" (the request wasn't even recognized) instead
+        # of the more specific "Source port is not valid in the given
+        # configuration" the plain numbered form below gets. That specific
+        # error — plus the official MiM API reference example — both use
+        # the numbered Input1/Input2/Output1/Output2 form, so that's what's
+        # used here; whatever in this list is still wrong should now show up
+        # as a [set_connections()]-tagged error with the device's exact
+        # complaint (see the get_connections() diagnostic above too).
         _step("set_connections()", self._mim.set_connections, connections=[
-            dict(source="InputA",    destination="Slot1InA"),
-            dict(source="InputB",    destination="Slot1InB"),
-            dict(source="Slot2OutA", destination="OutputA"),
-            dict(source="Slot2OutB", destination="OutputB"),
+            dict(source="Input1",    destination="Slot1InA"),
+            dict(source="Input2",    destination="Slot1InB"),
+            dict(source="Slot2OutA", destination="Output1"),
+            dict(source="Slot2OutB", destination="Output2"),
         ])
         _step("set_timebase()", self._osc.set_timebase, -0.1, 0.0)
         _step("set_frontend(1)", self._osc.set_frontend, 1,
@@ -1175,8 +1191,8 @@ class MokuGenPanel(QWidget):
 
         note = QLabel(
             "MultiInstrument mode: Slot 1 = Oscilloscope\n"
-            "(In A/B), Slot 2 = Waveform Generator\n"
-            "(Out A/B). Loop an output back to an input\n"
+            "(Input1/2), Slot 2 = Waveform Generator\n"
+            "(Output1/2). Loop an output back to an input\n"
             "to see the generated waveform on the plot below.")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
