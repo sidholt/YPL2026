@@ -42,11 +42,18 @@ two at a time against the same physical device)
 - Waveform Generator (Slot 2) + Oscilloscope (Slot 1) running at once, so a
   generated waveform can be watched live on the same plot via a loopback
   cable from an output back to an input
-- Per-output-channel (1/2) waveform controls: Sine/Square/Ramp/Pulse/DC/Off,
-  frequency, amplitude, offset, phase, plus duty cycle (Square/Pulse) or
-  symmetry (Ramp) — all persisted across sessions
+- Per-output waveform controls: Sine/Square/Ramp/Pulse/DC/Off, frequency,
+  amplitude, offset, phase, plus duty cycle (Square/Pulse) or symmetry
+  (Ramp) — all persisted across sessions
 - Live Ch1/Ch2 plot, ~30 Hz redraw decoupled from the network poll rate via
   a pre-allocated ring buffer (same fast-plotting approach as the CoreDAQ tab)
+- Note: on this Moku:Go, MultiInstrument slot 2 exposes only **one** output
+  (`Slot2OutA` → `Output1`); `Slot2OutB` is rejected by the device with
+  "Source port is not valid in the given configuration". The tab probes for
+  the second output on connect and, if the device refuses it, disables the
+  Output 2 controls with an explanation rather than failing to connect. If a
+  firmware revision ever exposes it, the second column enables itself with no
+  code change.
 
 **CoreDAQ Power Meter**
 - Connects over USB-serial (auto-detect or manual COM port)

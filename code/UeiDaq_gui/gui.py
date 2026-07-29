@@ -860,15 +860,20 @@ class MokuWidget(QGroupBox):
 
 class MokuMultiSession:
     """Wraps moku MultiInstrument: Oscilloscope (Slot1, reads Input1/Input2)
-    + WaveformGenerator (Slot2, drives Output1/Output2) sharing the device at
-    once — so a generated waveform can be watched live on the same plot via
-    a loopback cable, instead of the plain single-instrument MokuSession
-    above which can only do one or the other."""
+    + WaveformGenerator (Slot2, drives Output1) sharing the device at once —
+    so a generated waveform can be watched live on the same plot via a
+    loopback cable, instead of the plain single-instrument MokuSession above
+    which can only do one or the other.
+
+    `output_channels` reports how many generator outputs the device actually
+    accepted routing for (see connect) — read it after connecting to know
+    whether Output 2 is usable."""
 
     def __init__(self):
         self._mim = None
         self._osc = None
         self._wg  = None
+        self.output_channels = 0
 
     def connect(self, ip: str):
         self.disconnect()
@@ -896,32 +901,35 @@ class MokuMultiSession:
         self._wg  = _step("set_instrument(2, WaveformGenerator)",
                            self._mim.set_instrument, 2, WaveformGenerator)
 
-        # Diagnostic only — printed so the console shows the device's own
-        # default/current routing state right after both slots are deployed
-        # but before we've touched it, in case that reveals which of the
-        # port-name guesses below the firmware actually expects. Never
-        # allowed to abort connect() itself.
-        try:
-            print(f"[Moku] get_connections() before wiring: {self._mim.get_connections()}")
-        except Exception as e:
-            print(f"[Moku] get_connections() diagnostic call failed (non-fatal): {e}")
-
-        # Letter-form physical port names (InputA/InputB, OutputA/OutputB)
-        # were tried first and made things worse — a generic "Cannot
-        # understand request" (the request wasn't even recognized) instead
-        # of the more specific "Source port is not valid in the given
-        # configuration" the plain numbered form below gets. That specific
-        # error — plus the official MiM API reference example — both use
-        # the numbered Input1/Input2/Output1/Output2 form, so that's what's
-        # used here; whatever in this list is still wrong should now show up
-        # as a [set_connections()]-tagged error with the device's exact
-        # complaint (see the get_connections() diagnostic above too).
-        _step("set_connections()", self._mim.set_connections, connections=[
+        # Port naming below is the letter-suffix slot form (Slot1InA,
+        # Slot2OutA) plus numbered physical ports (Input1, Output1) — verified
+        # against this Moku:Go by probing each connection individually. The
+        # device distinguishes two failure modes, which is what pinned this
+        # down: an unrecognized name (Slot2Out1, InputA, Slot1In1) gives
+        # "Cannot understand request", while a recognized-but-unavailable one
+        # gives "Source port is not valid in the given configuration".
+        #
+        # Slot 2 exposes only ONE output (Slot2OutA) on this platform —
+        # Slot2OutB draws the latter error. Since set_connections() applies
+        # the list atomically, that one bad entry used to fail the whole
+        # wiring call, leaving the tab unusable. So the second output is
+        # attempted and dropped if refused, rather than assumed either way:
+        # the fallback keeps working if a firmware/platform revision changes
+        # how many slot outputs exist, in either direction.
+        base = [
             dict(source="Input1",    destination="Slot1InA"),
             dict(source="Input2",    destination="Slot1InB"),
             dict(source="Slot2OutA", destination="Output1"),
-            dict(source="Slot2OutB", destination="Output2"),
-        ])
+        ]
+        second_out = dict(source="Slot2OutB", destination="Output2")
+        try:
+            self._mim.set_connections(connections=base + [second_out])
+            self.output_channels = 2
+        except Exception as e:
+            print("[Moku] Output 2 unavailable — the device refused "
+                  f"Slot2OutB→Output2 ({e}); continuing with Output 1 only.")
+            _step("set_connections()", self._mim.set_connections, connections=base)
+            self.output_channels = 1
         _step("set_timebase()", self._osc.set_timebase, -0.1, 0.0)
         _step("set_frontend(1)", self._osc.set_frontend, 1,
               impedance='1MOhm', coupling='DC', range='10Vpp')
@@ -945,6 +953,12 @@ class MokuMultiSession:
                       duty: float, symmetry: float):
         if self._wg is None:
             raise RuntimeError("not connected")
+        if channel > self.output_channels:
+            # The generator itself would accept this, but the channel has no
+            # routed path to a physical output (see connect), so it would
+            # silently generate into nothing.
+            raise RuntimeError(
+                f"Output {channel} has no routed physical output on this device")
         if wf_type == "Off":
             self._wg.generate_waveform(channel=channel, type="Off")
             return
@@ -968,6 +982,7 @@ class MokuMultiSession:
         self._mim = None
         self._osc = None
         self._wg  = None
+        self.output_channels = 0
 
     @property
     def connected(self):
@@ -989,7 +1004,7 @@ class MokuGenWorker(QObject):
     of a Python list .append()/.pop(0) — the GUI's independent redraw timer
     reads it back out via get_display_data(), a zero-allocation call.
     """
-    connected    = pyqtSignal()
+    connected    = pyqtSignal(int)             # number of usable generator outputs
     connect_err  = pyqtSignal(str)
     lost         = pyqtSignal()
     label_update = pyqtSignal(float, float)   # throttled Ch1/Ch2 numeric readout
@@ -1027,7 +1042,7 @@ class MokuGenWorker(QObject):
         self.plot_filled        = 0
         self._last_label_emit_t = 0.0
         self._err_count         = 0
-        self.connected.emit()
+        self.connected.emit(self.session.output_channels)
         self._polling = True
         QTimer.singleShot(0, self._poll)
 
@@ -1191,9 +1206,10 @@ class MokuGenPanel(QWidget):
 
         note = QLabel(
             "MultiInstrument mode: Slot 1 = Oscilloscope\n"
-            "(Input1/2), Slot 2 = Waveform Generator\n"
-            "(Output1/2). Loop an output back to an input\n"
-            "to see the generated waveform on the plot below.")
+            "(reads Input1/2), Slot 2 = Waveform\n"
+            "Generator (drives Output1). Loop an output\n"
+            "back to an input to see the generated\n"
+            "waveform on the plot below.")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
         conn_lay.addWidget(note, 4, 0, 1, 2)
@@ -1271,13 +1287,27 @@ class MokuGenPanel(QWidget):
             apply_btn.clicked.connect(lambda _, c=ch - 1: self._apply_waveform(c))
             gen_lay.addWidget(apply_btn, 7, 0, 1, 2)
 
-            gen_lay.setRowStretch(8, 1)
+            # Shown only if the device reports no routed path for this output
+            # (see _on_connected) — otherwise the greyed-out controls would
+            # look like a bug rather than a hardware limit.
+            unavailable_lbl = QLabel(
+                "Not available: this device's second\n"
+                "MultiInstrument slot exposes only one\n"
+                "output, so there's no physical\n"
+                "connector to route this channel to.")
+            unavailable_lbl.setWordWrap(True)
+            unavailable_lbl.setStyleSheet(f"color: {C_GOLD}; font-size: 10px;")
+            unavailable_lbl.setVisible(False)
+            gen_lay.addWidget(unavailable_lbl, 8, 0, 1, 2)
+
+            gen_lay.setRowStretch(9, 1)
             root.addWidget(gen_box)
 
             self._ch_widgets.append(dict(
                 type=type_combo, freq=freq_spin, amplitude=amp_spin,
                 offset=offset_spin, phase=phase_spin, duty=duty_spin,
-                symmetry=sym_spin, apply_btn=apply_btn))
+                symmetry=sym_spin, apply_btn=apply_btn,
+                unavailable_lbl=unavailable_lbl))
 
         # ── Bottom: live readout + plot ─────────────────────────────────────
         plot_box = QGroupBox("Live Readback (Input1 / Input2)")
@@ -1343,12 +1373,19 @@ class MokuGenPanel(QWidget):
         self._connect_btn.setText("Connect")
         self._disconnect_btn.setEnabled(False)
         self._ip_edit.setEnabled(True)
+        # Re-enable the parameter fields so they're editable while
+        # disconnected (only Apply needs a live connection); the per-channel
+        # availability note is re-evaluated on the next connect.
         for cw in self._ch_widgets:
             cw["apply_btn"].setEnabled(False)
+            cw["unavailable_lbl"].setVisible(False)
+            for key in ("type", "freq", "amplitude", "offset",
+                        "phase", "duty", "symmetry"):
+                cw[key].setEnabled(True)
         self._ch1_lbl.setText("Ch1:  — V")
         self._ch2_lbl.setText("Ch2:  — V")
 
-    def _on_connected(self):
+    def _on_connected(self, output_channels: int):
         self._connected = True
         self._status_lbl.setText("CONNECTED")
         self._status_lbl.setStyleSheet(f"color: {C_GREEN}; font-weight: bold;")
@@ -1356,8 +1393,20 @@ class MokuGenPanel(QWidget):
         self._connect_btn.setEnabled(False)
         self._disconnect_btn.setEnabled(True)
         self._ip_edit.setEnabled(False)
-        for cw in self._ch_widgets:
-            cw["apply_btn"].setEnabled(True)
+        # Only enable the outputs the device actually routed to a physical
+        # connector (see MokuMultiSession.connect) — on this Moku:Go slot 2
+        # exposes one output, so Output 2's controls stay greyed out with the
+        # reason spelled out rather than looking like they should work.
+        for i, cw in enumerate(self._ch_widgets):
+            usable = (i + 1) <= output_channels
+            cw["apply_btn"].setEnabled(usable)
+            cw["unavailable_lbl"].setVisible(not usable)
+            for key in ("type", "freq", "amplitude", "offset",
+                        "phase", "duty", "symmetry"):
+                cw[key].setEnabled(usable)
+        if output_channels < len(self._ch_widgets):
+            print(f"[Moku] Only {output_channels} generator output(s) routed — "
+                  "the rest are disabled in the UI.")
         if HAS_PYQTGRAPH:
             for curve in self._live_curves:
                 curve.setData([], [])
