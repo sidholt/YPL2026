@@ -19,5 +19,13 @@
   "santec_fast_sweep_power_mw": 10.0,
   "itla_power_mw": 10.0,
   "itla_sweep_step_ghz": 100.0,
-  "coredaq_wavelength_nm": 1550.0
+  "coredaq_wavelength_nm": 1550.0,
+  "tab_order": [
+    "CoreDAQ Power Meter",
+    "DAQ Control",
+    "ITLA Laser",
+    "Santec Laser",
+    "HP-8168F Laser",
+    "CONEX Motor"
+  ]
 }

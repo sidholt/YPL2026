@@ -59,7 +59,7 @@ except ImportError:
     print("[WARNING] matplotlib not found — Santec Fast Sweep plot disabled. Run: uv pip install matplotlib")
 
 try:
-    from moku.instruments import Oscilloscope
+    from moku.instruments import Oscilloscope, MultiInstrument, WaveformGenerator
     HAS_MOKU = True
 except ImportError:
     HAS_MOKU = False
@@ -573,6 +573,18 @@ MOKU_PLOT_WINDOW_S     = 10.0
 MOKU_POLL_MS           = 100
 MOKU_SHUNT_OHMS        = 100.0
 
+# Moku "Waveform Gen" tab (MultiInstrument: Oscilloscope + WaveformGenerator
+# sharing the device at once). Poll loop is self-pacing (like CoreDAQWorker's
+# do_poll) rather than a fixed-interval timer, and the ring buffer + decimated
+# independent redraw timer follow the same pattern CoreDAQPanel uses — a fixed
+# timer racing ahead of the actual network round-trip, plus a Python list
+# .append()/.pop(0) history and re-rendering every point every redraw, is what
+# made that tab's live plot stutter under load before it was rewritten.
+MOKU_GEN_POLL_INTERVAL_MS = 15     # floor between get_data() round trips
+MOKU_GEN_PLOT_WINDOW_S    = 10.0
+MOKU_GEN_DISPLAY_MS       = 33     # ~30 Hz plot redraw, decoupled from poll rate
+MOKU_GEN_MAX_PLOT_POINTS  = 1500   # cap points handed to pyqtgraph per curve per redraw
+
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 COREDAQ_PLOT_WINDOW_S  = 30.0
@@ -840,6 +852,553 @@ class MokuWidget(QGroupBox):
     def cleanup(self):
         self._worker.stop_polling()
         self._worker.session.disconnect()
+        self._thread.quit()
+        self._thread.wait(2000)
+
+
+# ── Moku waveform generator + live plot (MultiInstrument mode) ─────────────────
+
+class MokuMultiSession:
+    """Wraps moku MultiInstrument: Oscilloscope (Slot1, reads Input1/Input2)
+    + WaveformGenerator (Slot2, drives Output1/Output2) sharing the device at
+    once — so a generated waveform can be watched live on the same plot via
+    a loopback cable, instead of the plain single-instrument MokuSession
+    above which can only do one or the other."""
+
+    def __init__(self):
+        self._mim = None
+        self._osc = None
+        self._wg  = None
+
+    def connect(self, ip: str):
+        self.disconnect()
+        if not HAS_MOKU:
+            raise RuntimeError("moku library not installed")
+        # platform_id=2 selects the 2-slot MultiInstrument mode Moku:Go
+        # supports (Moku:Pro has 4 slots and would use a different id).
+        self._mim = MultiInstrument(ip, force_connect=True, platform_id=2)
+        self._osc = self._mim.set_instrument(1, Oscilloscope)
+        self._wg  = self._mim.set_instrument(2, WaveformGenerator)
+        self._mim.set_connections(connections=[
+            dict(source="Input1",    destination="Slot1InA"),
+            dict(source="Input2",    destination="Slot1InB"),
+            dict(source="Slot2OutA", destination="Output1"),
+            dict(source="Slot2OutB", destination="Output2"),
+        ])
+        self._osc.set_timebase(-0.1, 0.0)
+        self._osc.set_frontend(1, impedance='1MOhm', coupling='DC', range='10Vpp')
+        self._osc.set_frontend(2, impedance='1MOhm', coupling='DC', range='10Vpp')
+        print(f"[Moku] MultiInstrument connected to {ip}")
+
+    def get_sample(self):
+        """Raises on failure — the worker's poll loop decides how to react to
+        that (retry vs. give up), same split as CoreDAQWorker._call() leaving
+        errors to do_poll()."""
+        if self._osc is None:
+            raise RuntimeError("not connected")
+        data = self._osc.get_data()
+        ch1 = float(np.mean(data['ch1'])) if data.get('ch1') else 0.0
+        ch2 = float(np.mean(data['ch2'])) if data.get('ch2') else 0.0
+        return (ch1, ch2)
+
+    def set_waveform(self, channel: int, wf_type: str, amplitude: float,
+                      frequency: float, offset: float, phase: float,
+                      duty: float, symmetry: float):
+        if self._wg is None:
+            raise RuntimeError("not connected")
+        if wf_type == "Off":
+            self._wg.generate_waveform(channel=channel, type="Off")
+            return
+        if wf_type == "DC":
+            self._wg.generate_waveform(channel=channel, type="DC", offset=offset)
+            return
+        kwargs = dict(channel=channel, type=wf_type, amplitude=amplitude,
+                      frequency=frequency, offset=offset, phase=phase)
+        if wf_type == "Square":
+            kwargs["duty"] = duty
+        elif wf_type == "Ramp":
+            kwargs["symmetry"] = symmetry
+        self._wg.generate_waveform(**kwargs)
+
+    def disconnect(self):
+        try:
+            if self._mim is not None:
+                self._mim.relinquish_ownership()
+        except Exception:
+            pass
+        self._mim = None
+        self._osc = None
+        self._wg  = None
+
+    @property
+    def connected(self):
+        return self._mim is not None
+
+
+class MokuGenWorker(QObject):
+    """
+    Runs on a QThread — same split as CoreDAQWorker: blocking Moku network
+    calls (connect, generate_waveform, and the poll loop's get_data() round
+    trips) never touch the GUI thread.
+
+    The poll loop is self-pacing rather than a fixed-interval QTimer, for the
+    same reason CoreDAQWorker.do_poll is: a timer firing faster than the
+    network round-trip actually completes would queue up an ever-growing
+    backlog of pending polls, which is what made CoreDAQ's live plot
+    stutter/freeze under load before that was rewritten. Each tick's sample
+    goes into a pre-allocated numpy ring buffer (O(1) circular write) instead
+    of a Python list .append()/.pop(0) — the GUI's independent redraw timer
+    reads it back out via get_display_data(), a zero-allocation call.
+    """
+    connected    = pyqtSignal()
+    connect_err  = pyqtSignal(str)
+    lost         = pyqtSignal()
+    label_update = pyqtSignal(float, float)   # throttled Ch1/Ch2 numeric readout
+    waveform_err = pyqtSignal(int, str)        # channel, message
+
+    LABEL_HZ           = 10.0   # wall-clock throttle for the numeric Ch1/Ch2 labels
+    MAX_CONSEC_ERRORS   = 20    # give up after this many back-to-back poll failures
+
+    def __init__(self):
+        super().__init__()
+        self.session  = MokuMultiSession()
+        self._polling = False
+        self._last_label_emit_t = 0.0
+        self._err_count = 0
+
+        # Pre-allocated, fixed-size, circular — sized generously for
+        # MOKU_GEN_PLOT_WINDOW_S at up to ~1 kHz; the actual achieved poll
+        # rate (capped by network round-trip time) fills a smaller fraction
+        # of it, which is fine.
+        self.plot_buffer_len   = max(2, int(MOKU_GEN_PLOT_WINDOW_S * 1000))
+        self.plot_buffer       = np.zeros((2, self.plot_buffer_len), dtype=np.float32)
+        self.plot_time_buffer  = np.zeros(self.plot_buffer_len, dtype=np.float64)
+        self.plot_write_index  = 0
+        self.plot_filled       = 0
+        self._display_buf      = np.zeros((2, self.plot_buffer_len), dtype=np.float32)
+        self._display_time_buf = np.zeros(self.plot_buffer_len, dtype=np.float64)
+
+    def do_connect(self, ip: str):
+        try:
+            self.session.connect(ip)
+        except Exception as e:
+            self.connect_err.emit(str(e))
+            return
+        self.plot_write_index   = 0
+        self.plot_filled        = 0
+        self._last_label_emit_t = 0.0
+        self._err_count         = 0
+        self.connected.emit()
+        self._polling = True
+        QTimer.singleShot(0, self._poll)
+
+    def do_disconnect(self):
+        self._polling = False
+        self.session.disconnect()
+
+    def do_set_waveform(self, channel: int, wf_type: str, amplitude: float,
+                         frequency: float, offset: float, phase: float,
+                         duty: float, symmetry: float):
+        try:
+            self.session.set_waveform(channel, wf_type, amplitude, frequency,
+                                       offset, phase, duty, symmetry)
+        except Exception as e:
+            self.waveform_err.emit(channel, str(e))
+
+    def _poll(self):
+        if not self._polling:
+            return
+        try:
+            ch1, ch2 = self.session.get_sample()
+            now = time.monotonic()
+            self.plot_buffer[0, self.plot_write_index] = ch1
+            self.plot_buffer[1, self.plot_write_index] = ch2
+            self.plot_time_buffer[self.plot_write_index] = now
+            self.plot_write_index = (self.plot_write_index + 1) % self.plot_buffer_len
+            if self.plot_filled < self.plot_buffer_len:
+                self.plot_filled += 1
+
+            if (now - self._last_label_emit_t) >= (1.0 / self.LABEL_HZ):
+                self._last_label_emit_t = now
+                self.label_update.emit(ch1, ch2)
+            self._err_count = 0
+        except Exception as e:
+            self._err_count += 1
+            if self._err_count == 1 or self._err_count % 200 == 0:
+                print(f"[Moku] poll error (×{self._err_count}): {e}")
+            # A handful of consecutive failures means the device is actually
+            # gone (unplugged, IP changed) rather than one transient network
+            # hiccup — give up and let the UI show it as disconnected instead
+            # of retrying forever against a dead connection.
+            if self._err_count >= self.MAX_CONSEC_ERRORS:
+                self._polling = False
+                self.lost.emit()
+                return
+        finally:
+            if self._polling:
+                QTimer.singleShot(MOKU_GEN_POLL_INTERVAL_MS, self._poll)
+
+    def get_display_data(self):
+        """Ring buffer stitched chronologically (oldest first) into
+        pre-allocated scratch buffers — no allocation on this hot path,
+        called directly (not via a queued signal) by the GUI's independent
+        display-refresh timer. Same approach as CoreDAQWorker.get_display_data."""
+        count = self.plot_filled
+        if count == 0:
+            return self._display_buf, self._display_time_buf, 0
+
+        N    = self.plot_buffer_len
+        widx = self.plot_write_index
+
+        if count >= N:
+            if widx == 0:
+                np.copyto(self._display_buf, self.plot_buffer)
+                np.copyto(self._display_time_buf, self.plot_time_buffer)
+            else:
+                self._display_buf[:, :N - widx] = self.plot_buffer[:, widx:]
+                self._display_buf[:, N - widx:] = self.plot_buffer[:, :widx]
+                self._display_time_buf[:N - widx] = self.plot_time_buffer[widx:]
+                self._display_time_buf[N - widx:] = self.plot_time_buffer[:widx]
+        else:
+            np.copyto(self._display_buf[:, :count], self.plot_buffer[:, :count])
+            np.copyto(self._display_time_buf[:count], self.plot_time_buffer[:count])
+
+        return self._display_buf, self._display_time_buf, count
+
+
+class MokuGenPanel(QWidget):
+    """
+    Top-level "Moku" tab — waveform generation + live plotting on the same
+    Moku:Go at once, via MultiInstrument mode (Oscilloscope + Waveform
+    Generator sharing the device instead of one at a time). Separate from
+    the read-only "Moku:Go — Live Readback" box embedded in DAQ Control
+    (which uses the plain single-instrument MokuSession/MokuWidget above) —
+    only connect one of the two at a time against the same physical device.
+    """
+
+    _sig_connect    = pyqtSignal(str)
+    _sig_disconnect = pyqtSignal()
+    _sig_set_wf     = pyqtSignal(int, str, float, float, float, float, float, float)
+
+    WAVEFORM_TYPES = ["Sine", "Square", "Ramp", "Pulse", "DC", "Off"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._connected = False
+
+        if not HAS_MOKU:
+            lay = QVBoxLayout(self)
+            lay.addWidget(QLabel(
+                "moku library is not installed.\nRun: uv pip install moku\nthen restart the GUI."))
+            return
+
+        self._worker = MokuGenWorker()
+        self._thread = QThread()
+        self._worker.moveToThread(self._thread)
+        self._thread.start()
+
+        self._sig_connect.connect(self._worker.do_connect)
+        self._sig_disconnect.connect(self._worker.do_disconnect)
+        self._sig_set_wf.connect(self._worker.do_set_waveform)
+
+        self._worker.connected.connect(self._on_connected)
+        self._worker.connect_err.connect(self._on_connect_err)
+        self._worker.lost.connect(self._on_lost)
+        self._worker.label_update.connect(self._on_label_update)
+        self._worker.waveform_err.connect(self._on_waveform_err)
+
+        # Independent redraw timer — reads the worker's ring buffer directly
+        # (get_display_data() is a plain, allocation-free method call, not a
+        # queued signal), same split CoreDAQPanel uses so plot refresh rate
+        # never depends on how fast the network link can sustain _poll() ticks.
+        self._display_timer = QTimer()
+        self._display_timer.setInterval(MOKU_GEN_DISPLAY_MS)
+        self._display_timer.timeout.connect(self._update_live_plot)
+
+        self._build_ui()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        final = QVBoxLayout(self)
+        final.setContentsMargins(10, 10, 10, 10)
+
+        root = QHBoxLayout()
+        root.setSpacing(12)
+        final.addLayout(root)
+
+        # ── Left: connection ────────────────────────────────────────────────
+        conn_box = QGroupBox("Connection")
+        conn_lay = QGridLayout(conn_box)
+
+        conn_lay.addWidget(QLabel("Status:"), 0, 0)
+        self._status_lbl = QLabel("DISCONNECTED")
+        self._status_lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+        conn_lay.addWidget(self._status_lbl, 0, 1)
+
+        conn_lay.addWidget(QLabel("IP:"), 1, 0)
+        self._ip_edit = QLineEdit(load_connection_settings().get("moku_ip", MOKU_IP))
+        self._ip_edit.setPlaceholderText("e.g. 192.168.73.1")
+        conn_lay.addWidget(self._ip_edit, 1, 1)
+
+        self._connect_btn = QPushButton("Connect")
+        self._connect_btn.clicked.connect(self._do_connect)
+        conn_lay.addWidget(self._connect_btn, 2, 0, 1, 2)
+
+        self._disconnect_btn = QPushButton("DISCONNECT")
+        self._disconnect_btn.setEnabled(False)
+        self._disconnect_btn.clicked.connect(self._do_disconnect)
+        conn_lay.addWidget(self._disconnect_btn, 3, 0, 1, 2)
+
+        note = QLabel(
+            "MultiInstrument mode: Slot 1 = Oscilloscope\n"
+            "(Input1/2), Slot 2 = Waveform Generator\n"
+            "(Output1/2). Loop an output back to an input\n"
+            "to see the generated waveform on the plot below.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        conn_lay.addWidget(note, 4, 0, 1, 2)
+
+        conn_lay.setRowStretch(5, 1)
+        root.addWidget(conn_box)
+
+        # ── Right: generator, one column per output channel ────────────────
+        self._ch_widgets = []   # index 0/1 -> Output 1/2, each a dict of controls
+        for ch in (1, 2):
+            gen_box = QGroupBox(f"Output {ch}")
+            gen_lay = QGridLayout(gen_box)
+
+            gen_lay.addWidget(QLabel("Waveform:"), 0, 0)
+            type_combo = QComboBox()
+            type_combo.addItems(self.WAVEFORM_TYPES)
+            type_key = f"moku_gen_ch{ch}_type"
+            saved_type = load_connection_settings().get(type_key)
+            if saved_type in self.WAVEFORM_TYPES:
+                type_combo.setCurrentText(saved_type)
+            type_combo.currentTextChanged.connect(
+                lambda t, k=type_key: save_connection_setting(k, t))
+            gen_lay.addWidget(type_combo, 0, 1)
+
+            gen_lay.addWidget(QLabel("Frequency (Hz):"), 1, 0)
+            freq_spin = NoScrollDoubleSpinBox()
+            freq_spin.setDecimals(1)
+            freq_spin.setRange(0.001, 30_000_000.0)
+            freq_spin.setValue(1000.0)
+            persist_spinbox(freq_spin, f"moku_gen_ch{ch}_freq_hz")
+            gen_lay.addWidget(freq_spin, 1, 1)
+
+            gen_lay.addWidget(QLabel("Amplitude (Vpp):"), 2, 0)
+            amp_spin = NoScrollDoubleSpinBox()
+            amp_spin.setDecimals(3)
+            amp_spin.setRange(0.0, 10.0)
+            amp_spin.setValue(1.0)
+            persist_spinbox(amp_spin, f"moku_gen_ch{ch}_amplitude_vpp")
+            gen_lay.addWidget(amp_spin, 2, 1)
+
+            gen_lay.addWidget(QLabel("Offset (V):"), 3, 0)
+            offset_spin = NoScrollDoubleSpinBox()
+            offset_spin.setDecimals(3)
+            offset_spin.setRange(-5.0, 5.0)
+            offset_spin.setValue(0.0)
+            persist_spinbox(offset_spin, f"moku_gen_ch{ch}_offset_v")
+            gen_lay.addWidget(offset_spin, 3, 1)
+
+            gen_lay.addWidget(QLabel("Phase (deg):"), 4, 0)
+            phase_spin = NoScrollDoubleSpinBox()
+            phase_spin.setDecimals(1)
+            phase_spin.setRange(-360.0, 360.0)
+            phase_spin.setValue(0.0)
+            persist_spinbox(phase_spin, f"moku_gen_ch{ch}_phase_deg")
+            gen_lay.addWidget(phase_spin, 4, 1)
+
+            gen_lay.addWidget(QLabel("Duty (%) [Square/Pulse]:"), 5, 0)
+            duty_spin = NoScrollDoubleSpinBox()
+            duty_spin.setDecimals(1)
+            duty_spin.setRange(0.1, 99.9)
+            duty_spin.setValue(50.0)
+            persist_spinbox(duty_spin, f"moku_gen_ch{ch}_duty_pct")
+            gen_lay.addWidget(duty_spin, 5, 1)
+
+            gen_lay.addWidget(QLabel("Symmetry (%) [Ramp]:"), 6, 0)
+            sym_spin = NoScrollDoubleSpinBox()
+            sym_spin.setDecimals(1)
+            sym_spin.setRange(0.1, 99.9)
+            sym_spin.setValue(50.0)
+            persist_spinbox(sym_spin, f"moku_gen_ch{ch}_symmetry_pct")
+            gen_lay.addWidget(sym_spin, 6, 1)
+
+            apply_btn = QPushButton(f"Apply to Output {ch}")
+            apply_btn.setEnabled(False)
+            apply_btn.clicked.connect(lambda _, c=ch - 1: self._apply_waveform(c))
+            gen_lay.addWidget(apply_btn, 7, 0, 1, 2)
+
+            gen_lay.setRowStretch(8, 1)
+            root.addWidget(gen_box)
+
+            self._ch_widgets.append(dict(
+                type=type_combo, freq=freq_spin, amplitude=amp_spin,
+                offset=offset_spin, phase=phase_spin, duty=duty_spin,
+                symmetry=sym_spin, apply_btn=apply_btn))
+
+        # ── Bottom: live readout + plot ─────────────────────────────────────
+        plot_box = QGroupBox("Live Readback (Input1 / Input2)")
+        plot_lay = QVBoxLayout(plot_box)
+
+        top_row = QHBoxLayout()
+        self._show_plot_chk = QCheckBox("Show live plot")
+        self._show_plot_chk.setChecked(True)
+        self._show_plot_chk.toggled.connect(self._on_show_plot_toggled)
+        top_row.addWidget(self._show_plot_chk)
+        top_row.addSpacing(20)
+        self._ch1_lbl = QLabel("Ch1:  — V")
+        self._ch2_lbl = QLabel("Ch2:  — V")
+        for lbl in (self._ch1_lbl, self._ch2_lbl):
+            lbl.setMinimumWidth(110)
+        top_row.addWidget(self._ch1_lbl)
+        top_row.addWidget(self._ch2_lbl)
+        top_row.addStretch()
+        plot_lay.addLayout(top_row)
+
+        if HAS_PYQTGRAPH:
+            self._plot_widget = pg.PlotWidget()
+            self._plot_widget.setLabel('left',   'Voltage', units='V')
+            self._plot_widget.setLabel('bottom', 'Time',    units='s')
+            self._plot_widget.setMinimumHeight(220)
+            self._plot_widget.addLegend()
+            self._live_curves = [
+                self._plot_widget.plot([], [], pen=pg.mkPen(C_BLUE, width=2), name='Ch1'),
+                self._plot_widget.plot([], [], pen=pg.mkPen(C_RED,  width=2), name='Ch2'),
+            ]
+            plot_lay.addWidget(self._plot_widget)
+        else:
+            self._live_curves = []
+            plot_lay.addWidget(QLabel(
+                "(install pyqtgraph to enable live plot: uv pip install pyqtgraph)"))
+
+        final.addWidget(plot_box)
+
+    # ── connect / disconnect ─────────────────────────────────────────────────
+
+    def _status(self, msg: str):
+        w = self.window()
+        if hasattr(w, "status_bar"):
+            w.status_bar.showMessage(msg)
+
+    def _do_connect(self):
+        ip = self._ip_edit.text().strip()
+        if not ip:
+            self._status("Enter a Moku IP address first")
+            return
+        save_connection_setting("moku_ip", ip)
+        self._connect_btn.setEnabled(False)
+        self._connect_btn.setText("Connecting…")
+        self._sig_connect.emit(ip)
+
+    def _do_disconnect(self):
+        self._sig_disconnect.emit()
+        self._display_timer.stop()
+        self._connected = False
+        self._status_lbl.setText("DISCONNECTED")
+        self._status_lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
+        self._connect_btn.setEnabled(True)
+        self._connect_btn.setText("Connect")
+        self._disconnect_btn.setEnabled(False)
+        self._ip_edit.setEnabled(True)
+        for cw in self._ch_widgets:
+            cw["apply_btn"].setEnabled(False)
+        self._ch1_lbl.setText("Ch1:  — V")
+        self._ch2_lbl.setText("Ch2:  — V")
+
+    def _on_connected(self):
+        self._connected = True
+        self._status_lbl.setText("CONNECTED")
+        self._status_lbl.setStyleSheet(f"color: {C_GREEN}; font-weight: bold;")
+        self._connect_btn.setText("Connect")
+        self._connect_btn.setEnabled(False)
+        self._disconnect_btn.setEnabled(True)
+        self._ip_edit.setEnabled(False)
+        for cw in self._ch_widgets:
+            cw["apply_btn"].setEnabled(True)
+        if HAS_PYQTGRAPH:
+            for curve in self._live_curves:
+                curve.setData([], [])
+        if self._show_plot_chk.isChecked():
+            self._display_timer.start()
+        self._status(f"Moku connected — {self._ip_edit.text().strip()}")
+
+    def _on_connect_err(self, msg: str):
+        self._connect_btn.setEnabled(True)
+        self._connect_btn.setText("Connect")
+        print(f"[Moku] Connect error: {msg}")
+        self._status(f"Moku connect error: {msg}")
+
+    def _on_lost(self):
+        print("[Moku] Connection lost")
+        self._status("Moku connection lost")
+        self._do_disconnect()
+
+    # ── waveform generator ───────────────────────────────────────────────────
+
+    def _apply_waveform(self, ch_idx: int):
+        cw = self._ch_widgets[ch_idx]
+        self._sig_set_wf.emit(
+            ch_idx + 1, cw["type"].currentText(),
+            cw["amplitude"].value(), cw["freq"].value(), cw["offset"].value(),
+            cw["phase"].value(), cw["duty"].value(), cw["symmetry"].value())
+
+    def _on_waveform_err(self, channel: int, msg: str):
+        print(f"[Moku] set_waveform error (Output {channel}): {msg}")
+        self._status(f"Moku Output {channel} error: {msg}")
+
+    # ── live plot ─────────────────────────────────────────────────────────────
+
+    def _on_label_update(self, ch1_v: float, ch2_v: float):
+        self._ch1_lbl.setText(f"Ch1:  {ch1_v:+.4f} V")
+        self._ch2_lbl.setText(f"Ch2:  {ch2_v:+.4f} V")
+
+    def _on_show_plot_toggled(self, checked: bool):
+        """Same pattern as CoreDAQPanel: stop the redraw timer while the plot
+        is hidden so the tab does zero plotting work, without touching the
+        poll loop that keeps feeding the ring buffer underneath."""
+        if HAS_PYQTGRAPH:
+            self._plot_widget.setVisible(checked)
+        if checked and self._connected:
+            for curve in self._live_curves:
+                curve.setData([], [])
+            self._display_timer.start()
+        else:
+            self._display_timer.stop()
+
+    def _update_live_plot(self):
+        """Independent ~30 Hz redraw timer — pulls whatever the worker's ring
+        buffer currently holds, decimates to MOKU_GEN_MAX_PLOT_POINTS before
+        handing anything to pyqtgraph, and never blocks on the network poll
+        rate. Same approach as CoreDAQPanel._update_live_plot."""
+        if not HAS_PYQTGRAPH or not self._connected:
+            return
+        data, times, count = self._worker.get_display_data()
+        if count <= 0:
+            return
+        times = times[:count]
+        rel = times - time.monotonic()
+        mask = rel >= -MOKU_GEN_PLOT_WINDOW_S
+        rel = rel[mask]
+        if rel.size == 0:
+            return
+        mask_idx = np.nonzero(mask)[0]
+        if rel.size > MOKU_GEN_MAX_PLOT_POINTS:
+            step = rel.size // MOKU_GEN_MAX_PLOT_POINTS
+            rel = rel[::step]
+            mask_idx = mask_idx[::step]
+        for ch, curve in enumerate(self._live_curves):
+            y = data[ch, :count][mask_idx]
+            curve.setData(rel, y, connect='all')
+
+    def cleanup(self):
+        if not HAS_MOKU:
+            return
+        self._display_timer.stop()
+        self._sig_disconnect.emit()
         self._thread.quit()
         self._thread.wait(2000)
 
@@ -1972,7 +2531,7 @@ class PinConfigView(QWidget):
                 # that's the one useful thing this pin is still good for.
                 lbl.setStyleSheet(f"color: {C_GOLD}; font-weight: bold;")
                 native = native_pins.get(i)
-                lbl.setText(f"AOut {i:02d} → gnd {native}" if native is not None
+                lbl.setText(f"AOut {i:02d} → pin {native}" if native is not None
                             else f"AOut {i:02d}")
             else:
                 # Working — no annotation needed, it just does what it says.
@@ -1981,7 +2540,7 @@ class PinConfigView(QWidget):
 
         if dead_info is not None and 1 in dead_info:
             self._aout1_warning_lbl.setText(
-                f"⚠ Do not drive AOut 1")
+                f"")
             self._aout1_warning_lbl.setVisible(True)
         else:
             self._aout1_warning_lbl.setText("")
@@ -7479,7 +8038,7 @@ class DetachedWindow(QMainWindow):
         event.accept()
 
 
-DEFAULT_TAB_ORDER = ["DAQ Control", "CoreDAQ Power Meter", "Santec Laser",
+DEFAULT_TAB_ORDER = ["DAQ Control", "Moku", "CoreDAQ Power Meter", "Santec Laser",
                       "ITLA Laser", "HP-8168F Laser", "CONEX Motor"]
 
 
@@ -7489,6 +8048,7 @@ class UnifiedMainWindow(QMainWindow):
         self.setWindowTitle("YPL Lab Control")
 
         self.daq_panel     = DAQPanel()
+        self.moku_gen_panel = MokuGenPanel()
         self.itla_panel    = ITLAPanel()
         self.conex_panel   = ConexDualPanel()
         self.hp8168f_panel = HP8168FPanel()
@@ -7513,6 +8073,7 @@ class UnifiedMainWindow(QMainWindow):
 
         panels_by_title = {
             "DAQ Control":         self.daq_panel,
+            "Moku":                self.moku_gen_panel,
             "CoreDAQ Power Meter": self.coredaq_panel,
             "Santec Laser":        self.santec_panel,
             "ITLA Laser":          self.itla_panel,
@@ -7774,6 +8335,7 @@ class UnifiedMainWindow(QMainWindow):
         for win in list(self._detached.values()):
             win.close()
         self.daq_panel.cleanup()
+        self.moku_gen_panel.cleanup()
         self.itla_panel.cleanup()
         self.conex_panel.cleanup()
         self.hp8168f_panel.cleanup()

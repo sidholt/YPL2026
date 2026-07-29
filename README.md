@@ -4,12 +4,12 @@
 > Youngblood Photonics Lab (YPL), University of Pittsburgh.
 
 A Windows PyQt6 application for controlling the lab's optical/DAQ hardware
-from one window: UEI PowerDNA analog output cards, a CoreDAQ USB optical
-power meter, a Santec TSL-550 tunable laser, a Newport CONEX-CC motor stage,
-an Emcore ITLA laser controller, and an HP/Agilent 8168F tunable laser —
-each on its own tab, each degrading gracefully (tab stays visible with a
-message instead of crashing the app) if its hardware library isn't installed
-or its instrument isn't connected.
+from one window: UEI PowerDNA analog output cards, a Moku:Go, a CoreDAQ USB
+optical power meter, a Santec TSL-550 tunable laser, a Newport CONEX-CC motor
+stage, an Emcore ITLA laser controller, and an HP/Agilent 8168F tunable
+laser — each on its own tab, each degrading gracefully (tab stays visible
+with a message instead of crashing the app) if its hardware library isn't
+installed or its instrument isn't connected.
 
 ## Features
 
@@ -35,6 +35,18 @@ or its instrument isn't connected.
   path (Set, Write All, Set All To, ramp, sweep, wave) goes through the same
   correction. See `pin_identify_test.py` (below) to work out a card's actual
   mapping.
+
+**Moku** (Moku:Go, via MultiInstrument mode — separate from the read-only
+oscilloscope panel embedded in the DAQ Control tab; only connect one of the
+two at a time against the same physical device)
+- Waveform Generator (Slot 2) + Oscilloscope (Slot 1) running at once, so a
+  generated waveform can be watched live on the same plot via a loopback
+  cable from an output back to an input
+- Per-output-channel (1/2) waveform controls: Sine/Square/Ramp/Pulse/DC/Off,
+  frequency, amplitude, offset, phase, plus duty cycle (Square/Pulse) or
+  symmetry (Ramp) — all persisted across sessions
+- Live Ch1/Ch2 plot, ~30 Hz redraw decoupled from the network poll rate via
+  a pre-allocated ring buffer (same fast-plotting approach as the CoreDAQ tab)
 
 **CoreDAQ Power Meter**
 - Connects over USB-serial (auto-detect or manual COM port)
@@ -140,7 +152,7 @@ or its instrument isn't connected.
   this if you try to connect).
 - *(Optional)* [Moku CLI](https://www.liquidinstruments.com/) installed to
   `C:\Program Files\Liquid Instruments\Moku CLI\` — only needed for the
-  Moku:Go oscilloscope panel inside the DAQ Control tab.
+  Moku:Go oscilloscope panel inside the DAQ Control tab and the Moku tab.
 
 **Hardware / network**, as applicable to what you're using:
 - A UEI DAQ cube reachable on the network (see `CUBE_IP` in
