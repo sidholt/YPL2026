@@ -45,8 +45,19 @@ two at a time against the same physical device)
 - Per-output waveform controls: Sine/Square/Ramp/Pulse/DC/Off, frequency,
   amplitude, offset, phase, plus duty cycle (Square/Pulse) or symmetry
   (Ramp) — all persisted across sessions
-- Live Ch1/Ch2 plot, ~30 Hz redraw decoupled from the network poll rate via
-  a pre-allocated ring buffer (same fast-plotting approach as the CoreDAQ tab)
+- Two plot views, switchable:
+  - **Scope trace** (default) — plots the captured frame itself, so you see
+    the actual waveform shape and amplitude. Selectable capture window
+    (100 µs – 1 s); shorter windows acquire faster and are needed to resolve
+    higher frequencies.
+  - **Rolling mean** — one averaged point per frame over the last 10 s. Good
+    for slow DC drift, but note a periodic waveform averages out to roughly
+    its DC offset (a 1 kHz sine reads as a flat line).
+- ~30 Hz redraw decoupled from the network poll rate; repaints are skipped
+  when no new frame has arrived, so the redraw timer costs nothing between
+  round trips (measured ~0.4 ms per redraw). A "frames/s from device" readout
+  shows the achieved acquisition rate, which is bounded by the Moku's network
+  round trip, not by the GUI.
 - Note: on this Moku:Go, MultiInstrument slot 2 exposes only **one** output
   (`Slot2OutA` → `Output1`); `Slot2OutB` is rejected by the device with
   "Source port is not valid in the given configuration". The tab probes for

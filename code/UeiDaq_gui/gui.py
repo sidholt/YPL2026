@@ -581,9 +581,18 @@ MOKU_SHUNT_OHMS        = 100.0
 # .append()/.pop(0) history and re-rendering every point every redraw, is what
 # made that tab's live plot stutter under load before it was rewritten.
 MOKU_GEN_POLL_INTERVAL_MS = 15     # floor between get_data() round trips
-MOKU_GEN_PLOT_WINDOW_S    = 10.0
+MOKU_GEN_PLOT_WINDOW_S    = 10.0   # rolling-mean (trend) mode history length
 MOKU_GEN_DISPLAY_MS       = 33     # ~30 Hz plot redraw, decoupled from poll rate
 MOKU_GEN_MAX_PLOT_POINTS  = 1500   # cap points handed to pyqtgraph per curve per redraw
+
+# Captured window for scope-trace mode. Shorter windows acquire faster AND
+# show high-frequency waveforms properly, so this is both a zoom and a speed
+# control; 10 ms shows 10 cycles of a 1 kHz signal.
+MOKU_GEN_DEFAULT_WINDOW_S = 0.01
+MOKU_GEN_WINDOW_PRESETS   = [
+    ("100 µs", 0.0001), ("1 ms", 0.001), ("10 ms", 0.01),
+    ("100 ms", 0.1), ("1 s", 1.0),
+]
 
 PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
@@ -935,7 +944,7 @@ class MokuMultiSession:
             self.output_channels = 1
         # Timebase is a slot-instrument setting, so it stays on the
         # Oscilloscope object.
-        _step("set_timebase()", self._osc.set_timebase, -0.1, 0.0)
+        _step("set_timebase()", self.set_timebase, MOKU_GEN_DEFAULT_WINDOW_S)
 
         # The frontend, by contrast, belongs to the platform in MiM:
         # Oscilloscope.set_frontend() here fails with "Frontend parameters
@@ -971,16 +980,41 @@ class MokuMultiSession:
         raise RuntimeError("no accepted parameter set; tried: "
                             + " | ".join(errors))
 
-    def get_sample(self):
-        """Raises on failure — the worker's poll loop decides how to react to
+    MAX_FRAME_POINTS = 1024
+
+    def set_timebase(self, window_s: float):
+        """Sets the captured window to `window_s` seconds ending at the
+        trigger. A shorter window also acquires faster, so this doubles as
+        the plot's speed control."""
+        if self._osc is None:
+            raise RuntimeError("not connected")
+        self._osc.set_timebase(-window_s, 0.0, max_length=self.MAX_FRAME_POINTS)
+
+    def get_frame(self):
+        """Returns (time, ch1, ch2) numpy arrays for the latest captured frame.
+
+        Raises on failure — the worker's poll loop decides how to react to
         that (retry vs. give up), same split as CoreDAQWorker._call() leaving
-        errors to do_poll()."""
+        errors to do_poll().
+
+        Returns the whole frame rather than a mean: one network round trip
+        already carries ~1024 points, so averaging them away threw out all
+        the shape/amplitude information (a 1 kHz sine over a 100 ms window
+        averages to roughly its DC offset — a flat line) while costing exactly
+        the same amount of network time."""
         if self._osc is None:
             raise RuntimeError("not connected")
         data = self._osc.get_data()
-        ch1 = float(np.mean(data['ch1'])) if data.get('ch1') else 0.0
-        ch2 = float(np.mean(data['ch2'])) if data.get('ch2') else 0.0
-        return (ch1, ch2)
+        ch1 = np.asarray(data.get('ch1') or (), dtype=np.float32)
+        ch2 = np.asarray(data.get('ch2') or (), dtype=np.float32)
+        raw_t = data.get('time')
+        if raw_t:
+            t = np.asarray(raw_t, dtype=np.float64)
+        else:
+            # Fall back to sample indices if the firmware omits the timebase,
+            # so the trace still renders (x axis just isn't in seconds).
+            t = np.arange(max(ch1.size, ch2.size), dtype=np.float64)
+        return t, ch1, ch2
 
     def set_waveform(self, channel: int, wf_type: str, amplitude: float,
                       frequency: float, offset: float, phase: float,
@@ -1066,6 +1100,26 @@ class MokuGenWorker(QObject):
         self._display_buf      = np.zeros((2, self.plot_buffer_len), dtype=np.float32)
         self._display_time_buf = np.zeros(self.plot_buffer_len, dtype=np.float64)
 
+        # ── Latest captured frame, for scope-trace mode ──────────────────────
+        # Pre-allocated to the largest frame the scope will return so a poll
+        # tick only copies into it. frame_seq lets the GUI skip redrawing when
+        # no new frame has arrived since its last repaint — with network round
+        # trips far slower than the 30 Hz redraw timer, most redraws would
+        # otherwise re-push identical 1024-point arrays into pyqtgraph for
+        # nothing, which is exactly the wasted GUI-thread work that reads as
+        # "glitchy".
+        n = MokuMultiSession.MAX_FRAME_POINTS
+        self.frame_t   = np.zeros(n, dtype=np.float64)
+        self.frame_ch  = np.zeros((2, n), dtype=np.float32)
+        self.frame_len = 0
+        self.frame_seq = 0
+
+    def do_set_timebase(self, window_s: float):
+        try:
+            self.session.set_timebase(window_s)
+        except Exception as e:
+            print(f"[Moku] set_timebase({window_s}) failed: {e}")
+
     def do_connect(self, ip: str):
         try:
             self.session.connect(ip)
@@ -1074,6 +1128,7 @@ class MokuGenWorker(QObject):
             return
         self.plot_write_index   = 0
         self.plot_filled        = 0
+        self.frame_len          = 0
         self._last_label_emit_t = 0.0
         self._err_count         = 0
         self.connected.emit(self.session.output_channels)
@@ -1097,7 +1152,19 @@ class MokuGenWorker(QObject):
         if not self._polling:
             return
         try:
-            ch1, ch2 = self.session.get_sample()
+            # One round trip feeds BOTH plot modes: the frame itself for the
+            # scope trace, and its per-channel mean for the rolling trend.
+            t, f1, f2 = self.session.get_frame()
+            n = min(len(t), max(f1.size, f2.size), self.frame_t.size)
+            if n:
+                self.frame_t[:n] = t[:n]
+                self.frame_ch[0, :n] = f1[:n] if f1.size >= n else 0.0
+                self.frame_ch[1, :n] = f2[:n] if f2.size >= n else 0.0
+                self.frame_len = n
+                self.frame_seq += 1
+
+            ch1 = float(f1.mean()) if f1.size else 0.0
+            ch2 = float(f2.mean()) if f2.size else 0.0
             now = time.monotonic()
             self.plot_buffer[0, self.plot_write_index] = ch1
             self.plot_buffer[1, self.plot_write_index] = ch2
@@ -1153,6 +1220,13 @@ class MokuGenWorker(QObject):
 
         return self._display_buf, self._display_time_buf, count
 
+    def get_display_frame(self):
+        """Latest captured frame as (time, channels, count, seq) — plain
+        attribute reads on pre-allocated arrays, no allocation and no queued
+        signal, called straight from the GUI's redraw timer. `seq` increments
+        once per acquired frame so the caller can skip redundant repaints."""
+        return self.frame_t, self.frame_ch, self.frame_len, self.frame_seq
+
 
 class MokuGenPanel(QWidget):
     """
@@ -1167,12 +1241,15 @@ class MokuGenPanel(QWidget):
     _sig_connect    = pyqtSignal(str)
     _sig_disconnect = pyqtSignal()
     _sig_set_wf     = pyqtSignal(int, str, float, float, float, float, float, float)
+    _sig_timebase   = pyqtSignal(float)
 
     WAVEFORM_TYPES = ["Sine", "Square", "Ramp", "Pulse", "DC", "Off"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._connected = False
+        self._last_drawn_seq = -1
+        self._rate_ref = (None, 0)   # (wall-clock, frame_seq) for the rate readout
 
         if not HAS_MOKU:
             lay = QVBoxLayout(self)
@@ -1188,6 +1265,7 @@ class MokuGenPanel(QWidget):
         self._sig_connect.connect(self._worker.do_connect)
         self._sig_disconnect.connect(self._worker.do_disconnect)
         self._sig_set_wf.connect(self._worker.do_set_waveform)
+        self._sig_timebase.connect(self._worker.do_set_timebase)
 
         self._worker.connected.connect(self._on_connected)
         self._worker.connect_err.connect(self._on_connect_err)
@@ -1352,7 +1430,41 @@ class MokuGenPanel(QWidget):
         self._show_plot_chk.setChecked(True)
         self._show_plot_chk.toggled.connect(self._on_show_plot_toggled)
         top_row.addWidget(self._show_plot_chk)
-        top_row.addSpacing(20)
+        top_row.addSpacing(12)
+
+        # Scope trace = the captured frame itself (shows waveform shape).
+        # Rolling mean = one averaged point per frame over a long window
+        # (shows slow DC drift, but averages any real waveform away).
+        top_row.addWidget(QLabel("View:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("Scope trace", "trace")
+        self._mode_combo.addItem("Rolling mean", "mean")
+        self._mode_combo.setToolTip(
+            "Scope trace: plots the captured frame — shows the actual waveform.\n"
+            "Rolling mean: one average per frame over "
+            f"{MOKU_GEN_PLOT_WINDOW_S:.0f}s — good for DC drift, but a\n"
+            "periodic waveform averages out to roughly its offset.")
+        saved_mode = load_connection_settings().get("moku_gen_plot_mode")
+        if saved_mode in ("trace", "mean"):
+            self._mode_combo.setCurrentIndex(self._mode_combo.findData(saved_mode))
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        top_row.addWidget(self._mode_combo)
+
+        top_row.addWidget(QLabel("Window:"))
+        self._window_combo = QComboBox()
+        for label, secs in MOKU_GEN_WINDOW_PRESETS:
+            self._window_combo.addItem(label, secs)
+        self._window_combo.setToolTip(
+            "Captured time window (scope trace mode). Shorter windows acquire\n"
+            "faster and are needed to resolve higher frequencies.")
+        saved_win = load_connection_settings().get("moku_gen_window_s")
+        idx = self._window_combo.findData(saved_win)
+        self._window_combo.setCurrentIndex(
+            idx if idx >= 0 else self._window_combo.findData(MOKU_GEN_DEFAULT_WINDOW_S))
+        self._window_combo.currentIndexChanged.connect(self._on_window_changed)
+        top_row.addWidget(self._window_combo)
+
+        top_row.addSpacing(12)
         self._ch1_lbl = QLabel("Ch1:  — V")
         self._ch2_lbl = QLabel("Ch2:  — V")
         for lbl in (self._ch1_lbl, self._ch2_lbl):
@@ -1360,6 +1472,9 @@ class MokuGenPanel(QWidget):
         top_row.addWidget(self._ch1_lbl)
         top_row.addWidget(self._ch2_lbl)
         top_row.addStretch()
+        self._rate_lbl = QLabel("")
+        self._rate_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        top_row.addWidget(self._rate_lbl)
         plot_lay.addLayout(top_row)
 
         if HAS_PYQTGRAPH:
@@ -1368,6 +1483,12 @@ class MokuGenPanel(QWidget):
             self._plot_widget.setLabel('bottom', 'Time',    units='s')
             self._plot_widget.setMinimumHeight(220)
             self._plot_widget.addLegend()
+            # Deliberately NOT using setDownsampling(auto=True): a frame is
+            # only ~1024 points, which pyqtgraph renders for free, and auto
+            # peak-downsampling collapsed that to ~58 points in testing —
+            # visibly blocky for no measurable speed gain. The rolling-mean
+            # path does its own decimation where the point count actually
+            # grows unbounded.
             self._live_curves = [
                 self._plot_widget.plot([], [], pen=pg.mkPen(C_BLUE, width=2), name='Ch1'),
                 self._plot_widget.plot([], [], pen=pg.mkPen(C_RED,  width=2), name='Ch2'),
@@ -1418,6 +1539,7 @@ class MokuGenPanel(QWidget):
                 cw[key].setEnabled(True)
         self._ch1_lbl.setText("Ch1:  — V")
         self._ch2_lbl.setText("Ch2:  — V")
+        self._rate_lbl.setText("")
 
     def _on_connected(self, output_channels: int):
         self._connected = True
@@ -1441,9 +1563,11 @@ class MokuGenPanel(QWidget):
         if output_channels < len(self._ch_widgets):
             print(f"[Moku] Only {output_channels} generator output(s) routed — "
                   "the rest are disabled in the UI.")
-        if HAS_PYQTGRAPH:
-            for curve in self._live_curves:
-                curve.setData([], [])
+        self._clear_curves()
+        self._on_mode_changed()      # apply saved view mode's axis label/state
+        # Push the saved window to the device — connect() applies the default,
+        # which won't match a window the user picked in a previous session.
+        self._sig_timebase.emit(self._window_combo.currentData())
         if self._show_plot_chk.isChecked():
             self._display_timer.start()
         self._status(f"Moku connected — {self._ip_edit.text().strip()}")
@@ -1485,24 +1609,93 @@ class MokuGenPanel(QWidget):
         if HAS_PYQTGRAPH:
             self._plot_widget.setVisible(checked)
         if checked and self._connected:
-            for curve in self._live_curves:
-                curve.setData([], [])
+            self._clear_curves()
             self._display_timer.start()
         else:
             self._display_timer.stop()
 
+    def _clear_curves(self):
+        if HAS_PYQTGRAPH:
+            for curve in self._live_curves:
+                curve.setData([], [])
+        # Force the next tick to repaint even if no new frame has landed.
+        self._last_drawn_seq = -1
+        self._rate_ref = (None, 0)
+
+    def _plot_mode(self) -> str:
+        return self._mode_combo.currentData()
+
+    def _update_rate_readout(self, seq: int):
+        """Shows the achieved frame rate, throttled to once a second. Makes
+        "the plot feels slow" a number — this rate is bounded by the Moku's
+        network round trip, so it's the ceiling on how live the trace can be,
+        independent of the redraw timer."""
+        now = time.monotonic()
+        last_t, last_seq = self._rate_ref
+        if last_t is None:
+            self._rate_ref = (now, seq)
+            return
+        dt = now - last_t
+        if dt < 1.0:
+            return
+        self._rate_lbl.setText(f"{(seq - last_seq) / dt:.1f} frames/s from device")
+        self._rate_ref = (now, seq)
+
+    def _on_mode_changed(self):
+        mode = self._plot_mode()
+        save_connection_setting("moku_gen_plot_mode", mode)
+        # Trace mode's x axis is time-within-frame (relative to the trigger);
+        # rolling-mean's is seconds-ago across a long window. Different
+        # meanings, so relabel and drop the stale curve.
+        if HAS_PYQTGRAPH:
+            self._plot_widget.setLabel(
+                'bottom', "Time (within frame)" if mode == "trace" else "Time (ago)",
+                units='s')
+        self._window_combo.setEnabled(mode == "trace")
+        self._clear_curves()
+
+    def _on_window_changed(self):
+        window_s = self._window_combo.currentData()
+        save_connection_setting("moku_gen_window_s", window_s)
+        self._clear_curves()
+        if self._connected:
+            self._sig_timebase.emit(window_s)
+
     def _update_live_plot(self):
-        """Independent ~30 Hz redraw timer — pulls whatever the worker's ring
-        buffer currently holds, decimates to MOKU_GEN_MAX_PLOT_POINTS before
-        handing anything to pyqtgraph, and never blocks on the network poll
-        rate. Same approach as CoreDAQPanel._update_live_plot."""
+        """Independent ~30 Hz redraw timer, decoupled from the (much slower)
+        network poll rate — a slow link just means fewer new frames per
+        redraw, not a slower UI."""
         if not HAS_PYQTGRAPH or not self._connected:
             return
+        if self._plot_mode() == "trace":
+            self._draw_trace()
+        else:
+            self._draw_rolling_mean()
+
+    def _draw_trace(self):
+        """Plots the captured frame as-is. The frame already arrives as a
+        contiguous 1024-point array with its own time axis, so there's nothing
+        to stitch, mask or decimate here — and skipping repaints when no new
+        frame has arrived means the redraw timer costs nothing between the
+        (far slower) network round trips."""
+        t, chans, count, seq = self._worker.get_display_frame()
+        if count <= 0 or seq == self._last_drawn_seq:
+            return
+        self._update_rate_readout(seq)
+        self._last_drawn_seq = seq
+        x = t[:count]
+        for ch, curve in enumerate(self._live_curves):
+            curve.setData(x, chans[ch, :count], connect='all')
+
+    def _draw_rolling_mean(self):
+        """One averaged point per acquired frame over a long window — pulls
+        the worker's ring buffer, drops samples older than the window, and
+        decimates before handing anything to pyqtgraph. Same approach as
+        CoreDAQPanel._update_live_plot."""
         data, times, count = self._worker.get_display_data()
         if count <= 0:
             return
-        times = times[:count]
-        rel = times - time.monotonic()
+        rel = times[:count] - time.monotonic()
         mask = rel >= -MOKU_GEN_PLOT_WINDOW_S
         rel = rel[mask]
         if rel.size == 0:
