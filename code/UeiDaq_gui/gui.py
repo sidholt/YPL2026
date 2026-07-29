@@ -874,25 +874,43 @@ class MokuMultiSession:
         self.disconnect()
         if not HAS_MOKU:
             raise RuntimeError("moku library not installed")
+
+        # Each setup call wrapped separately and re-raised with the step name
+        # prepended — the device's own error text (e.g. "Cannot understand
+        # request. One or more key/values are incorrect") doesn't say which
+        # call it came from, so without this a failure here is a guessing
+        # game between MultiInstrument()/set_instrument()/set_connections()/
+        # set_timebase()/set_frontend() every time it happens.
+        def _step(label, fn, *args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                raise RuntimeError(f"[{label}] {e}") from e
+
         # platform_id=2 selects the 2-slot MultiInstrument mode Moku:Go
         # supports (Moku:Pro has 4 slots and would use a different id).
-        self._mim = MultiInstrument(ip, force_connect=True, platform_id=2)
-        self._osc = self._mim.set_instrument(1, Oscilloscope)
-        self._wg  = self._mim.set_instrument(2, WaveformGenerator)
+        self._mim = _step("MultiInstrument()", MultiInstrument, ip,
+                           force_connect=True, platform_id=2)
+        self._osc = _step("set_instrument(1, Oscilloscope)",
+                           self._mim.set_instrument, 1, Oscilloscope)
+        self._wg  = _step("set_instrument(2, WaveformGenerator)",
+                           self._mim.set_instrument, 2, WaveformGenerator)
         # Moku:Go has 2 physical analog channels, so its MultiInstrument
         # connections API refers to them by letter (InputA/InputB,
         # OutputA/OutputB) — the numbered Input1..4/Output1..4 forms are for
         # Moku:Pro's 4-channel front end. Using the numbered forms here fails
         # with "Source port is not valid in the given configuration."
-        self._mim.set_connections(connections=[
+        _step("set_connections()", self._mim.set_connections, connections=[
             dict(source="InputA",    destination="Slot1InA"),
             dict(source="InputB",    destination="Slot1InB"),
             dict(source="Slot2OutA", destination="OutputA"),
             dict(source="Slot2OutB", destination="OutputB"),
         ])
-        self._osc.set_timebase(-0.1, 0.0)
-        self._osc.set_frontend(1, impedance='1MOhm', coupling='DC', range='10Vpp')
-        self._osc.set_frontend(2, impedance='1MOhm', coupling='DC', range='10Vpp')
+        _step("set_timebase()", self._osc.set_timebase, -0.1, 0.0)
+        _step("set_frontend(1)", self._osc.set_frontend, 1,
+              impedance='1MOhm', coupling='DC', range='10Vpp')
+        _step("set_frontend(2)", self._osc.set_frontend, 2,
+              impedance='1MOhm', coupling='DC', range='10Vpp')
         print(f"[Moku] MultiInstrument connected to {ip}")
 
     def get_sample(self):
