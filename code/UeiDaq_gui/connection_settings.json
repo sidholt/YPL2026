@@ -25,7 +25,10 @@
     "DAQ Control",
     "ITLA Laser",
     "Santec Laser",
+    "Moku",
     "HP-8168F Laser",
     "CONEX Motor"
-  ]
+  ],
+  "moku_gen_ch1_type": "Sine",
+  "moku_gen_plot_mode": "trace"
 }
