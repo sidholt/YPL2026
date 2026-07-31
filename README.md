@@ -11,6 +11,10 @@ laser — each on its own tab, each degrading gracefully (tab stays visible
 with a message instead of crashing the app) if its hardware library isn't
 installed or its instrument isn't connected.
 
+**New to the GUI?** This README covers installation and configuration. For how
+to *use* it — per-tab procedures, laser/DAQ safety, common lab workflows, and
+data formats — read the **[User Guide](docs/USER_GUIDE.md)**.
+
 ## Features
 
 **DAQ Control** (UEI PowerDNA analog output cards)
@@ -108,13 +112,17 @@ two at a time against the same physical device)
   plot, and CSV export
 
 **Across every tab**
-- Pop any tab out into its own window (and reattach it later)
+- Drag a tab left/right to reorder it (order persists between sessions), or
+  drag it vertically out of the bar to pop it into its own window
 - COM ports, GPIB addresses, and last-used wavelength/power are remembered
   automatically between runs
-- Every CSV export opens automatically right after saving
+- Every export enables a "📂 Open" button for that box's most recent file
+  (files are not auto-launched on save)
 
 ## Repository Layout
 
+- `docs/USER_GUIDE.md` — **the day-to-day operating manual**: per-tab
+  procedures, lab safety, common workflows, data formats, troubleshooting.
 - `code/UeiDaq_gui/`
   - `gui.py` — **current entry point.** The unified, multi-tab GUI described
     above.
@@ -257,20 +265,32 @@ uv run code\UeiDaq_gui\gui.py
 ```
 
 This opens one window sized to use most of your screen, with a tab per
-instrument (see [Features](#features) above). A few things worth knowing:
+instrument (see [Features](#features) above).
 
-- Most tabs try to auto-connect on launch using whatever COM port/GPIB
-  address/wavelength was last used — nothing to re-enter for a setup you've
-  already run before. Santec Laser is the exception (as of 2026-07-21): it
-  never auto-connects, use its "Connect to Laser" button.
-- The "⬡ Pop out tab" button (top-right corner of the tab bar) detaches the
-  current tab into its own window — useful for watching two instruments side
-  by side. A detached window has its own control to reattach it.
+> **📖 For how to actually operate each tab — step-by-step procedures, safety
+> notes, common lab workflows, and data formats — see the
+> [User Guide](docs/USER_GUIDE.md).** This README covers installation and
+> configuration; the User Guide is the day-to-day manual.
+
+A few things worth knowing up front:
+
+- **Only the CoreDAQ Power Meter auto-connects on launch.** Every other tab
+  waits for you to click Connect — auto-connecting lasers and motors on
+  startup was deliberately removed, since it moves hardware before you've
+  looked at the rig.
+- **DAQ output values are never restored on launch**, also deliberately: every
+  pin starts at 0. Restoring a saved output into a rig that's been rewired
+  since is how you damage a device. (Sweep ranges, set-points, and nicknames
+  *are* remembered — just not live outputs.)
+- Drag a tab left/right to reorder it; drag it vertically out of the bar to
+  pop it into its own window (useful for watching two instruments side by
+  side). A popped-out window has a "⬅ Reattach to main window" button.
 - Closing the main window disconnects and cleans up every instrument, even
   ones currently popped out into their own windows. Before disconnecting, it
   zeros every DAQ output pin and turns off laser emission (ITLA, Santec,
   HP-8168F) — a manual Disconnect click does the same for whichever
-  instrument you clicked it on.
+  instrument you clicked it on. Killing the process from Task Manager skips
+  all of that and leaves outputs live.
 
 ## Configuration
 
@@ -296,10 +316,18 @@ automatically to `connection_settings.json` / `ao_channel_names.json`.
 
 ## Data Output
 
-Sweep results and recordings save as CSV to `data/` at the repo root
-(auto-created if missing) and open automatically in their default
-application (e.g. Excel) right after saving, so there's no need to go
-hunting for the file afterward.
+Sweep results and recordings save as timestamped CSV to `data/` at the repo
+root (auto-created if missing), with sweep plot images in `data/images/`.
+Saving enables that box's "📂 Open" button, which opens the most recent file
+for that box — files are not auto-launched on save.
+
+Sweep/recording CSVs start with `#` comment lines recording the run's
+parameters (range, step, dwell, set-point), followed by a normal header row —
+so a sweep stays reproducible later. `pandas.read_csv(..., comment='#')` and
+Excel's import both skip them cleanly. Optical power is always in watts.
+
+See [Where your data goes](docs/USER_GUIDE.md#12-where-your-data-goes) for
+filename conventions and a worked example.
 
 ## Troubleshooting
 
