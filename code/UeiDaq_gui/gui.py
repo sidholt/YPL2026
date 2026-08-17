@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QLabel, QPushButton, QScrollArea, QFrame, QSizePolicy,
     QDoubleSpinBox, QSlider, QStackedWidget, QStatusBar, QGroupBox,
     QSpinBox, QComboBox, QLineEdit, QCheckBox, QTabWidget, QTabBar, QTextEdit,
-    QMessageBox, QListWidget, QListWidgetItem
+    QMessageBox, QListWidget, QListWidgetItem, QProgressBar
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QObject, QEventLoop, QEvent
 from PyQt6.QtGui import QPalette, QColor
@@ -598,6 +598,36 @@ PLOT_CHUNK_MS          = 100
 CMP_PLOT_WINDOW_S      = 10.0
 COREDAQ_PLOT_WINDOW_S  = 30.0
 
+# ── Dot Product tab ───────────────────────────────────────────────────────────
+# Random-bit-stream x phase-weight multiply-accumulate: the Moku output plays
+# a GUI-generated random bit (+1/-1) as a DC level while a UEI AOut holds the
+# phase shifter at the weight's phase, and the Moku scope input reads the
+# resulting detector level. Deliberately NO ramping on the AOut (see
+# CardSession.cancel_motion) — a slew-rate-limited approach to each phase
+# would dominate the step time and smear one element's phase into the next.
+#
+# Each element is measured twice — at phi (in-phase -> real part) and at
+# phi + 90 deg (quadrature -> imaginary part) — because a photodetector reads
+# power, one real number, and a complex product cannot be recovered from a
+# single such reading.
+DOT_DEFAULT_N          = 64        # elements per run
+DOT_DEFAULT_STEP_MS    = 100       # per measurement; 2 measurements per element
+DOT_MIN_STEP_MS        = 20        # below the Moku round-trip floor, see note
+DOT_DEFAULT_BIT_V      = 1.0       # Moku DC level magnitude for a +1/-1 bit
+DOT_DEFAULT_VPI        = 3.0       # phase-shifter V_pi (voltage for pi radians)
+DOT_BASELINE_SAMPLES   = 8         # dark/reference readings taken before a run
+DOT_ACK_TIMEOUT_MS     = 5000      # give up if the Moku never acks a DC update
+# After the settle period a fresh scope frame must still have landed, or the
+# reading would be of the PREVIOUS element. Cap how long we will wait for one
+# before taking the reading anyway and counting it as stale.
+DOT_FRAME_WAIT_MS      = 8         # re-check interval while waiting for a frame
+DOT_FRAME_WAIT_MAX_MS  = 2000      # hard cap on that wait, per measurement
+DOT_PHASE_MODES = [
+    ("Random phase [0, 2pi)", "uniform"),
+    ("Random +/-1 (0 or pi)", "binary"),
+    ("Manual list (degrees)", "manual"),
+]
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DAQ — WORKERS & SESSIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1077,6 +1107,14 @@ class MokuGenWorker(QObject):
     lost         = pyqtSignal()
     label_update = pyqtSignal(float, float)   # throttled Ch1/Ch2 numeric readout
     waveform_err = pyqtSignal(int, str)        # channel, message
+    # Emitted once the generator call for `channel` has actually returned on
+    # this thread. do_set_waveform is invoked via a queued signal, so from the
+    # GUI thread's side the call is fire-and-forget and lands at some unknown
+    # later time (it also has to wait out whatever poll round trip is already
+    # in flight). The Dot Product run loop needs to know when the new level is
+    # really on the output before it starts timing that element's settle
+    # window — otherwise it would measure the previous element's level.
+    waveform_applied = pyqtSignal(int)         # channel
 
     LABEL_HZ           = 10.0   # wall-clock throttle for the numeric Ch1/Ch2 labels
     MAX_CONSEC_ERRORS   = 20    # give up after this many back-to-back poll failures
@@ -1147,6 +1185,8 @@ class MokuGenWorker(QObject):
                                        offset, phase, duty, symmetry)
         except Exception as e:
             self.waveform_err.emit(channel, str(e))
+            return
+        self.waveform_applied.emit(channel)
 
     def _poll(self):
         if not self._polling:
@@ -1248,6 +1288,7 @@ class MokuGenPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._connected = False
+        self._output_channels = 0
         self._last_drawn_seq = -1
         self._rate_ref = (None, 0)   # (wall-clock, frame_seq) for the rate readout
 
@@ -1518,10 +1559,38 @@ class MokuGenPanel(QWidget):
         self._connect_btn.setText("Connecting…")
         self._sig_connect.emit(ip)
 
+    # ── accessors for the Dot Product tab ────────────────────────────────────
+    # That tab drives this same Moku (generator output + scope input) rather
+    # than opening a second connection to it — a Moku:Go only allows one
+    # owner at a time, so it borrows this panel's already-connected session.
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def output_channels(self) -> int:
+        return self._output_channels
+
+    @property
+    def worker(self):
+        """The MokuGenWorker, or None when the moku library is missing (in
+        which case __init__ returned before ever creating one)."""
+        return getattr(self, "_worker", None)
+
+    def request_waveform(self, channel: int, wf_type: str, amplitude: float,
+                          frequency: float, offset: float, phase: float = 0.0,
+                          duty: float = 50.0, symmetry: float = 50.0):
+        """Queue a generator update on the worker thread. Completion arrives
+        as the worker's waveform_applied / waveform_err signal."""
+        self._sig_set_wf.emit(channel, wf_type, amplitude, frequency,
+                               offset, phase, duty, symmetry)
+
     def _do_disconnect(self):
         self._sig_disconnect.emit()
         self._display_timer.stop()
         self._connected = False
+        self._output_channels = 0
         self._status_lbl.setText("DISCONNECTED")
         self._status_lbl.setStyleSheet(f"color: {C_RED}; font-weight: bold;")
         self._connect_btn.setEnabled(True)
@@ -1543,6 +1612,7 @@ class MokuGenPanel(QWidget):
 
     def _on_connected(self, output_channels: int):
         self._connected = True
+        self._output_channels = output_channels
         self._status_lbl.setText("CONNECTED")
         self._status_lbl.setStyleSheet(f"color: {C_GREEN}; font-weight: bold;")
         self._connect_btn.setText("Connect")
@@ -1909,6 +1979,19 @@ class CardSession:
                     list(self._sweep_pins), self._sweep_pending_target, idx + 1, total)
             self._sweep_step_idx += 1
             self._sweep_timer.start(self._sweep_dwell_ms)
+
+    def cancel_motion(self):
+        """Stops any ramp/sweep/waveform in flight and re-anchors the ramp
+        targets to where the outputs actually are, so subsequent direct
+        write() calls aren't fought by a slew-rate ramp still ticking toward
+        an older target. Called once at the start of the Dot Product run,
+        which steps the phase shifter by direct writes with no ramping —
+        ramping each element would dominate the step time and smear one
+        element's phase into the next."""
+        self.stop_sweep()
+        self.stop_wave()
+        self._timer.stop()
+        self._targets = list(self.values)
 
     def zero(self):
         self.stop_sweep()
@@ -8266,6 +8349,1100 @@ class CoreDAQPanel(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DOT PRODUCT — random bit stream × phase weights
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DotProductPlotWindow(QWidget):
+    """
+    Matplotlib results window for a Dot Product run — four panels, since a
+    single overlaid axes (what MatplotlibPlotWindow gives the sweep tabs)
+    can't show cumulative sums, per-element agreement, and the raw detector
+    levels at once when those have completely different y scales.
+    """
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1400, 900)
+
+        layout = QVBoxLayout(self)
+        if not HAS_MATPLOTLIB:
+            layout.addWidget(QLabel("matplotlib required for plots — "
+                                     "run: uv pip install matplotlib"))
+            self._fig = self._canvas = None
+            return
+
+        self.setStyleSheet("background-color: white;")
+        self._fig = Figure(figsize=(13, 8), dpi=120, facecolor="white")
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        layout.addWidget(self._canvas)
+        try:
+            from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+            layout.addWidget(NavigationToolbar2QT(self._canvas, self))
+        except Exception:
+            pass
+
+    def show_data(self, res: dict):
+        """`res` is the result dict built by DotProductPanel._finish_run."""
+        if not HAS_MATPLOTLIB:
+            self.show()
+            self.raise_()
+            return
+
+        k     = res["k"]
+        self._fig.clear()
+        axes = self._fig.subplots(2, 2)
+        for ax in axes.flat:
+            ax.set_facecolor("white")
+            ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.5, color="#cccccc")
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            ax.tick_params(axis="both", labelsize=10)
+
+        # ── Cumulative dot product, real and imaginary ──────────────────────
+        for ax, part, meas, exp in (
+                (axes[0][0], "Real",      res["cum_meas_re"], res["cum_exp_re"]),
+                (axes[0][1], "Imaginary", res["cum_meas_im"], res["cum_exp_im"])):
+            ax.plot(k, exp,  label=f"Expected {part.lower()}", color="#1f77b4",
+                     linewidth=2.4)
+            ax.plot(k, meas, label=f"Measured {part.lower()}", color="#d62728",
+                     linewidth=1.8, linestyle="--")
+            ax.set_xlabel("Elements accumulated", fontsize=11)
+            ax.set_ylabel(f"{part} part of running dot product", fontsize=11)
+            ax.set_title(f"Cumulative dot product — {part.lower()} part", fontsize=12)
+            ax.legend(loc="best", frameon=True, fontsize=10)
+
+        # ── Per-element agreement ───────────────────────────────────────────
+        ax = axes[1][0]
+        ax.scatter(res["exp_re"], res["meas_re"], s=18, color="#1f77b4",
+                    label="Real", alpha=0.75)
+        ax.scatter(res["exp_im"], res["meas_im"], s=18, color="#d62728",
+                    label="Imaginary", alpha=0.75)
+        lims = [v for v in (*res["exp_re"], *res["exp_im"],
+                             *res["meas_re"], *res["meas_im"])
+                if np.isfinite(v)]
+        if lims:
+            lo, hi = min(lims), max(lims)
+            pad = 0.05 * (hi - lo) if hi > lo else 0.1
+            ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="#888888",
+                     linewidth=1.2, linestyle=":", label="Ideal (y = x)")
+        ax.set_xlabel("Expected per-element product", fontsize=11)
+        ax.set_ylabel("Measured per-element product (scaled)", fontsize=11)
+        ax.set_title("Per-element measured vs expected", fontsize=12)
+        ax.legend(loc="best", frameon=True, fontsize=10)
+
+        # ── Raw detector levels (diagnostic) ────────────────────────────────
+        ax = axes[1][1]
+        ax.plot(k, res["raw_i"], label="In-phase reading (φ)", color="#2ca02c",
+                 linewidth=1.4)
+        ax.plot(k, res["raw_q"], label="Quadrature reading (φ+90°)",
+                 color="#ff7f0e", linewidth=1.4)
+        ax.axhline(res["baseline_v"], color="#888888", linewidth=1.2,
+                    linestyle=":", label=f"Baseline {res['baseline_v']:.4f} V")
+        ax.set_xlabel("Element index", fontsize=11)
+        ax.set_ylabel("Detector reading (V)", fontsize=11)
+        ax.set_title("Raw Moku input readings", fontsize=12)
+        ax.legend(loc="best", frameon=True, fontsize=9)
+
+        self._fig.suptitle(self.windowTitle(), fontsize=14)
+        self._fig.tight_layout()
+        self._canvas.draw()
+        self.show()
+        self.raise_()
+
+    def save_png(self, path: str) -> None:
+        if HAS_MATPLOTLIB and self._fig is not None:
+            self._fig.savefig(path, facecolor="white", dpi=200)
+
+
+class DotProductPanel(QWidget):
+    """
+    "Dot Product" tab — an optical multiply-accumulate driven by a random bit
+    stream on the Moku and a phase weight on a UEI AOut phase shifter.
+
+    Per element k the GUI commands a bit b_k ∈ {-1, +1} (a DC level of
+    ±bit_level volts on a Moku generator output) and a weight phase φ_k (a
+    voltage on one UEI AOut, written directly with NO slew-rate ramp), then
+    reads the detector level back through the Moku scope input. Each element
+    is measured twice — at φ_k and at φ_k + 90° — because the detector reads
+    power, one real number, so the real and imaginary parts of b_k·e^(jφ_k)
+    have to be recovered as separate in-phase and quadrature readings.
+
+    Hardware is borrowed from the other two tabs rather than reconnected: the
+    Moku from MokuGenPanel (a Moku:Go permits one owner at a time) and the
+    card from DAQPanel.card_sessions. Both must already be connected there.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._moku_panel = None
+        self._daq_panel  = None
+
+        # Run state. The whole run is flattened into one list of measurement
+        # tasks (_tasks) walked by a single index (_task_idx) rather than a
+        # nested element/quadrature state machine — the baseline readings, the
+        # in-phase readings and the quadrature readings then all follow the
+        # identical issue → ack → settle → fresh-frame → read path below.
+        self._running    = False
+        self._tasks      = []
+        self._task_idx   = 0
+        self._bits       = np.zeros(0)
+        self._phases     = np.zeros(0)
+        self._meas       = np.zeros((0, 2))
+        self._baseline   = []
+        self._cmd_v      = np.zeros((0, 2))
+        self._result     = None
+        self._plot_win   = None
+        self._last_csv   = None
+        self._card_session = None
+        self._pin_restore  = None
+        self._clamped    = 0
+        self._stale      = 0
+        self._run_t0     = 0.0
+
+        # Per-measurement handshake bookkeeping
+        self._awaiting_ack = False
+        self._seq_at_cmd   = 0
+        self._frame_waited = 0
+
+        self._ack_timer = QTimer(self)
+        self._ack_timer.setSingleShot(True)
+        self._ack_timer.timeout.connect(self._on_ack_timeout)
+
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.timeout.connect(self._on_settled)
+
+        self._build_ui()
+        self._regenerate()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        outer.addLayout(grid)
+        grid.addWidget(self._build_vector_box(),  0, 0)
+        grid.addWidget(self._build_phase_box(),   0, 1)
+        grid.addWidget(self._build_speed_box(),   1, 0)
+        grid.addWidget(self._build_run_box(),     1, 1)
+
+        outer.addWidget(self._build_plot_box(), 1)
+
+    def _build_vector_box(self):
+        box = QGroupBox("Random Bit Stream & Weights")
+        lay = QGridLayout(box)
+        r = 0
+
+        lay.addWidget(QLabel("Elements (N):"), r, 0)
+        self._n_spin = NoScrollSpinBox()
+        self._n_spin.setRange(2, 4096)
+        self._n_spin.setValue(DOT_DEFAULT_N)
+        self._n_spin.setToolTip("Length of the random bit stream — one "
+                                 "multiply-accumulate element each.")
+        persist_spinbox(self._n_spin, "dot_n_elements")
+        self._n_spin.valueChanged.connect(lambda _: self._regenerate())
+        lay.addWidget(self._n_spin, r, 1); r += 1
+
+        lay.addWidget(QLabel("Bit level (±V):"), r, 0)
+        self._bit_v_spin = NoScrollDoubleSpinBox()
+        self._bit_v_spin.setDecimals(3)
+        self._bit_v_spin.setRange(0.001, 5.0)
+        self._bit_v_spin.setValue(DOT_DEFAULT_BIT_V)
+        self._bit_v_spin.setToolTip(
+            "Moku DC output level for a bit. +1 drives +this, -1 drives -this.")
+        persist_spinbox(self._bit_v_spin, "dot_bit_level_v")
+        lay.addWidget(self._bit_v_spin, r, 1); r += 1
+
+        lay.addWidget(QLabel("Seed (-1 = random):"), r, 0)
+        self._seed_spin = NoScrollSpinBox()
+        self._seed_spin.setRange(-1, 999_999)
+        self._seed_spin.setValue(-1)
+        self._seed_spin.setToolTip(
+            "Fix the seed to replay the exact same bit stream and weights.")
+        persist_spinbox(self._seed_spin, "dot_seed")
+        self._seed_spin.valueChanged.connect(lambda _: self._regenerate())
+        lay.addWidget(self._seed_spin, r, 1); r += 1
+
+        lay.addWidget(QLabel("Weight phases:"), r, 0)
+        self._phase_mode = QComboBox()
+        for label, key in DOT_PHASE_MODES:
+            self._phase_mode.addItem(label, key)
+        saved = load_connection_settings().get("dot_phase_mode")
+        idx = self._phase_mode.findData(saved)
+        if idx >= 0:
+            self._phase_mode.setCurrentIndex(idx)
+        self._phase_mode.currentIndexChanged.connect(self._on_phase_mode_changed)
+        lay.addWidget(self._phase_mode, r, 1); r += 1
+
+        self._manual_edit = QLineEdit(
+            load_connection_settings().get("dot_manual_phases", "0, 90, 180, 270"))
+        self._manual_edit.setPlaceholderText("comma/space separated degrees")
+        self._manual_edit.setToolTip(
+            "Weight phases in degrees. Shorter than N is tiled to length; "
+            "longer is truncated.")
+        self._manual_edit.editingFinished.connect(self._on_manual_edited)
+        lay.addWidget(self._manual_edit, r, 0, 1, 2); r += 1
+
+        self._regen_btn = QPushButton("🎲  Regenerate bits & weights")
+        self._regen_btn.clicked.connect(self._regenerate)
+        lay.addWidget(self._regen_btn, r, 0, 1, 2); r += 1
+
+        self._vector_lbl = QLabel("")
+        self._vector_lbl.setWordWrap(True)
+        self._vector_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        lay.addWidget(self._vector_lbl, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        return box
+
+    def _build_phase_box(self):
+        box = QGroupBox("Phase Shifter (UEI AOut — no ramping)")
+        lay = QGridLayout(box)
+        r = 0
+
+        lay.addWidget(QLabel("Card:"), r, 0)
+        self._card_combo = QComboBox()
+        for i, info in CARDS.items():
+            if info["available"]:
+                self._card_combo.addItem(info["label"], i)
+        saved = load_connection_settings().get("dot_card_index")
+        idx = self._card_combo.findData(saved)
+        self._card_combo.setCurrentIndex(idx if idx >= 0 else
+                                          max(0, self._card_combo.count() - 1))
+        self._card_combo.currentIndexChanged.connect(self._on_card_changed)
+        lay.addWidget(self._card_combo, r, 1); r += 1
+
+        lay.addWidget(QLabel("AOut pin:"), r, 0)
+        self._pin_spin = NoScrollSpinBox()
+        self._pin_spin.setRange(0, MAX_PINS - 1)
+        self._pin_spin.setToolTip("The AOut driving the MZI phase shifter.")
+        persist_spinbox(self._pin_spin, "dot_pin")
+        lay.addWidget(self._pin_spin, r, 1); r += 1
+
+        self._vpi_lbl = QLabel("V_π:")
+        lay.addWidget(self._vpi_lbl, r, 0)
+        self._vpi_spin = NoScrollDoubleSpinBox()
+        self._vpi_spin.setDecimals(4)
+        self._vpi_spin.setRange(0.0001, 20.0)
+        self._vpi_spin.setValue(DOT_DEFAULT_VPI)
+        self._vpi_spin.setToolTip(
+            "Drive level that produces exactly π radians of phase shift.")
+        persist_spinbox(self._vpi_spin, "dot_vpi")
+        self._vpi_spin.valueChanged.connect(lambda _: self._update_phase_note())
+        lay.addWidget(self._vpi_spin, r, 1); r += 1
+
+        lay.addWidget(QLabel("Phase bias φ₀ (deg):"), r, 0)
+        self._phi0_spin = NoScrollDoubleSpinBox()
+        self._phi0_spin.setDecimals(2)
+        self._phi0_spin.setRange(0.0, 360.0)
+        self._phi0_spin.setValue(0.0)
+        self._phi0_spin.setToolTip(
+            "Constant phase added to every commanded phase — use it to null "
+            "the interferometer's own intrinsic phase.\nIt is NOT part of the "
+            "weight, so the expected dot product is unaffected.")
+        persist_spinbox(self._phi0_spin, "dot_phi0_deg")
+        self._phi0_spin.valueChanged.connect(lambda _: self._update_phase_note())
+        lay.addWidget(self._phi0_spin, r, 1); r += 1
+
+        self._phase_note = QLabel("")
+        self._phase_note.setWordWrap(True)
+        self._phase_note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        lay.addWidget(self._phase_note, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        return box
+
+    def _build_speed_box(self):
+        box = QGroupBox("Readout & Multiplication Speed")
+        lay = QGridLayout(box)
+        r = 0
+
+        lay.addWidget(QLabel("Moku output:"), r, 0)
+        self._out_combo = QComboBox()
+        self._out_combo.addItem("Output 1", 1)
+        self._out_combo.addItem("Output 2", 2)
+        self._out_combo.setToolTip("Generator output playing the bit stream.")
+        saved = load_connection_settings().get("dot_moku_output")
+        idx = self._out_combo.findData(saved)
+        if idx >= 0:
+            self._out_combo.setCurrentIndex(idx)
+        self._out_combo.currentIndexChanged.connect(
+            lambda _: save_connection_setting("dot_moku_output",
+                                               self._out_combo.currentData()))
+        lay.addWidget(self._out_combo, r, 1); r += 1
+
+        lay.addWidget(QLabel("Moku input (detector):"), r, 0)
+        self._in_combo = QComboBox()
+        self._in_combo.addItem("Input 1", 0)
+        self._in_combo.addItem("Input 2", 1)
+        self._in_combo.setToolTip(
+            "Scope input the photodetector is cabled into. Each reading is "
+            "the mean of one captured frame.")
+        saved = load_connection_settings().get("dot_moku_input")
+        idx = self._in_combo.findData(saved)
+        if idx >= 0:
+            self._in_combo.setCurrentIndex(idx)
+        self._in_combo.currentIndexChanged.connect(
+            lambda _: save_connection_setting("dot_moku_input",
+                                               self._in_combo.currentData()))
+        lay.addWidget(self._in_combo, r, 1); r += 1
+
+        lay.addWidget(QLabel("Step period (ms):"), r, 0)
+        self._step_spin = NoScrollSpinBox()
+        self._step_spin.setRange(DOT_MIN_STEP_MS, 10_000)
+        self._step_spin.setValue(DOT_DEFAULT_STEP_MS)
+        self._step_spin.setToolTip(
+            "Settle time per measurement — the multiplication speed control.\n"
+            "Two measurements per element (in-phase + quadrature), so the\n"
+            "element rate is 1 / (2 × this).")
+        persist_spinbox(self._step_spin, "dot_step_ms")
+        self._step_spin.valueChanged.connect(lambda _: self._update_rate_note())
+        lay.addWidget(self._step_spin, r, 1); r += 1
+
+        lay.addWidget(QLabel("Baseline samples:"), r, 0)
+        self._baseline_spin = NoScrollSpinBox()
+        self._baseline_spin.setRange(0, 200)
+        self._baseline_spin.setValue(DOT_BASELINE_SAMPLES)
+        self._baseline_spin.setToolTip(
+            "Readings taken with the bit level at 0 V before the run starts. "
+            "Their mean is the detector's zero-product reference, subtracted "
+            "from every element reading.")
+        persist_spinbox(self._baseline_spin, "dot_baseline_samples")
+        self._baseline_spin.valueChanged.connect(lambda _: self._update_rate_note())
+        lay.addWidget(self._baseline_spin, r, 1); r += 1
+
+        self._rate_note = QLabel("")
+        self._rate_note.setWordWrap(True)
+        self._rate_note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        lay.addWidget(self._rate_note, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        return box
+
+    def _build_run_box(self):
+        box = QGroupBox("Run")
+        lay = QGridLayout(box)
+        r = 0
+
+        self._run_btn = QPushButton("▶  Run dot product")
+        self._run_btn.clicked.connect(self._start_run)
+        lay.addWidget(self._run_btn, r, 0)
+        self._stop_btn = QPushButton("■  Stop")
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._stop_run)
+        lay.addWidget(self._stop_btn, r, 1); r += 1
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        lay.addWidget(self._progress, r, 0, 1, 2); r += 1
+
+        self._run_lbl = QLabel("Idle")
+        self._run_lbl.setWordWrap(True)
+        lay.addWidget(self._run_lbl, r, 0, 1, 2); r += 1
+
+        self._autoscale_chk = QCheckBox("Auto-scale measured to expected "
+                                         "(least-squares gain)")
+        self._autoscale_chk.setChecked(
+            load_connection_settings().get("dot_autoscale", True))
+        self._autoscale_chk.setToolTip(
+            "The detector reads volts, the expected dot product is "
+            "dimensionless, and the volts-per-unit factor depends on optical "
+            "power, responsivity and fringe visibility.\nWith this on, one "
+            "real gain is fitted across the whole run so the two are directly "
+            "comparable; with it off, the manual gain below is used.")
+        self._autoscale_chk.toggled.connect(self._on_autoscale_toggled)
+        lay.addWidget(self._autoscale_chk, r, 0, 1, 2); r += 1
+
+        lay.addWidget(QLabel("Manual gain (V per unit):"), r, 0)
+        self._gain_spin = NoScrollDoubleSpinBox()
+        self._gain_spin.setDecimals(6)
+        self._gain_spin.setRange(1e-6, 1000.0)
+        self._gain_spin.setValue(1.0)
+        persist_spinbox(self._gain_spin, "dot_manual_gain")
+        lay.addWidget(self._gain_spin, r, 1); r += 1
+
+        self._results_btn = QPushButton("📈  Results plot")
+        self._results_btn.setEnabled(False)
+        self._results_btn.clicked.connect(self._show_results_plot)
+        lay.addWidget(self._results_btn, r, 0)
+        self._export_btn = QPushButton("💾  Export CSV")
+        self._export_btn.setEnabled(False)
+        self._export_btn.clicked.connect(self._export_csv)
+        lay.addWidget(self._export_btn, r, 1); r += 1
+
+        self._open_btn = QPushButton("📂  Open last CSV")
+        self._open_btn.setEnabled(False)
+        self._open_btn.clicked.connect(
+            lambda: open_saved_file(self._last_csv) if self._last_csv else None)
+        lay.addWidget(self._open_btn, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        self._on_autoscale_toggled(self._autoscale_chk.isChecked())
+        return box
+
+    def _build_plot_box(self):
+        box = QGroupBox("Running Dot Product — measured vs expected")
+        lay = QVBoxLayout(box)
+
+        if not HAS_PYQTGRAPH:
+            self._live_curves = {}
+            lay.addWidget(QLabel(
+                "(install pyqtgraph to enable the live plot: "
+                "uv pip install pyqtgraph)"))
+            return box
+
+        self._plot_widget = pg.PlotWidget()
+        self._plot_widget.setLabel('bottom', 'Elements accumulated')
+        self._plot_widget.setLabel('left',   'Running dot product')
+        self._plot_widget.setMinimumHeight(240)
+        self._plot_widget.addLegend()
+        self._live_curves = {
+            "exp_re":  self._plot_widget.plot(
+                [], [], pen=pg.mkPen(C_BLUE, width=2), name="Expected real"),
+            "meas_re": self._plot_widget.plot(
+                [], [], pen=pg.mkPen(C_BLUE, width=2,
+                                      style=Qt.PenStyle.DashLine),
+                name="Measured real"),
+            "exp_im":  self._plot_widget.plot(
+                [], [], pen=pg.mkPen(C_RED, width=2), name="Expected imag"),
+            "meas_im": self._plot_widget.plot(
+                [], [], pen=pg.mkPen(C_RED, width=2,
+                                      style=Qt.PenStyle.DashLine),
+                name="Measured imag"),
+        }
+        lay.addWidget(self._plot_widget)
+        return box
+
+    # ── wiring from the main window ──────────────────────────────────────────
+
+    def set_sources(self, moku_panel, daq_panel):
+        """Borrow the already-connected Moku and DAQ card from their own tabs
+        instead of opening second connections to the same hardware."""
+        self._moku_panel = moku_panel
+        self._daq_panel  = daq_panel
+        worker = moku_panel.worker if moku_panel is not None else None
+        if worker is not None:
+            worker.waveform_applied.connect(self._on_waveform_applied)
+            worker.waveform_err.connect(self._on_waveform_err)
+            worker.lost.connect(self._on_moku_lost)
+        self._on_card_changed()
+
+    def _status(self, msg: str):
+        w = self.window()
+        if hasattr(w, "status_bar"):
+            w.status_bar.showMessage(msg)
+
+    # ── vector / weight generation ───────────────────────────────────────────
+
+    def _on_phase_mode_changed(self):
+        save_connection_setting("dot_phase_mode", self._phase_mode.currentData())
+        self._manual_edit.setEnabled(self._phase_mode.currentData() == "manual")
+        self._regenerate()
+
+    def _on_manual_edited(self):
+        save_connection_setting("dot_manual_phases", self._manual_edit.text())
+        if self._phase_mode.currentData() == "manual":
+            self._regenerate()
+
+    def _parse_manual_phases(self, n: int):
+        raw = self._manual_edit.text().replace(",", " ").split()
+        vals = []
+        for tok in raw:
+            try:
+                vals.append(math.radians(float(tok)))
+            except ValueError:
+                continue
+        if not vals:
+            return None
+        # Tile a short list up to N (and truncate a long one) so the run length
+        # is always exactly N regardless of how many phases were typed.
+        reps = -(-n // len(vals))
+        return np.array((vals * reps)[:n], dtype=np.float64)
+
+    def _regenerate(self):
+        if self._running:
+            return
+        n    = self._n_spin.value()
+        seed = self._seed_spin.value()
+        rng  = np.random.default_rng(None if seed < 0 else seed)
+
+        self._bits = rng.choice(np.array([-1.0, 1.0]), size=n)
+
+        mode = self._phase_mode.currentData()
+        if mode == "manual":
+            phases = self._parse_manual_phases(n)
+            if phases is None:
+                phases = np.zeros(n)
+                self._status("Dot Product: no valid phases parsed — using 0°")
+        elif mode == "binary":
+            phases = rng.choice(np.array([0.0, math.pi]), size=n)
+        else:
+            phases = rng.uniform(0.0, 2 * math.pi, size=n)
+        self._phases = phases
+
+        exp = self._bits * np.exp(1j * self._phases)
+        total = exp.sum()
+        preview = " ".join(f"{int(b):+d}" for b in self._bits[:12])
+        self._vector_lbl.setText(
+            f"N = {n} · bits: {preview}{' …' if n > 12 else ''}\n"
+            f"Expected dot product = {total.real:+.4f} {total.imag:+.4f}j "
+            f"(|·| = {abs(total):.4f})")
+        self._reset_live_plot()
+        self._update_phase_note()
+        self._update_rate_note()
+
+    # ── derived-info notes ───────────────────────────────────────────────────
+
+    def _on_card_changed(self):
+        save_connection_setting("dot_card_index", self._card_combo.currentData())
+        cs = self._card_for_combo()
+        if cs is not None:
+            self._pin_spin.setMaximum(max(0, cs.num_pins - 1))
+            self._vpi_lbl.setText(f"{'V' if cs.mode == 'voltage' else 'I'}_π "
+                                   f"({cs.unit}):")
+        self._update_phase_note()
+
+    def _card_for_combo(self):
+        if self._daq_panel is None:
+            return None
+        return self._daq_panel.card_sessions.get(self._card_combo.currentData())
+
+    def _update_phase_note(self):
+        cs   = self._card_for_combo()
+        unit = cs.unit if cs else "V"
+        vpi  = self._vpi_spin.value()
+        # Thermo-optic shifters dissipate ∝ V², so phase ∝ V² and the drive
+        # for a wanted phase is the square root — NOT linear in φ.
+        v_max_needed = vpi * math.sqrt(2.0)
+        note = (f"Thermal map: drive = {unit}_π · √(φ/π), so φ ∝ drive².\n"
+                f"φ wraps into [0, 2π), needing up to "
+                f"{v_max_needed:.3f} {unit} (= √2 · {unit}_π).")
+        if cs is not None and v_max_needed > cs.max_val + 1e-9:
+            note += (f"\n⚠ Exceeds this card's {cs.max_val:.1f} {unit} limit — "
+                     f"phases near 2π will clamp. Keep {unit}_π below "
+                     f"{cs.max_val / math.sqrt(2.0):.3f} {unit}.")
+            self._phase_note.setStyleSheet(f"color: {C_GOLD}; font-size: 10px;")
+        else:
+            self._phase_note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        self._phase_note.setText(note)
+
+    def _update_rate_note(self):
+        step_s = self._step_spin.value() / 1000.0
+        elem_s = 1.0 / (2.0 * step_s)
+        n      = self._n_spin.value()
+        total  = (2 * n + self._baseline_spin.value()) * step_s
+        self._rate_note.setText(
+            f"≈ {elem_s:.2f} elements/s (2 measurements each) — "
+            f"{n} elements ≈ {total:.1f} s.\n"
+            f"Floor is the Moku round trip: each step costs one "
+            f"generate_waveform plus one fresh frame, so very short periods "
+            f"will not be achieved. The achieved rate is reported at the end.")
+
+    def _on_autoscale_toggled(self, checked: bool):
+        save_connection_setting("dot_autoscale", checked)
+        self._gain_spin.setEnabled(not checked)
+
+    # ── run: setup ────────────────────────────────────────────────────────────
+
+    def _start_run(self):
+        if self._running:
+            return
+        moku = self._moku_panel
+        if moku is None or not moku.is_connected:
+            self._fail("Connect the Moku in the Moku tab first.")
+            return
+        worker = moku.worker
+        if worker is None:
+            self._fail("moku library not available.")
+            return
+        out_ch = self._out_combo.currentData()
+        if out_ch > moku.output_channels:
+            self._fail(f"Moku Output {out_ch} has no routed physical output "
+                        f"on this device (only {moku.output_channels} usable).")
+            return
+
+        cs = self._card_for_combo()
+        if cs is None:
+            self._fail("No DAQ card available.")
+            return
+        if not cs.connected:
+            self._fail(f"Connect {CARDS[cs.card_index]['label']} in the "
+                        f"DAQ Control tab first.")
+            return
+        pin = self._pin_spin.value()
+        if pin >= cs.num_pins:
+            self._fail(f"AOut {pin} is out of range for this card "
+                        f"({cs.num_pins} channels).")
+            return
+        if len(self._bits) != self._n_spin.value():
+            self._regenerate()
+
+        n = len(self._bits)
+        self._card_session = cs
+        self._pin_restore  = cs.values[pin]
+        # Direct writes from here on — kill any ramp/sweep/wave still ticking
+        # so nothing fights the per-element phase values.
+        cs.cancel_motion()
+
+        bit_v = self._bit_v_spin.value()
+        phi0  = math.radians(self._phi0_spin.value())
+
+        # Flatten the whole run into one task list: baseline readings first
+        # (bit level 0 — the detector's zero-product reference), then two
+        # readings per element at φ and φ+90°.
+        self._tasks = [("baseline", -1, -1, 0.0, phi0)
+                       for _ in range(self._baseline_spin.value())]
+        for k in range(n):
+            level = float(self._bits[k]) * bit_v
+            base  = float(self._phases[k]) + phi0
+            self._tasks.append(("elem", k, 0, level, base))
+            self._tasks.append(("elem", k, 1, level, base + math.pi / 2.0))
+
+        self._task_idx = 0
+        self._meas     = np.full((n, 2), np.nan)
+        self._cmd_v    = np.full((n, 2), np.nan)
+        self._baseline = []
+        self._clamped  = 0
+        self._stale    = 0
+        self._result   = None
+        self._run_t0   = time.monotonic()
+        self._running  = True
+
+        self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._regen_btn.setEnabled(False)
+        self._results_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+        self._progress.setRange(0, len(self._tasks))
+        self._progress.setValue(0)
+        self._reset_live_plot()
+        self._status(f"Dot Product running — {n} elements on "
+                     f"{CARDS[cs.card_index]['label'].split('  —  ')[0]} "
+                     f"AOut {pin:02d}")
+        self._issue_task()
+
+    def _fail(self, msg: str):
+        self._run_lbl.setText(f"⚠ {msg}")
+        self._run_lbl.setStyleSheet(f"color: {C_RED};")
+        self._status(f"Dot Product: {msg}")
+
+    # ── run: per-measurement state machine ───────────────────────────────────
+    #
+    # issue (write AOut + queue Moku DC) → ack (DC really on the output) →
+    # settle (step period) → fresh frame → read. The ack and fresh-frame
+    # stages are what keep a reading from being of the PREVIOUS element: the
+    # generator update is a queued cross-thread call, and the scope frame in
+    # the worker's buffer at any instant was captured before it.
+
+    def _issue_task(self):
+        if not self._running:
+            return
+        if self._task_idx >= len(self._tasks):
+            self._finish_run()
+            return
+
+        kind, k, quad, level, phase = self._tasks[self._task_idx]
+        cs = self._card_session
+        pin = self._pin_spin.value()
+
+        drive, clamped = self._phase_to_drive(phase, cs)
+        if clamped:
+            self._clamped += 1
+        try:
+            targets = list(cs.values)
+            targets[pin] = drive
+            cs.write(targets)
+        except Exception as e:
+            self._abort(f"AOut write failed: {e}")
+            return
+        if kind == "elem":
+            self._cmd_v[k, quad] = drive
+
+        self._awaiting_ack = True
+        self._frame_waited = 0
+        self._ack_timer.start(DOT_ACK_TIMEOUT_MS)
+        # DC type ignores amplitude/frequency/phase — only `offset` sets the level.
+        self._moku_panel.request_waveform(
+            self._out_combo.currentData(), "DC", 0.0, 0.0, level)
+
+    def _phase_to_drive(self, phase_rad: float, cs):
+        """Thermal (φ ∝ drive²) phase-shifter map, wrapped into [0, 2π) and
+        clamped to the card's range. Returns (drive, was_clamped)."""
+        ph  = phase_rad % (2.0 * math.pi)
+        val = self._vpi_spin.value() * math.sqrt(ph / math.pi)
+        lim = min(max(val, cs.min_val), cs.max_val)
+        return lim, abs(lim - val) > 1e-9
+
+    def _on_waveform_applied(self, channel: int):
+        if not (self._running and self._awaiting_ack):
+            return
+        if channel != self._out_combo.currentData():
+            return
+        self._awaiting_ack = False
+        self._ack_timer.stop()
+        worker = self._moku_panel.worker
+        # Note the frame counter at the moment the level landed; the reading
+        # must come from a frame captured strictly after this.
+        self._seq_at_cmd = worker.frame_seq
+        self._settle_timer.start(self._step_spin.value())
+
+    def _on_waveform_err(self, channel: int, msg: str):
+        if self._running and channel == self._out_combo.currentData():
+            self._abort(f"Moku output error: {msg}")
+
+    def _on_ack_timeout(self):
+        if self._running and self._awaiting_ack:
+            self._abort("Moku did not acknowledge the bit level in time.")
+
+    def _on_moku_lost(self):
+        if self._running:
+            self._abort("Moku connection lost.")
+
+    def _on_settled(self):
+        if not self._running:
+            return
+        worker = self._moku_panel.worker
+        # +2 rather than +1: the frame in flight when the level landed was
+        # already partly captured before it, so it can straddle the change.
+        if worker.frame_seq < self._seq_at_cmd + 2:
+            if self._frame_waited < DOT_FRAME_WAIT_MAX_MS:
+                self._frame_waited += DOT_FRAME_WAIT_MS
+                self._settle_timer.start(DOT_FRAME_WAIT_MS)
+                return
+            self._stale += 1
+        self._record_measurement(self._read_detector())
+
+    def _read_detector(self) -> float:
+        """Mean of the latest captured frame on the selected input."""
+        worker = self._moku_panel.worker
+        _t, ch, count, _seq = worker.get_display_frame()
+        if count <= 0:
+            return float("nan")
+        return float(np.mean(ch[self._in_combo.currentData(), :count]))
+
+    def _record_measurement(self, value: float):
+        kind, k, quad, _level, _phase = self._tasks[self._task_idx]
+        if kind == "baseline":
+            self._baseline.append(value)
+        else:
+            self._meas[k, quad] = value
+            if quad == 1:
+                self._update_live_plot()
+
+        self._task_idx += 1
+        self._progress.setValue(self._task_idx)
+        done_elems = max(0, (self._task_idx - len(self._baseline)) // 2)
+        if kind == "baseline":
+            self._run_lbl.setText(
+                f"Baseline {len(self._baseline)}/{self._baseline_spin.value()} "
+                f"— {value:+.5f} V")
+        else:
+            self._run_lbl.setText(
+                f"Element {k + 1}/{len(self._bits)} "
+                f"({'I' if quad == 0 else 'Q'}) — {value:+.5f} V  ·  "
+                f"{done_elems} accumulated")
+        self._run_lbl.setStyleSheet("")
+        self._issue_task()
+
+    # ── run: teardown ─────────────────────────────────────────────────────────
+
+    def _stop_timers(self):
+        self._ack_timer.stop()
+        self._settle_timer.stop()
+        self._awaiting_ack = False
+
+    def _restore_hardware(self):
+        """Put the phase shifter back where it was and idle the bit output, so
+        stopping a run doesn't leave the bench mid-element."""
+        cs = self._card_session
+        if cs is not None and cs.connected and self._pin_restore is not None:
+            try:
+                targets = list(cs.values)
+                targets[self._pin_spin.value()] = self._pin_restore
+                cs.write(targets)
+            except Exception as e:
+                print(f"[DotProduct] AOut restore failed: {e}")
+        if self._moku_panel is not None and self._moku_panel.is_connected:
+            self._moku_panel.request_waveform(
+                self._out_combo.currentData(), "DC", 0.0, 0.0, 0.0)
+
+    def _end_run(self):
+        self._running = False
+        self._stop_timers()
+        self._restore_hardware()
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._regen_btn.setEnabled(True)
+
+    def _abort(self, msg: str):
+        self._end_run()
+        self._fail(msg)
+        print(f"[DotProduct] Aborted — {msg}")
+
+    def _stop_run(self):
+        if not self._running:
+            return
+        self._end_run()
+        self._status("Dot Product stopped")
+        # Whatever completed is still a valid (shorter) result worth keeping.
+        if np.isfinite(self._meas[:, 1]).any():
+            self._finalize_result()
+            self._run_lbl.setText(
+                f"Stopped after {self._result['n_used']} of "
+                f"{len(self._bits)} elements — partial results kept.")
+        else:
+            self._run_lbl.setText("Stopped before any element completed.")
+
+    def _finish_run(self):
+        self._end_run()
+        # Every reading came back NaN — the scope never handed over a frame, so
+        # there is nothing to fit or plot. Say that plainly instead of showing
+        # a results window full of NaNs.
+        if not (np.isfinite(self._meas[:, 0]) & np.isfinite(self._meas[:, 1])).any():
+            self._fail("No detector readings captured — check that the Moku "
+                        "scope is running and the input is connected.")
+            return
+        self._finalize_result()
+        res = self._result
+        self._status(f"Dot Product complete — {res['n_used']} elements, "
+                     f"error {res['nrmse'] * 100:.2f}%")
+        self._show_results_plot()
+
+    # ── results ───────────────────────────────────────────────────────────────
+
+    def _baseline_v(self) -> float:
+        vals = [v for v in self._baseline if np.isfinite(v)]
+        if vals:
+            return float(np.mean(vals))
+        # No baseline taken (or all readings failed): fall back to the mean of
+        # every element reading, which is the detector's DC level as long as
+        # the phases cover the circle reasonably evenly.
+        finite = self._meas[np.isfinite(self._meas)]
+        return float(np.mean(finite)) if finite.size else 0.0
+
+    def _complex_from_readings(self, i_v, q_v, ref: float):
+        """Detector level at phase φ is P0 + P1·b·cos(φ), so the in-phase
+        reading minus the reference gives the real part directly, while the
+        quadrature reading gives P1·b·cos(φ+90°) = −P1·b·sin(φ) — the
+        NEGATIVE of the imaginary part. That sign is not a free parameter: a
+        fitted gain can absorb an overall sign, but not a relative one
+        between the real and imaginary axes."""
+        return (i_v - ref), -(q_v - ref)
+
+    def _finalize_result(self):
+        n_all = len(self._bits)
+        done  = np.isfinite(self._meas[:, 0]) & np.isfinite(self._meas[:, 1])
+        idx   = np.nonzero(done)[0]
+        ref   = self._baseline_v()
+
+        raw_i = self._meas[idx, 0]
+        raw_q = self._meas[idx, 1]
+        m_re, m_im = self._complex_from_readings(raw_i, raw_q, ref)
+
+        exp    = self._bits[idx] * np.exp(1j * self._phases[idx])
+        e_re   = exp.real
+        e_im   = exp.imag
+
+        gain = self._fit_gain(m_re, m_im, e_re, e_im)
+        s_re, s_im = m_re * gain, m_im * gain
+
+        cum_m_re, cum_m_im = np.cumsum(s_re), np.cumsum(s_im)
+        cum_e_re, cum_e_im = np.cumsum(e_re), np.cumsum(e_im)
+
+        # Per-element agreement, normalised by the expected vector's own
+        # magnitude so it reads as a fraction rather than raw volts.
+        err   = np.hypot(s_re - e_re, s_im - e_im)
+        scale = np.sqrt(np.mean(e_re ** 2 + e_im ** 2)) or 1.0
+        nrmse = float(np.sqrt(np.mean(err ** 2)) / scale) if err.size else float("nan")
+
+        stacked_m = np.concatenate([s_re, s_im])
+        stacked_e = np.concatenate([e_re, e_im])
+        if stacked_m.size >= 2 and stacked_m.std() > 0 and stacked_e.std() > 0:
+            corr = float(np.corrcoef(stacked_m, stacked_e)[0, 1])
+        else:
+            corr = float("nan")
+
+        elapsed = time.monotonic() - self._run_t0
+        n_meas  = len(self._baseline) + 2 * len(idx)
+
+        self._result = dict(
+            k=np.arange(1, len(idx) + 1), idx=idx,
+            n_used=len(idx), n_total=n_all,
+            bits=self._bits[idx], phases=self._phases[idx],
+            cmd_i=self._cmd_v[idx, 0], cmd_q=self._cmd_v[idx, 1],
+            raw_i=raw_i, raw_q=raw_q, baseline_v=ref,
+            meas_re=s_re, meas_im=s_im, exp_re=e_re, exp_im=e_im,
+            cum_meas_re=cum_m_re, cum_meas_im=cum_m_im,
+            cum_exp_re=cum_e_re, cum_exp_im=cum_e_im,
+            gain=gain, nrmse=nrmse, corr=corr,
+            elapsed_s=elapsed, n_meas=n_meas,
+            elem_per_s=(len(idx) / elapsed) if elapsed > 0 else float("nan"),
+            clamped=self._clamped, stale=self._stale,
+        )
+
+        final_m = complex(cum_m_re[-1], cum_m_im[-1]) if len(idx) else 0j
+        final_e = complex(cum_e_re[-1], cum_e_im[-1]) if len(idx) else 0j
+        self._run_lbl.setText(
+            f"Measured Σ = {final_m.real:+.4f} {final_m.imag:+.4f}j   ·   "
+            f"expected Σ = {final_e.real:+.4f} {final_e.imag:+.4f}j\n"
+            f"error {nrmse * 100:.2f}%  ·  corr {corr:.4f}  ·  "
+            f"gain {gain:.4g} (1/gain = {1.0 / gain:.4g} V per unit)\n"
+            f"{len(idx)} elements in {elapsed:.1f} s "
+            f"({self._result['elem_per_s']:.2f} elem/s achieved)"
+            + (f"  ·  ⚠ {self._clamped} drive clamps" if self._clamped else "")
+            + (f"  ·  ⚠ {self._stale} stale frames" if self._stale else ""))
+        self._run_lbl.setStyleSheet("")
+        self._results_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
+        self._update_live_plot()
+
+    def _fit_gain(self, m_re, m_im, e_re, e_im) -> float:
+        """Single real least-squares gain mapping the measured volts onto the
+        dimensionless expected products, fitted jointly over the real and
+        imaginary axes (they share one detector, so they share one gain)."""
+        if not self._autoscale_chk.isChecked():
+            manual = self._gain_spin.value()
+            return (1.0 / manual) if manual else 1.0
+        den = float(np.sum(m_re ** 2 + m_im ** 2))
+        if den <= 0:
+            return 1.0
+        num = float(np.sum(m_re * e_re + m_im * e_im))
+        return num / den if num != 0 else 1.0
+
+    # ── live plot ─────────────────────────────────────────────────────────────
+
+    def _reset_live_plot(self):
+        if not HAS_PYQTGRAPH or not self._live_curves:
+            return
+        n = len(self._bits)
+        exp = self._bits * np.exp(1j * self._phases)
+        ks  = np.arange(1, n + 1)
+        # The expected curves are fully known up front, so draw them
+        # immediately — the measured pair then fills in against them.
+        self._live_curves["exp_re"].setData(ks, np.cumsum(exp.real))
+        self._live_curves["exp_im"].setData(ks, np.cumsum(exp.imag))
+        self._live_curves["meas_re"].setData([], [])
+        self._live_curves["meas_im"].setData([], [])
+
+    def _update_live_plot(self):
+        """Redraws the measured cumulative curves. The fitted gain is
+        recomputed over everything measured so far, so early in a run the
+        curves visibly settle as the fit tightens."""
+        if not HAS_PYQTGRAPH or not self._live_curves:
+            return
+        done = np.isfinite(self._meas[:, 0]) & np.isfinite(self._meas[:, 1])
+        idx  = np.nonzero(done)[0]
+        if idx.size == 0:
+            return
+        ref = self._baseline_v()
+        m_re, m_im = self._complex_from_readings(
+            self._meas[idx, 0], self._meas[idx, 1], ref)
+        exp  = self._bits[idx] * np.exp(1j * self._phases[idx])
+        gain = self._fit_gain(m_re, m_im, exp.real, exp.imag)
+        ks   = np.arange(1, idx.size + 1)
+        self._live_curves["meas_re"].setData(ks, np.cumsum(m_re * gain))
+        self._live_curves["meas_im"].setData(ks, np.cumsum(m_im * gain))
+
+    def _show_results_plot(self):
+        if self._result is None:
+            return
+        win = DotProductPlotWindow("Dot Product — measured vs expected", self)
+        win.show_data(self._result)
+        mw = self.window()
+        win.move(mw.x() + 40, mw.y() + 40)
+        self._plot_win = win
+
+    # ── CSV export ────────────────────────────────────────────────────────────
+
+    def _export_csv(self):
+        res = self._result
+        if res is None:
+            return
+        import datetime
+        os.makedirs(DATA_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(DATA_DIR, f"dot_product_{stamp}.csv")
+
+        cs   = self._card_session
+        unit = cs.unit if cs else "V"
+        card = CARDS[cs.card_index]["label"] if cs else "?"
+        comments = [
+            f"elements_used: {res['n_used']} of {res['n_total']}",
+            f"card: {card}   aout_pin: {self._pin_spin.value()}   unit: {unit}",
+            f"phase_map: thermal, drive = Vpi*sqrt(phi/pi)",
+            f"vpi_{unit}: {self._vpi_spin.value():.6f}",
+            f"phase_bias_deg: {self._phi0_spin.value():.4f}",
+            f"weight_phase_mode: {self._phase_mode.currentData()}",
+            f"seed: {self._seed_spin.value()}",
+            f"bit_level_v: {self._bit_v_spin.value():.6f}",
+            f"moku_output: {self._out_combo.currentData()}   "
+            f"moku_input: {self._in_combo.currentData() + 1}",
+            f"step_period_ms: {self._step_spin.value()}",
+            f"baseline_samples: {len(self._baseline)}   "
+            f"baseline_v: {res['baseline_v']:.9e}",
+            f"quadrature: imag = -(Q_reading - baseline)",
+            f"autoscale: {self._autoscale_chk.isChecked()}   "
+            f"gain_units_per_volt: {res['gain']:.9e}",
+            f"nrmse: {res['nrmse']:.6f}   correlation: {res['corr']:.6f}",
+            f"elapsed_s: {res['elapsed_s']:.3f}   "
+            f"achieved_elem_per_s: {res['elem_per_s']:.4f}   "
+            f"measurements: {res['n_meas']}",
+            f"drive_clamps: {res['clamped']}   stale_frames: {res['stale']}",
+        ]
+        header = ["element", "bit", "weight_phase_deg",
+                  f"drive_inphase_{unit}", f"drive_quadrature_{unit}",
+                  "reading_inphase_V", "reading_quadrature_V",
+                  "measured_real", "measured_imag",
+                  "expected_real", "expected_imag",
+                  "cum_measured_real", "cum_measured_imag",
+                  "cum_expected_real", "cum_expected_imag"]
+        rows = []
+        for i in range(res["n_used"]):
+            rows.append([
+                int(res["idx"][i]) + 1,
+                f"{int(res['bits'][i]):+d}",
+                f"{math.degrees(res['phases'][i]):.4f}",
+                f"{res['cmd_i'][i]:.6f}", f"{res['cmd_q'][i]:.6f}",
+                f"{res['raw_i'][i]:.9e}", f"{res['raw_q'][i]:.9e}",
+                f"{res['meas_re'][i]:.6f}", f"{res['meas_im'][i]:.6f}",
+                f"{res['exp_re'][i]:.6f}",  f"{res['exp_im'][i]:.6f}",
+                f"{res['cum_meas_re'][i]:.6f}", f"{res['cum_meas_im'][i]:.6f}",
+                f"{res['cum_exp_re'][i]:.6f}",  f"{res['cum_exp_im'][i]:.6f}",
+            ])
+        write_csv_with_metadata(fname, comments, header, rows)
+        self._last_csv = fname
+        self._open_btn.setEnabled(True)
+        print(f"[DotProduct] Saved {len(rows)} rows → {fname}")
+
+        # Pair the results image with the CSV under data/images/, same
+        # convention as the AO sweep and Santec Fast Sweep exports.
+        img_saved = False
+        if HAS_MATPLOTLIB:
+            if self._plot_win is None:
+                self._show_results_plot()
+            if self._plot_win is not None:
+                os.makedirs(IMAGES_DIR, exist_ok=True)
+                img_path = os.path.join(
+                    IMAGES_DIR,
+                    os.path.splitext(os.path.basename(fname))[0] + ".png")
+                self._plot_win.save_png(img_path)
+                print(f"[DotProduct] Saved plot image → {img_path}")
+                img_saved = True
+        self._status(f"Saved {len(rows)} dot-product rows → {fname}"
+                      + ("  (+ image)" if img_saved else ""))
+
+    def cleanup(self):
+        if self._running:
+            self._end_run()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UNIFIED MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -8354,8 +9531,8 @@ class DetachedWindow(QMainWindow):
         event.accept()
 
 
-DEFAULT_TAB_ORDER = ["DAQ Control", "Moku", "CoreDAQ Power Meter", "Santec Laser",
-                      "ITLA Laser", "HP-8168F Laser", "CONEX Motor"]
+DEFAULT_TAB_ORDER = ["DAQ Control", "Moku", "Dot Product", "CoreDAQ Power Meter",
+                      "Santec Laser", "ITLA Laser", "HP-8168F Laser", "CONEX Motor"]
 
 
 class UnifiedMainWindow(QMainWindow):
@@ -8370,6 +9547,11 @@ class UnifiedMainWindow(QMainWindow):
         self.hp8168f_panel = HP8168FPanel()
         self.santec_panel  = SantecPanel()
         self.coredaq_panel = CoreDAQPanel()
+        # Drives the Moku generator/scope and a UEI AOut at once, so it
+        # borrows both of those already-connected sessions rather than
+        # opening its own (a Moku:Go allows a single owner at a time).
+        self.dot_panel     = DotProductPanel()
+        self.dot_panel.set_sources(self.moku_gen_panel, self.daq_panel)
         self.daq_panel.pin_view.set_coredaq_panel(self.coredaq_panel)
         self.itla_panel.set_coredaq_panel(self.coredaq_panel)
         self.hp8168f_panel.set_coredaq_panel(self.coredaq_panel)
@@ -8390,6 +9572,7 @@ class UnifiedMainWindow(QMainWindow):
         panels_by_title = {
             "DAQ Control":         self.daq_panel,
             "Moku":                self.moku_gen_panel,
+            "Dot Product":         self.dot_panel,
             "CoreDAQ Power Meter": self.coredaq_panel,
             "Santec Laser":        self.santec_panel,
             "ITLA Laser":          self.itla_panel,
@@ -8650,6 +9833,10 @@ class UnifiedMainWindow(QMainWindow):
         # Pull detached windows back in so cleanup runs cleanly
         for win in list(self._detached.values()):
             win.close()
+        # First — it drives the DAQ card and the Moku, so an in-flight run has
+        # to be stopped (and its phase shifter restored) before either of
+        # those sessions is torn down underneath it.
+        self.dot_panel.cleanup()
         self.daq_panel.cleanup()
         self.moku_gen_panel.cleanup()
         self.itla_panel.cleanup()

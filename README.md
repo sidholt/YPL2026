@@ -11,6 +11,10 @@ laser — each on its own tab, each degrading gracefully (tab stays visible
 with a message instead of crashing the app) if its hardware library isn't
 installed or its instrument isn't connected.
 
+Alongside the per-instrument tabs there's one cross-instrument measurement
+tab, **Dot Product**, which drives the Moku and a UEI phase shifter together
+to compute an optical multiply-accumulate.
+
 **New to the GUI?** This README covers installation and configuration. For how
 to *use* it — per-tab procedures, laser/DAQ safety, common lab workflows, and
 data formats — read the **[User Guide](docs/USER_GUIDE.md)**.
@@ -69,6 +73,37 @@ two at a time against the same physical device)
   Output 2 controls with an explanation rather than failing to connect. If a
   firmware revision ever exposes it, the second column enables itself with no
   code change.
+
+**Dot Product** (optical multiply-accumulate: Moku bit stream × UEI phase weights)
+- Computes a complex dot product on the bench: each element multiplies a
+  random bit `b` (±1, played as a DC level on a Moku generator output) by a
+  weight phase `φ` (held on one UEI AOut phase shifter), with the Moku scope
+  input reading the detector
+- **No ramping** — the AOut is stepped by direct writes, since slew-rate
+  limiting each element would dominate the step time and smear one element's
+  phase into the next
+- Real *and* imaginary parts recovered by quadrature: every element is
+  measured twice, at `φ` and at `φ + 90°`, because a detector reads power —
+  one real number — so a complex product can't come from a single reading
+- Adjustable multiplication speed (step period per measurement, with the
+  derived element rate shown; the achieved rate is reported after each run,
+  since the floor is the Moku's network round trip)
+- Weight phases: random over [0, 2π), random ±1 (0 or π), or a manual list of
+  degrees; fixable seed replays the exact same bit stream and weights
+- Thermal phase-shifter map (`drive = V_π·√(φ/π)`, i.e. φ ∝ drive²) with a
+  φ₀ bias for nulling the interferometer's own phase, and a warning when the
+  chosen `V_π` would need more drive than the card can deliver
+- Live plot of the running dot product — measured real/imaginary against the
+  expected curves, which are known up front and drawn immediately
+- Baseline (zero-product) reference taken before each run, plus a
+  least-squares gain fit so the detector's volts and the dimensionless
+  expected products are directly comparable; reports normalized error,
+  correlation, drive clamps and stale frames
+- Four-panel matplotlib results plot (cumulative real, cumulative imaginary,
+  per-element measured-vs-expected scatter, raw detector readings) and CSV
+  export with the PNG saved alongside
+- Borrows the already-connected Moku (from the Moku tab) and DAQ card (from
+  DAQ Control) rather than opening second sessions — connect both there first
 
 **CoreDAQ Power Meter**
 - Connects over USB-serial (auto-detect or manual COM port)
