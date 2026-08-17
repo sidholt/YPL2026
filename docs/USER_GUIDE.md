@@ -37,9 +37,11 @@ Three tabs can emit light into fiber: **Santec**, **ITLA**, and **HP-8168F**.
   assume it.
 - Never disconnect or reconnect fiber with the output on. Turn the output off
   in the GUI first.
-- Closing the GUI turns laser emission off as part of shutdown, but *do not*
-  rely on that as your safety procedure — it only helps if the software is
-  still responsive.
+- Closing the GUI turns the Santec and HP-8168F off as part of shutdown, but
+  *do not* rely on that as your safety procedure — it only helps if the
+  software is still responsive.
+- **The ITLA is not turned off on exit.** It keeps emitting after the GUI
+  closes. Turn it off with the ITLA tab's own **Off** button when you're done.
 
 ### Electrical safety on the DAQ
 
@@ -103,7 +105,8 @@ So a normal session is: launch, then connect the specific instruments you need.
 Close the main window. Shutdown does the following before exiting:
 
 1. Zeroes every DAQ output pin.
-2. Turns off laser emission (ITLA, Santec, HP-8168F).
+2. Turns off Santec and HP-8168F laser emission. **The ITLA is left as-is —
+   if it was emitting, it still is after the GUI closes.**
 3. Disconnects and releases every port, **including tabs you popped out into
    their own windows**.
 

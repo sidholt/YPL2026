@@ -4689,16 +4689,17 @@ class ITLAPanel(QWidget):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def cleanup(self):
+        # The laser is deliberately left in whatever state it is in — closing
+        # the GUI does not turn the ITLA off. Only stop the worker thread and
+        # release the serial port.
         if self.itla is None:
             return
-        if self._laser_state not in ("disconnected", "off"):
-            try:
-                if self.worker.isRunning():
-                    self.worker.terminate()
-                    self.worker.wait(2000)
-                self.itla.resena(0)
-            except Exception:
-                pass
+        try:
+            if self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait(2000)
+        except Exception:
+            pass
         try:
             self.itla.disconnect()
         except Exception:
@@ -8668,10 +8669,11 @@ def main():
     window.show()
 
     # Route Ctrl+C (and SIGTERM) through the normal window-close path so a
-    # console-launched quit still zeroes DAQ outputs and turns off the ITLA/
-    # Santec/HP-8168F lasers before exiting, instead of just dying in place
-    # with everything still live. window.close() triggers closeEvent(),
-    # which is what already does that shutdown work for the X-button path.
+    # console-launched quit still zeroes DAQ outputs and turns off the Santec/
+    # HP-8168F lasers before exiting, instead of just dying in place with
+    # everything still live. window.close() triggers closeEvent(), which is
+    # what already does that shutdown work for the X-button path. (The ITLA is
+    # intentionally exempt — it keeps lasing across a GUI restart.)
     def _handle_quit_signal(*_args):
         window.close()
         app.quit()

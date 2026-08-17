@@ -287,10 +287,11 @@ A few things worth knowing up front:
   side). A popped-out window has a "⬅ Reattach to main window" button.
 - Closing the main window disconnects and cleans up every instrument, even
   ones currently popped out into their own windows. Before disconnecting, it
-  zeros every DAQ output pin and turns off laser emission (ITLA, Santec,
-  HP-8168F) — a manual Disconnect click does the same for whichever
-  instrument you clicked it on. Killing the process from Task Manager skips
-  all of that and leaves outputs live.
+  zeros every DAQ output pin and turns off Santec/HP-8168F laser emission — a
+  manual Disconnect click does the same for whichever instrument you clicked it
+  on. The **ITLA is deliberately left emitting** on exit (use its own Off
+  button); everything else is shut down. Killing the process from Task Manager
+  skips all of that and leaves outputs live.
 
 ## Configuration
 
