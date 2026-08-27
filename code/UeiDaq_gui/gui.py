@@ -29,7 +29,9 @@ from PyQt6.QtWidgets import (
     QSpinBox, QComboBox, QLineEdit, QCheckBox, QTabWidget, QTabBar, QTextEdit,
     QMessageBox, QListWidget, QListWidgetItem, QProgressBar
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, QObject, QEventLoop, QEvent
+from PyQt6.QtCore import (
+    Qt, pyqtSignal, QTimer, QThread, QObject, QEventLoop, QEvent, QRectF
+)
 from PyQt6.QtGui import QPalette, QColor
 
 # ── Optional hardware libraries (each tab degrades gracefully) ────────────────
@@ -628,6 +630,40 @@ DOT_PHASE_MODES = [
     ("Manual list (degrees)", "manual"),
 ]
 
+# ── 2D Sweep tab ──────────────────────────────────────────────────────────────
+# One detector mapped over two axes at once, drawn as a heatmap. The drive
+# axis (a UEI AOut or a DC level on a Moku generator output) is the fast/inner
+# axis and the laser axis (wavelength or power) is the slow/outer one, because
+# retuning a laser costs orders of magnitude more time than moving a DAC — the
+# laser is therefore stepped once per row, not once per point.
+SWEEP2D_DEFAULT_STEPS        = 21
+SWEEP2D_DEFAULT_DWELL_MS     = 200      # settle after each drive step
+SWEEP2D_DEFAULT_LASER_MS     = 2000     # extra settle after each laser step
+SWEEP2D_DEFAULT_SAMPLES      = 3        # detector readings averaged per point
+SWEEP2D_SAMPLE_INTERVAL_MS   = 25
+SWEEP2D_DRIVE_ACK_TIMEOUT_MS = 5000     # Moku "waveform applied" acknowledgement
+SWEEP2D_RAMP_TIMEOUT_MS      = 15000    # slew-rate-limited UEI ramp to one step
+SWEEP2D_LASER_TIMEOUT_MS     = 180000   # an ITLA relock can genuinely take minutes
+SWEEP2D_FRAME_WAIT_MS        = 8        # re-check interval while awaiting a Moku frame
+SWEEP2D_FRAME_WAIT_MAX_MS    = 2000     # hard cap on that wait, per sample
+
+# Offered in the heatmap window's Interpolation box. These are matplotlib
+# imshow() methods: "nearest" shows the measured grid exactly as sampled (no
+# invented detail), everything below it smooths between measured points to
+# varying degrees. Which one is honest for a given grid is a judgement call
+# you can only make while looking at the data, hence a live control.
+SWEEP2D_INTERPOLATIONS = ["nearest", "bilinear", "bicubic", "gaussian",
+                          "spline16", "spline36", "hanning", "hamming",
+                          "quadric", "catrom", "lanczos", "sinc"]
+SWEEP2D_COLORMAPS = ["viridis", "plasma", "inferno", "magma", "turbo",
+                     "cividis", "jet", "coolwarm", "RdBu_r", "gray"]
+
+# Viridis anchor points for the live pyqtgraph heatmap, spelled out rather
+# than pulled from pyqtgraph's colormap registry (which names ship with it
+# varies by version, and a missing name would raise mid-run).
+SWEEP2D_LIVE_COLORS = [(68, 1, 84), (59, 82, 139), (33, 145, 140),
+                       (94, 201, 98), (253, 231, 37)]
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DAQ — WORKERS & SESSIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1061,7 +1097,15 @@ class MokuMultiSession:
             self._wg.generate_waveform(channel=channel, type="Off")
             return
         if wf_type == "DC":
-            self._wg.generate_waveform(channel=channel, type="DC", offset=offset)
+            # A DC wave's level is `dc_level`, NOT `offset` — the two are
+            # different parameters in the generator API (`offset` is the DC
+            # offset added to a *waveform*, and it defaults to 0, which is why
+            # passing it alone left the level unset and the device rejected
+            # the call with "dc_level cannot be empty for DC wave"). The GUI
+            # keeps calling it "Offset (V)" since that's the only level a DC
+            # output has; only the wire name changes here.
+            self._wg.generate_waveform(channel=channel, type="DC",
+                                        dc_level=offset)
             return
         kwargs = dict(channel=channel, type=wf_type, amplitude=amplitude,
                       frequency=frequency, offset=offset, phase=phase)
@@ -4606,6 +4650,37 @@ class ITLAPanel(QWidget):
         """Wires the CoreDAQ tab in so wavelength sweeps can log optical power."""
         self._coredaq_panel = panel
 
+    # ── 2D Sweep hooks ────────────────────────────────────────────────────────
+    # Unlike the GPIB lasers this one has no plain "set wavelength": a
+    # wavelength is an ITU channel plus an optional fine-tune offset, and
+    # applying it is a live retune (relock), so the 2D Sweep tab awaits the
+    # worker's done("retune") exactly as the Retune button does.
+
+    def sweep2d_ready(self) -> bool:
+        return self.worker is not None and getattr(self, "_laser_state", "") == "on"
+
+    def sweep2d_done_signal(self):
+        return self.worker.done if self.worker is not None else None
+
+    def sweep2d_range(self, quantity: str):
+        spin = self.spin_nm if quantity == "wavelength" else self.spin_mw
+        return spin.minimum(), spin.maximum()
+
+    def sweep2d_apply(self, quantity: str, value: float) -> str:
+        """Queues one setpoint; returns the op name whose done() completes it."""
+        if quantity == "wavelength":
+            self.spin_nm.setValue(value)
+            ch, ftf = nm_to_itla_ch_ftf(value, self._fcf1, self._fcf2,
+                                         self._grid, self._ui_grid)
+            self._set_state("locking")
+            self.worker.run_op("retune", ch=ch, ftf=ftf,
+                                mw=self.spin_mw.value(),
+                                use_ftf=self.chk_ftf.isChecked())
+            return "retune"
+        self.spin_mw.setValue(value)
+        self.worker.run_op("set_power_live", mw=value)
+        return "set_power_live"
+
     def _show_sweep_power_plot(self):
         series = {}
         for ch in range(4):
@@ -6151,6 +6226,28 @@ class HP8168FPanel(QWidget):
             return None
         return {"wavelength_nm": self._last_wavelength_nm, "power_mw": self._last_power_mw}
 
+    # ── 2D Sweep hooks (see SantecPanel for the rationale) ────────────────────
+
+    def sweep2d_ready(self) -> bool:
+        return hasattr(self, "_worker") and self._status_lbl.text() == "CONNECTED"
+
+    def sweep2d_done_signal(self):
+        return self._worker.op_done if hasattr(self, "_worker") else None
+
+    def sweep2d_range(self, quantity: str):
+        spin = self._wl_spin if quantity == "wavelength" else self._pow_spin
+        return spin.minimum(), spin.maximum()
+
+    def sweep2d_apply(self, quantity: str, value: float) -> str:
+        """Queues one setpoint; returns the op name whose op_done completes it."""
+        if quantity == "wavelength":
+            self._wl_spin.setValue(value)
+            self._sig_set_wl.emit(value)
+            return "set_wavelength"
+        self._pow_spin.setValue(value)
+        self._sig_set_power.emit(value)
+        return "set_power"
+
     def set_coredaq_panel(self, panel):
         """Wires the CoreDAQ tab in so wavelength sweeps can log optical power."""
         self._coredaq_panel = panel
@@ -7066,6 +7163,33 @@ class SantecPanel(QWidget):
         if self._status_lbl.text() == "DISCONNECTED":
             return None
         return {"wavelength_nm": self._last_wavelength_nm, "power_mw": self._last_power_mw}
+
+    # ── 2D Sweep hooks ────────────────────────────────────────────────────────
+    # The 2D Sweep tab steps this laser as its slow axis. It borrows this
+    # panel's already-connected worker rather than opening a second session —
+    # the Prologix adapter allows a single owner at a time.
+
+    def sweep2d_ready(self) -> bool:
+        return (hasattr(self, "_worker")
+                and self._status_lbl.text() == "CONNECTED"
+                and not self._fast_sweep_running)
+
+    def sweep2d_done_signal(self):
+        return self._worker.op_done if hasattr(self, "_worker") else None
+
+    def sweep2d_range(self, quantity: str):
+        spin = self._wl_spin if quantity == "wavelength" else self._pow_spin
+        return spin.minimum(), spin.maximum()
+
+    def sweep2d_apply(self, quantity: str, value: float) -> str:
+        """Queues one setpoint; returns the op name whose op_done completes it."""
+        if quantity == "wavelength":
+            self._wl_spin.setValue(value)
+            self._sig_set_wl.emit(value)
+            return "set_wavelength"
+        self._pow_spin.setValue(value)
+        self._sig_set_power.emit(value)
+        return "set_power"
 
     def set_coredaq_panel(self, panel):
         """Wires the CoreDAQ tab in so wavelength sweeps can log optical power."""
@@ -9443,6 +9567,1274 @@ class DotProductPanel(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 2D SWEEP — drive axis × laser axis heatmap
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HeatmapWindow(QWidget):
+    """
+    Matplotlib heatmap of a 2D sweep, with the interpolation, colormap and
+    colour scaling all adjustable *after* the run.
+
+    Interpolation is deliberately a live control rather than a plot-time
+    parameter: a measured grid is coarse, and how much smoothing between real
+    samples is honest (as opposed to inventing structure that was never
+    measured) is a judgement you can only make while looking at the data.
+    "nearest" — one flat cell per measured point, no invention at all — is
+    the default for exactly that reason.
+    """
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1200, 850)
+
+        self._x = self._y = self._z = None
+        self._labels = ("x", "y", "z")
+
+        layout = QVBoxLayout(self)
+        if not HAS_MATPLOTLIB:
+            layout.addWidget(QLabel("matplotlib required for the heatmap — "
+                                     "run: uv pip install matplotlib"))
+            self._fig = self._canvas = None
+            return
+
+        self.setStyleSheet("background-color: white;")
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(8, 6, 8, 0)
+        saved = load_connection_settings()
+
+        def _label(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color: #333333;")
+            return lbl
+
+        controls.addWidget(_label("Interpolation:"))
+        self._interp_combo = QComboBox()
+        self._interp_combo.addItems(SWEEP2D_INTERPOLATIONS)
+        self._interp_combo.setToolTip(
+            "How the measured grid is resampled onto the screen.\n"
+            "'nearest' draws one flat cell per measured point and invents "
+            "nothing;\nthe others smooth between measured points to varying "
+            "degrees.")
+        self._interp_combo.setCurrentText(
+            saved.get("sweep2d_interpolation", "nearest"))
+        self._interp_combo.currentTextChanged.connect(self._on_control_changed)
+        controls.addWidget(self._interp_combo)
+
+        controls.addSpacing(12)
+        controls.addWidget(_label("Colormap:"))
+        self._cmap_combo = QComboBox()
+        self._cmap_combo.addItems(SWEEP2D_COLORMAPS)
+        self._cmap_combo.setCurrentText(saved.get("sweep2d_colormap", "viridis"))
+        self._cmap_combo.currentTextChanged.connect(self._on_control_changed)
+        controls.addWidget(self._cmap_combo)
+
+        controls.addSpacing(12)
+        self._log_chk = QCheckBox("Log colour scale")
+        self._log_chk.setToolTip(
+            "Log₁₀ colour scaling — useful when the detector spans decades "
+            "(e.g. an MZI null next to a peak).\nIgnored if any value in the "
+            "grid is zero or negative.")
+        self._log_chk.setStyleSheet("color: #333333;")
+        self._log_chk.setChecked(saved.get("sweep2d_log_scale", False))
+        self._log_chk.toggled.connect(self._on_control_changed)
+        controls.addWidget(self._log_chk)
+
+        controls.addStretch()
+        self._note_lbl = QLabel("")
+        self._note_lbl.setStyleSheet("color: #999900;")
+        controls.addWidget(self._note_lbl)
+        layout.addLayout(controls)
+
+        self._fig = Figure(figsize=(11, 7.5), dpi=120, facecolor="white")
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        layout.addWidget(self._canvas)
+        try:
+            from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+            layout.addWidget(NavigationToolbar2QT(self._canvas, self))
+        except Exception:
+            pass
+
+    def show_data(self, x_vals, y_vals, z, x_label: str, y_label: str,
+                  z_label: str):
+        """`z` is (len(y_vals), len(x_vals)); unmeasured points are NaN."""
+        self._x = np.asarray(x_vals, dtype=float)
+        self._y = np.asarray(y_vals, dtype=float)
+        self._z = np.asarray(z, dtype=float)
+        self._labels = (x_label, y_label, z_label)
+        if HAS_MATPLOTLIB:
+            self._redraw()
+        self.show()
+        self.raise_()
+
+    def _on_control_changed(self, *_):
+        save_connection_setting("sweep2d_interpolation",
+                                 self._interp_combo.currentText())
+        save_connection_setting("sweep2d_colormap", self._cmap_combo.currentText())
+        save_connection_setting("sweep2d_log_scale", self._log_chk.isChecked())
+        if self._z is not None:
+            self._redraw()
+
+    @staticmethod
+    def _axis_extent(vals):
+        """Half-cell-padded (lo, hi) so each measured point sits at the centre
+        of its cell rather than on the edge of the image."""
+        if len(vals) > 1:
+            step = (vals[-1] - vals[0]) / (len(vals) - 1)
+        else:
+            step = 1.0
+        return vals[0] - step / 2.0, vals[-1] + step / 2.0
+
+    def _redraw(self):
+        from matplotlib.colors import LogNorm
+
+        x, y, z = self._x, self._y, self._z
+        # imshow's extent assumes ascending axes, so flip whichever axis was
+        # swept downwards (a Start > Stop range) along with its data — the map
+        # then reads the same way round regardless of sweep direction.
+        if len(x) > 1 and x[0] > x[-1]:
+            x, z = x[::-1], z[:, ::-1]
+        if len(y) > 1 and y[0] > y[-1]:
+            y, z = y[::-1], z[::-1, :]
+
+        x_lo, x_hi = self._axis_extent(x)
+        y_lo, y_hi = self._axis_extent(y)
+
+        try:
+            cmap = matplotlib.colormaps[self._cmap_combo.currentText()].copy()
+        except Exception:
+            cmap = matplotlib.cm.get_cmap(self._cmap_combo.currentText()).copy()
+        # Points that were never measured (a stopped run) stay visibly blank
+        # instead of being coloured as if they held a real value.
+        cmap.set_bad("#dcdcdc")
+
+        finite = z[np.isfinite(z)]
+        norm = None
+        note = ""
+        if self._log_chk.isChecked():
+            if finite.size and finite.min() > 0:
+                norm = LogNorm(vmin=float(finite.min()), vmax=float(finite.max()))
+            else:
+                note = "log scale ignored — grid contains values ≤ 0"
+
+        interp = self._interp_combo.currentText()
+        if interp != "nearest" and finite.size < z.size:
+            note = (note + "  ·  " if note else "") + \
+                   "smoothing across unmeasured points"
+        self._note_lbl.setText(note)
+
+        self._fig.clear()
+        ax = self._fig.add_subplot(111, facecolor="white")
+        im = ax.imshow(np.ma.masked_invalid(z), origin="lower", aspect="auto",
+                        extent=[x_lo, x_hi, y_lo, y_hi], cmap=cmap,
+                        norm=norm, interpolation=interp)
+        cbar = self._fig.colorbar(im, ax=ax, pad=0.02)
+        cbar.set_label(self._labels[2], fontsize=11)
+        if norm is not None:
+            # A log colour bar over less than a decade (common — an MZI
+            # fringe) otherwise labels every tick "2.75 × 10⁰", which is
+            # unreadable for what is really just 2.75 nW.
+            from matplotlib.ticker import ScalarFormatter
+            for axis_fmt in (cbar.ax.yaxis.set_major_formatter,
+                              cbar.ax.yaxis.set_minor_formatter):
+                axis_fmt(ScalarFormatter())
+        ax.set_xlabel(self._labels[0], fontsize=12)
+        ax.set_ylabel(self._labels[1], fontsize=12)
+        ax.set_title(self.windowTitle(), fontsize=13)
+        ax.tick_params(axis="both", labelsize=10)
+        self._fig.tight_layout()
+        self._canvas.draw()
+
+    def save_png(self, path: str) -> None:
+        if HAS_MATPLOTLIB and self._fig is not None:
+            self._fig.savefig(path, facecolor="white", dpi=200)
+
+
+class Sweep2DPanel(QWidget):
+    """
+    "2D Sweep" tab — one detector mapped over two swept axes at once.
+
+    X (fast axis) is a drive level: either a UEI AOut (stepped through the
+    card's slew-rate-limited ramp, same as the DAQ tab's 1D sweep) or a DC
+    level on a Moku generator output. Y (slow axis) is laser wavelength or
+    laser power on whichever laser tab is connected.
+
+    The laser is deliberately the OUTER axis: retuning — and, on the ITLA,
+    relocking — a laser costs orders of magnitude more time than moving a
+    DAC, so it is stepped once per row rather than once per point. A full
+    drive sweep therefore runs at each wavelength/power in turn.
+
+    Every instrument is borrowed from its own tab rather than reopened here
+    (one owner per Moku, per GPIB adapter, per card), so each one has to be
+    connected in its own tab first.
+
+    The run is a GUI-thread state machine driven by QTimers and the workers'
+    completion signals — the same shape as the Dot Product tab — so the UI
+    stays responsive throughout and Stop takes effect between any two steps:
+
+        row: set laser → await op_done → laser settle
+        point: set drive → await arrival/ack → dwell → average N readings
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._moku_panel    = None
+        self._daq_panel     = None
+        self._coredaq_panel = None
+        self._lasers        = {}      # key -> laser panel
+
+        # ── Run state ────────────────────────────────────────────────────────
+        self._running   = False
+        self._x_vals    = np.zeros(0)
+        self._y_vals    = np.zeros(0)
+        self._z         = np.zeros((0, 0))
+        self._z4        = None        # all four CoreDAQ heads, when in use
+        self._iy        = 0
+        self._xi        = 0
+        self._x_order   = []
+        self._done_pts  = 0
+        self._samples   = []
+        self._stale     = 0
+        self._run_t0    = 0.0
+        self._result    = None
+        self._plot_win  = None
+        self._last_csv  = None
+        self._last_matrix_csv = None
+
+        # Per-step handshake bookkeeping
+        self._awaiting_laser = None   # (laser_key, op_name) or None
+        self._awaiting_wf    = False
+        self._need_seq       = 0      # Moku frame counter the next read must beat
+        self._frame_waited   = 0
+        self._ramp_waited    = 0
+
+        # Hardware to put back the way we found it
+        self._card_session = None
+        self._pin_restore  = None
+        self._moku_restore = None
+
+        self._laser_timeout = QTimer(self)
+        self._laser_timeout.setSingleShot(True)
+        self._laser_timeout.timeout.connect(self._on_laser_timeout)
+
+        self._laser_settle = QTimer(self)
+        self._laser_settle.setSingleShot(True)
+        self._laser_settle.timeout.connect(self._issue_point)
+
+        self._wf_timeout = QTimer(self)
+        self._wf_timeout.setSingleShot(True)
+        self._wf_timeout.timeout.connect(self._on_wf_timeout)
+
+        self._ramp_poll = QTimer(self)
+        self._ramp_poll.setInterval(RAMP_TICK_MS)
+        self._ramp_poll.timeout.connect(self._check_ramp)
+
+        self._dwell_timer = QTimer(self)
+        self._dwell_timer.setSingleShot(True)
+        self._dwell_timer.timeout.connect(self._begin_samples)
+
+        self._sample_timer = QTimer(self)
+        self._sample_timer.setSingleShot(True)
+        self._sample_timer.timeout.connect(self._take_sample)
+
+        self._build_ui()
+        self._on_drive_source_changed()
+        self._on_laser_changed()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        outer.addLayout(grid)
+        grid.addWidget(self._build_drive_box(),    0, 0)
+        grid.addWidget(self._build_laser_box(),    0, 1)
+        grid.addWidget(self._build_detector_box(), 1, 0)
+        grid.addWidget(self._build_run_box(),      1, 1)
+
+        outer.addWidget(self._build_live_box(), 1)
+
+    def _build_drive_box(self):
+        box = QGroupBox("X axis — Drive (fast axis)")
+        lay = QGridLayout(box)
+        r = 0
+
+        lay.addWidget(QLabel("Source:"), r, 0)
+        self._src_combo = QComboBox()
+        self._src_combo.addItem("UEI DAQ AOut", "uei")
+        self._src_combo.addItem("Moku output (DC level)", "moku")
+        saved = load_connection_settings().get("sweep2d_drive_source")
+        idx = self._src_combo.findData(saved)
+        if idx >= 0:
+            self._src_combo.setCurrentIndex(idx)
+        self._src_combo.currentIndexChanged.connect(self._on_drive_source_changed)
+        lay.addWidget(self._src_combo, r, 1); r += 1
+
+        lay.addWidget(QLabel("Card:"), r, 0)
+        self._card_combo = QComboBox()
+        for i, info in CARDS.items():
+            if info["available"]:
+                self._card_combo.addItem(info["label"], i)
+        saved = load_connection_settings().get("sweep2d_card_index")
+        idx = self._card_combo.findData(saved)
+        self._card_combo.setCurrentIndex(idx if idx >= 0 else
+                                          max(0, self._card_combo.count() - 1))
+        self._card_combo.currentIndexChanged.connect(self._on_card_changed)
+        lay.addWidget(self._card_combo, r, 1); r += 1
+
+        lay.addWidget(QLabel("AOut pin:"), r, 0)
+        self._pin_spin = NoScrollSpinBox()
+        self._pin_spin.setRange(0, MAX_PINS - 1)
+        self._pin_spin.setToolTip("The AOut driven along the X axis. It is "
+                                   "ramped (slew-rate limited) to each step.")
+        persist_spinbox(self._pin_spin, "sweep2d_pin")
+        lay.addWidget(self._pin_spin, r, 1); r += 1
+
+        lay.addWidget(QLabel("Moku output:"), r, 0)
+        self._out_combo = QComboBox()
+        self._out_combo.addItem("Output 1", 1)
+        self._out_combo.addItem("Output 2", 2)
+        self._out_combo.setToolTip("Generator output driven as a DC level.")
+        saved = load_connection_settings().get("sweep2d_moku_output")
+        idx = self._out_combo.findData(saved)
+        if idx >= 0:
+            self._out_combo.setCurrentIndex(idx)
+        self._out_combo.currentIndexChanged.connect(
+            lambda _: save_connection_setting("sweep2d_moku_output",
+                                               self._out_combo.currentData()))
+        lay.addWidget(self._out_combo, r, 1); r += 1
+
+        self._x_start_lbl = QLabel("Start:")
+        lay.addWidget(self._x_start_lbl, r, 0)
+        self._x_start = NoScrollDoubleSpinBox()
+        self._x_start.setDecimals(4)
+        self._x_start.setRange(-20.0, 20.0)
+        persist_spinbox(self._x_start, "sweep2d_x_start")
+        self._x_start.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._x_start, r, 1); r += 1
+
+        self._x_stop_lbl = QLabel("Stop:")
+        lay.addWidget(self._x_stop_lbl, r, 0)
+        self._x_stop = NoScrollDoubleSpinBox()
+        self._x_stop.setDecimals(4)
+        self._x_stop.setRange(-20.0, 20.0)
+        self._x_stop.setValue(1.0)
+        persist_spinbox(self._x_stop, "sweep2d_x_stop")
+        self._x_stop.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._x_stop, r, 1); r += 1
+
+        lay.addWidget(QLabel("Steps:"), r, 0)
+        self._x_steps = NoScrollSpinBox()
+        self._x_steps.setRange(1, 1001)
+        self._x_steps.setValue(SWEEP2D_DEFAULT_STEPS)
+        persist_spinbox(self._x_steps, "sweep2d_x_steps")
+        self._x_steps.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._x_steps, r, 1); r += 1
+
+        self._serpentine_chk = QCheckBox("Serpentine (zig-zag) scan")
+        self._serpentine_chk.setToolTip(
+            "Sweep alternate rows in the opposite direction, so each row "
+            "starts where the previous one ended.\nSaves the long jump back "
+            "to Start every row — but on a hysteretic (e.g. thermal) device "
+            "it can\nleave a visible odd/even row difference. Turn it off if "
+            "the map looks combed.")
+        self._serpentine_chk.setChecked(
+            load_connection_settings().get("sweep2d_serpentine", True))
+        self._serpentine_chk.toggled.connect(
+            lambda v: save_connection_setting("sweep2d_serpentine", v))
+        lay.addWidget(self._serpentine_chk, r, 0, 1, 2); r += 1
+
+        self._drive_note = QLabel("")
+        self._drive_note.setWordWrap(True)
+        self._drive_note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        lay.addWidget(self._drive_note, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        return box
+
+    def _build_laser_box(self):
+        box = QGroupBox("Y axis — Laser (slow axis)")
+        lay = QGridLayout(box)
+        r = 0
+
+        lay.addWidget(QLabel("Laser:"), r, 0)
+        self._laser_combo = QComboBox()
+        self._laser_combo.addItem("Santec TSL-550", "santec")
+        self._laser_combo.addItem("HP-8168F", "hp8168f")
+        self._laser_combo.addItem("ITLA (Emcore TTX)", "itla")
+        saved = load_connection_settings().get("sweep2d_laser")
+        idx = self._laser_combo.findData(saved)
+        if idx >= 0:
+            self._laser_combo.setCurrentIndex(idx)
+        self._laser_combo.currentIndexChanged.connect(self._on_laser_changed)
+        lay.addWidget(self._laser_combo, r, 1); r += 1
+
+        lay.addWidget(QLabel("Sweep:"), r, 0)
+        self._qty_combo = QComboBox()
+        self._qty_combo.addItem("Wavelength (nm)", "wavelength")
+        self._qty_combo.addItem("Power (mW)", "power")
+        saved = load_connection_settings().get("sweep2d_quantity")
+        idx = self._qty_combo.findData(saved)
+        if idx >= 0:
+            self._qty_combo.setCurrentIndex(idx)
+        self._qty_combo.currentIndexChanged.connect(self._on_laser_changed)
+        lay.addWidget(self._qty_combo, r, 1); r += 1
+
+        self._y_start_lbl = QLabel("Start:")
+        lay.addWidget(self._y_start_lbl, r, 0)
+        self._y_start = NoScrollDoubleSpinBox()
+        self._y_start.setDecimals(4)
+        self._y_start.setRange(0.0, 2000.0)
+        self._y_start.setValue(1550.0)
+        persist_spinbox(self._y_start, "sweep2d_y_start")
+        self._y_start.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._y_start, r, 1); r += 1
+
+        self._y_stop_lbl = QLabel("Stop:")
+        lay.addWidget(self._y_stop_lbl, r, 0)
+        self._y_stop = NoScrollDoubleSpinBox()
+        self._y_stop.setDecimals(4)
+        self._y_stop.setRange(0.0, 2000.0)
+        self._y_stop.setValue(1560.0)
+        persist_spinbox(self._y_stop, "sweep2d_y_stop")
+        self._y_stop.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._y_stop, r, 1); r += 1
+
+        lay.addWidget(QLabel("Steps:"), r, 0)
+        self._y_steps = NoScrollSpinBox()
+        self._y_steps.setRange(1, 501)
+        self._y_steps.setValue(11)
+        persist_spinbox(self._y_steps, "sweep2d_y_steps")
+        self._y_steps.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._y_steps, r, 1); r += 1
+
+        lay.addWidget(QLabel("Settle after each step (ms):"), r, 0)
+        self._laser_settle_spin = NoScrollSpinBox()
+        self._laser_settle_spin.setRange(0, 120_000)
+        self._laser_settle_spin.setValue(SWEEP2D_DEFAULT_LASER_MS)
+        self._laser_settle_spin.setToolTip(
+            "Extra wait after the laser reports the setpoint applied, before "
+            "the row's first point is measured.\nGPIB lasers acknowledge a "
+            "set command well before the output has actually settled.")
+        persist_spinbox(self._laser_settle_spin, "sweep2d_laser_settle_ms")
+        self._laser_settle_spin.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._laser_settle_spin, r, 1); r += 1
+
+        self._laser_note = QLabel("")
+        self._laser_note.setWordWrap(True)
+        self._laser_note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        lay.addWidget(self._laser_note, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        return box
+
+    def _build_detector_box(self):
+        box = QGroupBox("Detector & Timing")
+        lay = QGridLayout(box)
+        r = 0
+
+        lay.addWidget(QLabel("Detector:"), r, 0)
+        self._det_combo = QComboBox()
+        for h in range(1, 5):
+            self._det_combo.addItem(f"CoreDAQ head {h}", f"coredaq{h}")
+        self._det_combo.addItem("Moku input 1", "moku1")
+        self._det_combo.addItem("Moku input 2", "moku2")
+        self._det_combo.setToolTip(
+            "What is measured at each grid point.\nCoreDAQ: the latest "
+            "polled optical power (all four heads are recorded to CSV "
+            "regardless of\nwhich one is mapped). Moku: the mean of one "
+            "captured scope frame.")
+        saved = load_connection_settings().get("sweep2d_detector")
+        idx = self._det_combo.findData(saved)
+        if idx >= 0:
+            self._det_combo.setCurrentIndex(idx)
+        self._det_combo.currentIndexChanged.connect(self._on_detector_changed)
+        lay.addWidget(self._det_combo, r, 1); r += 1
+
+        lay.addWidget(QLabel("Dwell per point (ms):"), r, 0)
+        self._dwell_spin = NoScrollSpinBox()
+        self._dwell_spin.setRange(0, 60_000)
+        self._dwell_spin.setValue(SWEEP2D_DEFAULT_DWELL_MS)
+        self._dwell_spin.setToolTip(
+            "Settle time after the drive has arrived at a step, before the "
+            "readings for that point are taken.")
+        persist_spinbox(self._dwell_spin, "sweep2d_dwell_ms")
+        self._dwell_spin.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._dwell_spin, r, 1); r += 1
+
+        lay.addWidget(QLabel("Readings averaged per point:"), r, 0)
+        self._samples_spin = NoScrollSpinBox()
+        self._samples_spin.setRange(1, 200)
+        self._samples_spin.setValue(SWEEP2D_DEFAULT_SAMPLES)
+        self._samples_spin.setToolTip(
+            f"Detector readings averaged into each grid point "
+            f"(~{SWEEP2D_SAMPLE_INTERVAL_MS} ms apart on CoreDAQ; one fresh "
+            f"frame each on the Moku).")
+        persist_spinbox(self._samples_spin, "sweep2d_samples")
+        self._samples_spin.valueChanged.connect(lambda _: self._update_notes())
+        lay.addWidget(self._samples_spin, r, 1); r += 1
+
+        self._timing_note = QLabel("")
+        self._timing_note.setWordWrap(True)
+        self._timing_note.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        lay.addWidget(self._timing_note, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        return box
+
+    def _build_run_box(self):
+        box = QGroupBox("Run")
+        lay = QGridLayout(box)
+        r = 0
+
+        self._run_btn = QPushButton("▶  Run 2D sweep")
+        self._run_btn.clicked.connect(self._start_sweep)
+        lay.addWidget(self._run_btn, r, 0)
+        self._stop_btn = QPushButton("■  Stop")
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._stop_sweep)
+        lay.addWidget(self._stop_btn, r, 1); r += 1
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        lay.addWidget(self._progress, r, 0, 1, 2); r += 1
+
+        self._run_lbl = QLabel("Idle")
+        self._run_lbl.setWordWrap(True)
+        lay.addWidget(self._run_lbl, r, 0, 1, 2); r += 1
+
+        self._heatmap_btn = QPushButton("🗺  Heatmap")
+        self._heatmap_btn.setEnabled(False)
+        self._heatmap_btn.setToolTip(
+            "Open the matplotlib heatmap, where the interpolation, colormap "
+            "and colour scale can be changed live.")
+        self._heatmap_btn.clicked.connect(self._show_heatmap)
+        lay.addWidget(self._heatmap_btn, r, 0)
+        self._export_btn = QPushButton("💾  Export CSV")
+        self._export_btn.setEnabled(False)
+        self._export_btn.clicked.connect(self._export_csv)
+        lay.addWidget(self._export_btn, r, 1); r += 1
+
+        self._open_btn = QPushButton("📂  Open last CSV")
+        self._open_btn.setEnabled(False)
+        self._open_btn.clicked.connect(
+            lambda: open_saved_file(self._last_csv) if self._last_csv else None)
+        lay.addWidget(self._open_btn, r, 0, 1, 2); r += 1
+
+        lay.setRowStretch(r, 1)
+        return box
+
+    def _build_live_box(self):
+        box = QGroupBox("Live heatmap")
+        lay = QVBoxLayout(box)
+
+        if not HAS_PYQTGRAPH:
+            self._img = None
+            lay.addWidget(QLabel("(install pyqtgraph for the live heatmap: "
+                                  "uv pip install pyqtgraph)"))
+            return box
+
+        self._live_plot = pg.PlotWidget()
+        self._live_plot.setMinimumHeight(260)
+        self._img = pg.ImageItem()
+        cmap = pg.ColorMap(np.linspace(0.0, 1.0, len(SWEEP2D_LIVE_COLORS)),
+                            SWEEP2D_LIVE_COLORS)
+        try:
+            self._img.setColorMap(cmap)
+        except Exception:
+            # Older pyqtgraph — no ImageItem.setColorMap
+            self._img.setLookupTable(cmap.getLookupTable(0.0, 1.0, 256))
+        self._live_plot.addItem(self._img)
+        lay.addWidget(self._live_plot)
+
+        self._live_lbl = QLabel("")
+        self._live_lbl.setStyleSheet(f"color: {C_GRAY}; font-size: 10px;")
+        lay.addWidget(self._live_lbl)
+        return box
+
+    # ── wiring from the main window ──────────────────────────────────────────
+
+    def set_sources(self, moku_panel, daq_panel, coredaq_panel, lasers: dict):
+        """Borrow the already-connected instruments from their own tabs
+        instead of opening second connections to the same hardware."""
+        self._moku_panel    = moku_panel
+        self._daq_panel     = daq_panel
+        self._coredaq_panel = coredaq_panel
+        self._lasers        = dict(lasers)
+
+        worker = moku_panel.worker if moku_panel is not None else None
+        if worker is not None:
+            worker.waveform_applied.connect(self._on_waveform_applied)
+            worker.waveform_err.connect(self._on_waveform_err)
+            worker.lost.connect(self._on_moku_lost)
+
+        for key, panel in self._lasers.items():
+            sig = panel.sweep2d_done_signal() if panel is not None else None
+            if sig is not None:
+                sig.connect(lambda op, k=key: self._on_laser_op_done(k, op))
+
+        self._on_card_changed()
+        self._on_laser_changed()
+
+    def _status(self, msg: str):
+        w = self.window()
+        if hasattr(w, "status_bar"):
+            w.status_bar.showMessage(msg)
+
+    # ── derived info / UI state ──────────────────────────────────────────────
+
+    def _drive_is_uei(self) -> bool:
+        return self._src_combo.currentData() == "uei"
+
+    def _card_for_combo(self):
+        if self._daq_panel is None:
+            return None
+        return self._daq_panel.card_sessions.get(self._card_combo.currentData())
+
+    def _drive_unit(self) -> str:
+        if not self._drive_is_uei():
+            return "V"
+        cs = self._card_for_combo()
+        return cs.unit if cs is not None else "V"
+
+    def _laser_panel(self):
+        return self._lasers.get(self._laser_combo.currentData())
+
+    def _quantity(self) -> str:
+        return self._qty_combo.currentData()
+
+    def _laser_unit(self) -> str:
+        return "nm" if self._quantity() == "wavelength" else "mW"
+
+    def _detector_kind(self):
+        """Returns ("coredaq"|"moku", zero-based channel index)."""
+        d = self._det_combo.currentData() or "coredaq1"
+        return ("coredaq", int(d[-1]) - 1) if d.startswith("coredaq") \
+            else ("moku", int(d[-1]) - 1)
+
+    def _detector_labels(self):
+        """(display unit, watts→display scale) for the selected detector."""
+        kind, _ = self._detector_kind()
+        return ("nW", 1e9) if kind == "coredaq" else ("V", 1.0)
+
+    def _on_drive_source_changed(self):
+        save_connection_setting("sweep2d_drive_source",
+                                 self._src_combo.currentData())
+        uei = self._drive_is_uei()
+        self._card_combo.setEnabled(uei)
+        self._pin_spin.setEnabled(uei)
+        self._out_combo.setEnabled(not uei)
+        self._update_notes()
+
+    def _on_card_changed(self):
+        save_connection_setting("sweep2d_card_index",
+                                 self._card_combo.currentData())
+        cs = self._card_for_combo()
+        if cs is not None:
+            self._pin_spin.setMaximum(max(0, cs.num_pins - 1))
+        self._update_notes()
+
+    def _on_detector_changed(self):
+        save_connection_setting("sweep2d_detector", self._det_combo.currentData())
+        self._update_notes()
+
+    def _on_laser_changed(self):
+        save_connection_setting("sweep2d_laser", self._laser_combo.currentData())
+        save_connection_setting("sweep2d_quantity", self._quantity())
+        unit = self._laser_unit()
+        self._y_start_lbl.setText(f"Start ({unit}):")
+        self._y_stop_lbl.setText(f"Stop ({unit}):")
+        self._update_notes()
+
+    def _update_notes(self):
+        unit = self._drive_unit()
+        self._x_start_lbl.setText(f"Start ({unit}):")
+        self._x_stop_lbl.setText(f"Stop ({unit}):")
+
+        if self._drive_is_uei():
+            cs = self._card_for_combo()
+            if cs is not None:
+                self._drive_note.setText(
+                    f"Ramped at the card's slew rate to each step, then held "
+                    f"for the dwell. Range {cs.min_val:.1f} – "
+                    f"{cs.max_val:.1f} {cs.unit}.")
+            else:
+                self._drive_note.setText("No DAQ card available.")
+        else:
+            self._drive_note.setText(
+                "Played as a DC level on the generator output (±5 V on a "
+                "Moku:Go). Each step waits for the device to acknowledge the "
+                "new level before the dwell starts.")
+
+        panel = self._laser_panel()
+        name  = self._laser_combo.currentText()
+        # A panel whose hardware module is missing builds only a placeholder
+        # message and never creates a worker, so it has no done signal — that
+        # is the tell for "this tab isn't usable at all" as opposed to
+        # "usable, just not connected yet".
+        if panel is None or panel.sweep2d_done_signal() is None:
+            self._laser_note.setText(f"{name}: tab unavailable (its library or "
+                                      f"hardware module is missing).")
+        elif panel.sweep2d_ready():
+            lo, hi = panel.sweep2d_range(self._quantity())
+            self._laser_note.setText(
+                f"{name}: ready. Allowed {lo:.4g} – {hi:.4g} "
+                f"{self._laser_unit()}.")
+        else:
+            self._laser_note.setText(
+                f"{name}: not ready — connect it in its own tab first "
+                f"(the ITLA must also be lasing).")
+
+        nx = self._x_steps.value()
+        ny = self._y_steps.value()
+        det_unit, _ = self._detector_labels()
+        per_point = (self._dwell_spin.value()
+                     + self._samples_spin.value() * SWEEP2D_SAMPLE_INTERVAL_MS)
+        est_s = (nx * ny * per_point + ny * self._laser_settle_spin.value()) / 1000.0
+        self._timing_note.setText(
+            f"{nx} × {ny} = {nx * ny} points in {det_unit}. Floor estimate "
+            f"≈ {est_s / 60.0:.1f} min — excludes the drive's ramp time and "
+            f"each laser's own tuning time, which on the ITLA (a full relock "
+            f"per row) dominates everything else.")
+
+    # ── run: setup ────────────────────────────────────────────────────────────
+
+    def _start_sweep(self):
+        if self._running:
+            return
+
+        laser = self._laser_panel()
+        if laser is None or laser.sweep2d_done_signal() is None:
+            self._fail(f"{self._laser_combo.currentText()} is unavailable — "
+                        f"its library or hardware module is missing.")
+            return
+        if not laser.sweep2d_ready():
+            self._fail(f"{self._laser_combo.currentText()} is not ready — "
+                        f"connect it in its own tab first "
+                        f"(the ITLA must also be lasing).")
+            return
+        qty = self._quantity()
+        lo, hi = laser.sweep2d_range(qty)
+        y0, y1 = self._y_start.value(), self._y_stop.value()
+        if not (lo - 1e-9 <= min(y0, y1) and max(y0, y1) <= hi + 1e-9):
+            self._fail(f"Y range {y0:.4g} → {y1:.4g} {self._laser_unit()} is "
+                        f"outside the laser's {lo:.4g} – {hi:.4g} limits.")
+            return
+
+        x0, x1 = self._x_start.value(), self._x_stop.value()
+        cs = None
+        if self._drive_is_uei():
+            cs = self._card_for_combo()
+            if cs is None:
+                self._fail("No DAQ card available.")
+                return
+            if not cs.connected:
+                self._fail(f"Connect {CARDS[cs.card_index]['label']} in the "
+                            f"DAQ Control tab first.")
+                return
+            if self._pin_spin.value() >= cs.num_pins:
+                self._fail(f"AOut {self._pin_spin.value()} is out of range for "
+                            f"this card ({cs.num_pins} channels).")
+                return
+            if min(x0, x1) < cs.min_val - 1e-9 or max(x0, x1) > cs.max_val + 1e-9:
+                self._fail(f"X range is outside the card's {cs.min_val:.1f} – "
+                            f"{cs.max_val:.1f} {cs.unit} limits.")
+                return
+        else:
+            if self._moku_panel is None or not self._moku_panel.is_connected:
+                self._fail("Connect the Moku in the Moku tab first.")
+                return
+            if self._moku_panel.worker is None:
+                self._fail("moku library not available.")
+                return
+            if self._out_combo.currentData() > self._moku_panel.output_channels:
+                self._fail(f"Moku Output {self._out_combo.currentData()} has no "
+                            f"routed physical output on this device.")
+                return
+
+        kind, _ = self._detector_kind()
+        if kind == "coredaq":
+            if self._coredaq_panel is None or \
+                    self._coredaq_panel.latest_power_w() is None:
+                self._fail("Connect the CoreDAQ in its own tab first.")
+                return
+        elif self._moku_panel is None or not self._moku_panel.is_connected:
+            self._fail("The Moku detector needs the Moku tab connected.")
+            return
+
+        nx, ny = self._x_steps.value(), self._y_steps.value()
+        self._x_vals = np.array([x0]) if nx == 1 else np.linspace(x0, x1, nx)
+        self._y_vals = np.array([y0]) if ny == 1 else np.linspace(y0, y1, ny)
+        self._z  = np.full((ny, nx), np.nan)
+        self._z4 = np.full((ny, nx, 4), np.nan) if kind == "coredaq" else None
+
+        self._card_session = cs
+        if cs is not None:
+            self._pin_restore = cs.values[self._pin_spin.value()]
+            # A 1D sweep or waveform still ticking on this card would fight
+            # every step we make from here on.
+            cs.stop_sweep()
+            cs.stop_wave()
+        self._moku_restore = 0.0
+
+        self._iy = self._xi = self._done_pts = 0
+        self._stale   = 0
+        self._result  = None
+        self._run_t0  = time.monotonic()
+        self._running = True
+
+        self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._heatmap_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+        self._progress.setRange(0, nx * ny)
+        self._progress.setValue(0)
+        self._reset_live_plot()
+        self._status(f"2D sweep running — {nx} × {ny} points")
+        self._begin_row()
+
+    def _fail(self, msg: str):
+        self._run_lbl.setText(f"⚠ {msg}")
+        self._run_lbl.setStyleSheet(f"color: {C_RED};")
+        self._status(f"2D Sweep: {msg}")
+
+    # ── run: row (laser) axis ────────────────────────────────────────────────
+
+    def _begin_row(self):
+        if not self._running:
+            return
+        if self._iy >= len(self._y_vals):
+            self._finish_sweep()
+            return
+
+        nx = len(self._x_vals)
+        # Serpentine: alternate rows run backwards so each starts where the
+        # last one ended, instead of jumping the drive all the way back.
+        self._x_order = list(range(nx))
+        if self._serpentine_chk.isChecked() and self._iy % 2 == 1:
+            self._x_order.reverse()
+        self._xi = 0
+
+        key   = self._laser_combo.currentData()
+        laser = self._laser_panel()
+        value = float(self._y_vals[self._iy])
+        try:
+            op = laser.sweep2d_apply(self._quantity(), value)
+        except Exception as e:
+            self._abort(f"Laser setpoint failed: {e}")
+            return
+        self._awaiting_laser = (key, op)
+        self._laser_timeout.start(SWEEP2D_LASER_TIMEOUT_MS)
+        self._run_lbl.setText(
+            f"Row {self._iy + 1}/{len(self._y_vals)} — tuning laser to "
+            f"{value:.4f} {self._laser_unit()}…")
+        self._run_lbl.setStyleSheet("")
+
+    def _on_laser_op_done(self, key: str, op: str):
+        if not self._running or self._awaiting_laser is None:
+            return
+        if (key, op) != self._awaiting_laser:
+            return
+        self._awaiting_laser = None
+        self._laser_timeout.stop()
+        self._laser_settle.start(self._laser_settle_spin.value())
+
+    def _on_laser_timeout(self):
+        if self._running and self._awaiting_laser is not None:
+            self._abort("Laser did not confirm the setpoint in time.")
+
+    # ── run: point (drive) axis ──────────────────────────────────────────────
+
+    def _issue_point(self):
+        if not self._running:
+            return
+        ix = self._x_order[self._xi]
+        x  = float(self._x_vals[ix])
+
+        if self._drive_is_uei():
+            cs = self._card_session
+            try:
+                targets = list(cs.values)
+                targets[self._pin_spin.value()] = x
+                cs.ramp_to(targets)
+            except Exception as e:
+                self._abort(f"AOut ramp failed: {e}")
+                return
+            self._ramp_waited = 0
+            self._ramp_poll.start()
+        else:
+            self._awaiting_wf = True
+            self._wf_timeout.start(SWEEP2D_DRIVE_ACK_TIMEOUT_MS)
+            # DC ignores amplitude/frequency/phase — only `offset` sets the level.
+            self._moku_panel.request_waveform(
+                self._out_combo.currentData(), "DC", 0.0, 0.0, x)
+
+    def _check_ramp(self):
+        """Advance only once the ramped AOut has actually arrived — the card
+        is slew-rate limited, so the write returns long before the output is
+        where it was asked to go."""
+        if not self._running:
+            self._ramp_poll.stop()
+            return
+        cs  = self._card_session
+        pin = self._pin_spin.value()
+        target = float(self._x_vals[self._x_order[self._xi]])
+        if abs(cs.values[pin] - target) <= cs._step:
+            self._ramp_poll.stop()
+            self._begin_dwell()
+            return
+        self._ramp_waited += RAMP_TICK_MS
+        if self._ramp_waited >= SWEEP2D_RAMP_TIMEOUT_MS:
+            self._ramp_poll.stop()
+            self._abort(f"AOut never reached {target:.4f} {cs.unit} "
+                         f"(stuck at {cs.values[pin]:.4f}).")
+
+    def _on_waveform_applied(self, channel: int):
+        if not (self._running and self._awaiting_wf):
+            return
+        if channel != self._out_combo.currentData():
+            return
+        self._awaiting_wf = False
+        self._wf_timeout.stop()
+        self._begin_dwell()
+
+    def _on_waveform_err(self, channel: int, msg: str):
+        if self._running and channel == self._out_combo.currentData():
+            self._abort(f"Moku output error: {msg}")
+
+    def _on_wf_timeout(self):
+        if self._running and self._awaiting_wf:
+            self._abort("Moku did not acknowledge the drive level in time.")
+
+    def _on_moku_lost(self):
+        if self._running:
+            self._abort("Moku connection lost.")
+
+    def _begin_dwell(self):
+        # Note the frame counter at the moment the drive landed: a reading
+        # taken from a frame captured before this would be of the PREVIOUS
+        # point. +1 so the first accepted frame is at least two past the
+        # change — the frame in flight straddles it.
+        kind, _ = self._detector_kind()
+        if kind == "moku":
+            self._need_seq = self._moku_panel.worker.frame_seq + 1
+        self._dwell_timer.start(self._dwell_spin.value())
+
+    # ── run: measurement ─────────────────────────────────────────────────────
+
+    def _begin_samples(self):
+        if not self._running:
+            return
+        self._samples = []
+        self._frame_waited = 0
+        self._take_sample()
+
+    def _take_sample(self):
+        if not self._running:
+            return
+        kind, idx = self._detector_kind()
+
+        if kind == "moku":
+            worker = self._moku_panel.worker
+            if worker.frame_seq <= self._need_seq:
+                if self._frame_waited < SWEEP2D_FRAME_WAIT_MAX_MS:
+                    self._frame_waited += SWEEP2D_FRAME_WAIT_MS
+                    self._sample_timer.start(SWEEP2D_FRAME_WAIT_MS)
+                    return
+                self._stale += 1
+            self._need_seq     = worker.frame_seq
+            self._frame_waited = 0
+            _t, ch, count, _seq = worker.get_display_frame()
+            value = float(np.mean(ch[idx, :count])) if count > 0 else float("nan")
+            self._samples.append((value, None))
+        else:
+            powers = self._coredaq_panel.latest_power_w()
+            if powers is None:
+                self._abort("CoreDAQ disconnected mid-sweep.")
+                return
+            heads = tuple(float(p) for p in powers)
+            self._samples.append((heads[idx], heads))
+
+        if len(self._samples) < self._samples_spin.value():
+            self._sample_timer.start(SWEEP2D_SAMPLE_INTERVAL_MS)
+            return
+        self._store_point()
+
+    def _store_point(self):
+        ix  = self._x_order[self._xi]
+        iy  = self._iy
+        vals = [s[0] for s in self._samples]
+        value = float(np.nanmean(vals)) if vals else float("nan")
+        self._z[iy, ix] = value
+        if self._z4 is not None:
+            heads = [s[1] for s in self._samples if s[1] is not None]
+            if heads:
+                self._z4[iy, ix, :] = np.mean(np.array(heads), axis=0)
+
+        self._done_pts += 1
+        self._progress.setValue(self._done_pts)
+        self._update_live_plot()
+
+        det_unit, scale = self._detector_labels()
+        total = self._z.size
+        elapsed = time.monotonic() - self._run_t0
+        eta = elapsed / self._done_pts * (total - self._done_pts)
+        self._run_lbl.setText(
+            f"Point {self._done_pts}/{total} — "
+            f"x = {self._x_vals[ix]:.4f} {self._drive_unit()}, "
+            f"y = {self._y_vals[iy]:.4f} {self._laser_unit()} → "
+            f"{value * scale:.4f} {det_unit}   ·   ~{eta / 60.0:.1f} min left")
+        self._run_lbl.setStyleSheet("")
+
+        self._xi += 1
+        if self._xi < len(self._x_order):
+            self._issue_point()
+        else:
+            self._iy += 1
+            self._begin_row()
+
+    # ── run: teardown ────────────────────────────────────────────────────────
+
+    def _stop_timers(self):
+        for t in (self._laser_timeout, self._laser_settle, self._wf_timeout,
+                  self._ramp_poll, self._dwell_timer, self._sample_timer):
+            t.stop()
+        self._awaiting_laser = None
+        self._awaiting_wf    = False
+
+    def _restore_hardware(self):
+        """Put the drive back where it was, so stopping a sweep doesn't leave
+        the bench parked mid-row. The laser is deliberately left where it is —
+        retuning it back would cost another full settle for no benefit."""
+        cs = self._card_session
+        if cs is not None and cs.connected and self._pin_restore is not None:
+            try:
+                targets = list(cs.values)
+                targets[self._pin_spin.value()] = self._pin_restore
+                cs.ramp_to(targets)
+            except Exception as e:
+                print(f"[Sweep2D] AOut restore failed: {e}")
+        if (not self._drive_is_uei() and self._moku_panel is not None
+                and self._moku_panel.is_connected):
+            self._moku_panel.request_waveform(
+                self._out_combo.currentData(), "DC", 0.0, 0.0,
+                self._moku_restore or 0.0)
+
+    def _end_run(self):
+        self._running = False
+        self._stop_timers()
+        self._restore_hardware()
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+
+    def _abort(self, msg: str):
+        self._end_run()
+        self._fail(msg)
+        print(f"[Sweep2D] Aborted — {msg}")
+        if np.isfinite(self._z).any():
+            self._finalize_result()
+
+    def _stop_sweep(self):
+        if not self._running:
+            return
+        self._end_run()
+        self._status("2D sweep stopped")
+        if np.isfinite(self._z).any():
+            self._finalize_result()
+            self._run_lbl.setText(
+                f"Stopped after {self._done_pts} of {self._z.size} points — "
+                f"partial map kept (unmeasured points stay blank).")
+        else:
+            self._run_lbl.setText("Stopped before any point was measured.")
+
+    def _finish_sweep(self):
+        self._end_run()
+        if not np.isfinite(self._z).any():
+            self._fail("No readings captured — check the detector connection.")
+            return
+        self._finalize_result()
+        elapsed = self._result["elapsed_s"]
+        self._status(f"2D sweep complete — {self._done_pts} points in "
+                     f"{elapsed / 60.0:.1f} min")
+        self._run_lbl.setText(
+            f"Complete — {self._done_pts} points in {elapsed / 60.0:.1f} min"
+            + (f"  ·  {self._stale} stale frames" if self._stale else ""))
+        self._show_heatmap()
+
+    def _finalize_result(self):
+        det_unit, scale = self._detector_labels()
+        kind, idx = self._detector_kind()
+        self._result = {
+            "x":          self._x_vals.copy(),
+            "y":          self._y_vals.copy(),
+            "z":          self._z.copy(),
+            "z4":         None if self._z4 is None else self._z4.copy(),
+            "x_unit":     self._drive_unit(),
+            "y_unit":     self._laser_unit(),
+            "det_unit":   det_unit,
+            "det_scale":  scale,
+            "det_kind":   kind,
+            "det_index":  idx,
+            "det_name":   self._det_combo.currentText(),
+            "points":     self._done_pts,
+            "stale":      self._stale,
+            "elapsed_s":  time.monotonic() - self._run_t0,
+        }
+        self._heatmap_btn.setEnabled(True)
+        self._export_btn.setEnabled(True)
+
+    # ── live plot ────────────────────────────────────────────────────────────
+
+    def _reset_live_plot(self):
+        if not HAS_PYQTGRAPH or self._img is None:
+            return
+        self._live_plot.setLabel('bottom', f"Drive ({self._drive_unit()})")
+        self._live_plot.setLabel('left',
+                                  f"Laser {self._quantity()} "
+                                  f"({self._laser_unit()})")
+        self._img.clear()
+        self._live_lbl.setText("")
+
+    def _update_live_plot(self):
+        if not HAS_PYQTGRAPH or self._img is None:
+            return
+        _det_unit, scale = self._detector_labels()
+        z = self._z * scale
+        finite = z[np.isfinite(z)]
+        if finite.size == 0:
+            return
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi <= lo:
+            hi = lo + 1e-12
+        # Unmeasured points are pinned to the floor colour — ImageItem has no
+        # NaN handling, and NaNs would poison its autoscaling.
+        img = np.nan_to_num(z, nan=lo).T
+        x, y = self._x_vals, self._y_vals
+        dx = (x[-1] - x[0]) / (len(x) - 1) if len(x) > 1 else 1.0
+        dy = (y[-1] - y[0]) / (len(y) - 1) if len(y) > 1 else 1.0
+        self._img.setImage(img, levels=(lo, hi), autoLevels=False)
+        self._img.setRect(QRectF(x[0] - dx / 2.0, y[0] - dy / 2.0,
+                                  (len(x) - 1) * dx + dx,
+                                  (len(y) - 1) * dy + dy))
+        self._live_lbl.setText(
+            f"Colour range {lo:.4f} – {hi:.4f} {_det_unit} "
+            f"(rescaled as the map fills; the final heatmap window has the "
+            f"interpolation and colormap controls)")
+
+    def _show_heatmap(self):
+        res = self._result
+        if res is None:
+            return
+        title = (f"2D Sweep — {res['det_name']} vs drive & laser "
+                 f"{self._quantity()}")
+        win = HeatmapWindow(title, self)
+        win.show_data(res["x"], res["y"], res["z"] * res["det_scale"],
+                       f"Drive ({res['x_unit']})",
+                       f"Laser {self._quantity()} ({res['y_unit']})",
+                       f"{res['det_name']} ({res['det_unit']})")
+        mw = self.window()
+        win.move(mw.x() + 40, mw.y() + 40)
+        self._plot_win = win
+
+    # ── CSV export ───────────────────────────────────────────────────────────
+
+    def _export_csv(self):
+        res = self._result
+        if res is None:
+            return
+        import datetime
+        os.makedirs(DATA_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(DATA_DIR, f"sweep2d_{stamp}.csv")
+
+        x, y, z = res["x"], res["y"], res["z"]
+        cs   = self._card_session
+        if self._drive_is_uei():
+            drive_desc = (f"{CARDS[cs.card_index]['label'] if cs else '?'} "
+                          f"AOut {self._pin_spin.value()}")
+        else:
+            drive_desc = f"Moku Output {self._out_combo.currentData()}"
+
+        comments = [
+            f"sweep: 2D  ({len(x)} drive steps x {len(y)} laser steps)",
+            f"points_measured: {res['points']} of {z.size}",
+            f"drive_source: {drive_desc}   unit: {res['x_unit']}",
+            f"drive_range: {x[0]:.6f} to {x[-1]:.6f} {res['x_unit']}",
+            f"serpentine: {self._serpentine_chk.isChecked()}",
+            f"laser: {self._laser_combo.currentText()}   "
+            f"quantity: {self._quantity()}   unit: {res['y_unit']}",
+            f"laser_range: {y[0]:.6f} to {y[-1]:.6f} {res['y_unit']}",
+            f"laser_settle_ms: {self._laser_settle_spin.value()}",
+            f"detector: {res['det_name']}",
+            f"dwell_ms: {self._dwell_spin.value()}   "
+            f"readings_averaged: {self._samples_spin.value()}",
+            f"elapsed_s: {res['elapsed_s']:.3f}   stale_frames: {res['stale']}",
+        ]
+
+        det_col = ("detector_W" if res["det_kind"] == "coredaq"
+                   else "detector_V")
+        header = ["laser_index", f"laser_{res['y_unit']}",
+                  "drive_index", f"drive_{res['x_unit']}", det_col]
+        if res["z4"] is not None:
+            header += [f"coredaq_ch{c}_W" for c in range(1, 5)]
+
+        rows = []
+        for iy in range(len(y)):
+            for ix in range(len(x)):
+                row = [iy, f"{y[iy]:.6f}", ix, f"{x[ix]:.6f}",
+                       f"{z[iy, ix]:.9e}"]
+                if res["z4"] is not None:
+                    row += [f"{res['z4'][iy, ix, c]:.9e}" for c in range(4)]
+                rows.append(row)
+        write_csv_with_metadata(fname, comments, header, rows)
+        self._last_csv = fname
+        self._open_btn.setEnabled(True)
+        print(f"[Sweep2D] Saved {len(rows)} rows → {fname}")
+
+        # Matrix form alongside the long form: one row per laser step, one
+        # column per drive step — what you want if the map is going straight
+        # into Excel/Origin as a surface rather than being re-parsed.
+        matrix_name = os.path.splitext(fname)[0] + "_matrix.csv"
+        m_header = [f"laser_{res['y_unit']} \\ drive_{res['x_unit']}"] + \
+                   [f"{v:.6f}" for v in x]
+        m_rows = [[f"{y[iy]:.6f}"] + [f"{z[iy, ix]:.9e}" for ix in range(len(x))]
+                  for iy in range(len(y))]
+        write_csv_with_metadata(matrix_name, comments + [
+            f"layout: matrix - first row is the drive axis, first column is "
+            f"the laser axis, cells are {det_col}"], m_header, m_rows)
+        self._last_matrix_csv = matrix_name
+        print(f"[Sweep2D] Saved matrix → {matrix_name}")
+
+        # Pair the heatmap image with the CSV under data/images/, same
+        # convention as the AO sweep, Santec Fast Sweep and Dot Product.
+        img_saved = False
+        if HAS_MATPLOTLIB:
+            if self._plot_win is None:
+                self._show_heatmap()
+            if self._plot_win is not None:
+                os.makedirs(IMAGES_DIR, exist_ok=True)
+                img_path = os.path.join(
+                    IMAGES_DIR,
+                    os.path.splitext(os.path.basename(fname))[0] + ".png")
+                self._plot_win.save_png(img_path)
+                print(f"[Sweep2D] Saved heatmap image → {img_path}")
+                img_saved = True
+
+        self._status(f"Saved {len(rows)} 2D-sweep rows → {fname}  (+ matrix"
+                      + (" + image)" if img_saved else ")"))
+
+    def cleanup(self):
+        if self._running:
+            self._end_run()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UNIFIED MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -9531,8 +10923,9 @@ class DetachedWindow(QMainWindow):
         event.accept()
 
 
-DEFAULT_TAB_ORDER = ["DAQ Control", "Moku", "Dot Product", "CoreDAQ Power Meter",
-                      "Santec Laser", "ITLA Laser", "HP-8168F Laser", "CONEX Motor"]
+DEFAULT_TAB_ORDER = ["DAQ Control", "Moku", "Dot Product", "2D Sweep",
+                      "CoreDAQ Power Meter", "Santec Laser", "ITLA Laser",
+                      "HP-8168F Laser", "CONEX Motor"]
 
 
 class UnifiedMainWindow(QMainWindow):
@@ -9552,6 +10945,13 @@ class UnifiedMainWindow(QMainWindow):
         # opening its own (a Moku:Go allows a single owner at a time).
         self.dot_panel     = DotProductPanel()
         self.dot_panel.set_sources(self.moku_gen_panel, self.daq_panel)
+        # Same borrowing arrangement, one axis wider: a drive source (Moku or
+        # UEI) crossed with a laser axis, read out on the CoreDAQ or the Moku.
+        self.sweep2d_panel = Sweep2DPanel()
+        self.sweep2d_panel.set_sources(
+            self.moku_gen_panel, self.daq_panel, self.coredaq_panel,
+            {"santec": self.santec_panel, "hp8168f": self.hp8168f_panel,
+             "itla": self.itla_panel})
         self.daq_panel.pin_view.set_coredaq_panel(self.coredaq_panel)
         self.itla_panel.set_coredaq_panel(self.coredaq_panel)
         self.hp8168f_panel.set_coredaq_panel(self.coredaq_panel)
@@ -9573,6 +10973,7 @@ class UnifiedMainWindow(QMainWindow):
             "DAQ Control":         self.daq_panel,
             "Moku":                self.moku_gen_panel,
             "Dot Product":         self.dot_panel,
+            "2D Sweep":            self.sweep2d_panel,
             "CoreDAQ Power Meter": self.coredaq_panel,
             "Santec Laser":        self.santec_panel,
             "ITLA Laser":          self.itla_panel,
@@ -9837,6 +11238,7 @@ class UnifiedMainWindow(QMainWindow):
         # to be stopped (and its phase shifter restored) before either of
         # those sessions is torn down underneath it.
         self.dot_panel.cleanup()
+        self.sweep2d_panel.cleanup()
         self.daq_panel.cleanup()
         self.moku_gen_panel.cleanup()
         self.itla_panel.cleanup()

@@ -129,6 +129,8 @@ Default left-to-right order:
 |---|---|
 | DAQ Control | UEI PowerDNA analog output cards (Dev0/Dev1/Dev2) |
 | Moku | Moku:Go — waveform generator + oscilloscope |
+| Dot Product | Measurement tab — Moku bit stream × UEI phase weights |
+| 2D Sweep | Measurement tab — drive axis × laser axis heatmap |
 | CoreDAQ Power Meter | 4-head USB optical power meter |
 | Santec Laser | Santec TSL-550 tunable laser |
 | ITLA Laser | Emcore TTX ITLA |
@@ -479,8 +481,15 @@ Filenames are timestamped `YYYYMMDD_HHMMSS`, e.g.:
 data/ao_sweep_coredaq_20260731_142530.csv
 data/Dev2_voltage_moku_20260731_142530.csv
 data/global_recording_20260731_142530.csv
+data/sweep2d_20260731_142530.csv
 data/images/santec_fast_sweep_20260731_142530.png
 ```
+
+A 2D Sweep writes its map **twice**: `sweep2d_<stamp>.csv` in long form (one
+row per grid point, plus all four CoreDAQ heads) and
+`sweep2d_<stamp>_matrix.csv` in matrix form (first row is the drive axis,
+first column the laser axis) for dropping straight into Excel/Origin as a
+surface. Both carry the same `#` parameter header.
 
 ### File format
 

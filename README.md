@@ -11,9 +11,11 @@ laser — each on its own tab, each degrading gracefully (tab stays visible
 with a message instead of crashing the app) if its hardware library isn't
 installed or its instrument isn't connected.
 
-Alongside the per-instrument tabs there's one cross-instrument measurement
-tab, **Dot Product**, which drives the Moku and a UEI phase shifter together
-to compute an optical multiply-accumulate.
+Alongside the per-instrument tabs there are two cross-instrument measurement
+tabs: **Dot Product**, which drives the Moku and a UEI phase shifter together
+to compute an optical multiply-accumulate, and **2D Sweep**, which maps one
+detector over a drive axis and a laser axis at once and draws the result as a
+heatmap.
 
 **New to the GUI?** This README covers installation and configuration. For how
 to *use* it — per-tab procedures, laser/DAQ safety, common lab workflows, and
@@ -104,6 +106,39 @@ two at a time against the same physical device)
   export with the PNG saved alongside
 - Borrows the already-connected Moku (from the Moku tab) and DAQ card (from
   DAQ Control) rather than opening second sessions — connect both there first
+
+**2D Sweep** (drive axis × laser axis heatmap)
+- Maps one detector over two swept axes at once: an **X (fast) axis** driving
+  either a UEI AOut (ramped at the card's slew rate, same as the DAQ tab's 1D
+  sweep) or a DC level on a Moku generator output, and a **Y (slow) axis**
+  stepping laser **wavelength or power** on the Santec, HP-8168F, or ITLA
+- The laser is deliberately the outer axis — retuning (and, on the ITLA,
+  relocking) costs orders of magnitude more than moving a DAC, so it steps
+  once per row rather than once per point
+- Detector is any CoreDAQ head (all four are recorded to CSV regardless of
+  which one is mapped) or either Moku scope input, with an adjustable number
+  of readings averaged into each grid point
+- Optional **serpentine (zig-zag) scan** — alternate rows run backwards, so
+  each row starts where the last one ended instead of jumping the drive back
+  to Start
+- Live heatmap fills in as the sweep runs, with a per-point readout and a
+  running time-remaining estimate
+- Matplotlib results heatmap with **live-adjustable interpolation**
+  (`nearest` → `bilinear`/`bicubic`/`gaussian`/`lanczos`/…), colormap, and a
+  log colour scale for detectors spanning decades. Interpolation is a control
+  rather than a plot-time parameter on purpose: how much smoothing between
+  measured points is honest is a judgement you can only make while looking at
+  the data, so `nearest` (one flat cell per measured point, nothing invented)
+  is the default
+- Stopping mid-run keeps the partial map — unmeasured points stay visibly
+  blank instead of being coloured as if they held a real value
+- CSV export in **both** long form (one row per point, plus all four CoreDAQ
+  heads) and matrix form (`…_matrix.csv`: laser rows × drive columns, for
+  dropping straight into Excel/Origin as a surface), with the heatmap PNG
+  saved alongside
+- Borrows every instrument from its own tab rather than reopening it —
+  connect the drive source, the laser, and the detector in their own tabs
+  first
 
 **CoreDAQ Power Meter**
 - Connects over USB-serial (auto-detect or manual COM port)
