@@ -9476,7 +9476,10 @@ class DotProductPanel(QWidget):
     def _show_results_plot(self):
         if self._result is None:
             return
-        win = DotProductPlotWindow("Dot Product — measured vs expected", self)
+        # Parentless — see the note in Sweep2DPanel._show_heatmap: passing a
+        # parent here made this open as a child widget stuck inside the tab
+        # instead of a window you can move or close.
+        win = DotProductPlotWindow("Dot Product — measured vs expected")
         win.show_data(self._result)
         mw = self.window()
         win.move(mw.x() + 40, mw.y() + 40)
@@ -10733,7 +10736,11 @@ class Sweep2DPanel(QWidget):
             return
         title = (f"2D Sweep — {res['det_name']} vs drive & laser "
                  f"{self._quantity()}")
-        win = HeatmapWindow(title, self)
+        # Deliberately parentless, like every other plot window here: a
+        # QWidget given a parent is shown as a CHILD widget pinned inside that
+        # parent — no title bar, so it can't be moved or closed. Only a
+        # top-level window can. self._plot_win is what keeps it alive.
+        win = HeatmapWindow(title)
         win.show_data(res["x"], res["y"], res["z"] * res["det_scale"],
                        f"Drive ({res['x_unit']})",
                        f"Laser {self._quantity()} ({res['y_unit']})",
